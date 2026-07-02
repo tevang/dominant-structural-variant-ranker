@@ -1,0 +1,12 @@
+workflow:
+  ph: 7.0
+  solvent: water
+  solvent_model: alpb
+  max_tautomers: 64
+  max_stereoisomers: 64
+  max_conformers: 100
+  conformer_backend: auto3d
+  auto3d_internal_enumeration: true
+  execute_external: true
+  optional_refinement: none
+

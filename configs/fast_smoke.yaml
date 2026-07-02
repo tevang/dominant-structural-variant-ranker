@@ -1,0 +1,10 @@
+workflow:
+  ph: 7.0
+  solvent: water
+  solvent_model: alpb
+  max_tautomers: 4
+  max_stereoisomers: 8
+  max_conformers: 3
+  execute_external: false
+  optional_refinement: none
+
