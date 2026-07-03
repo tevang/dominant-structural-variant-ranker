@@ -1,11 +1,13 @@
 from __future__ import annotations
 
+import re
 from pathlib import Path
 
-from click import unstyle
 from typer.testing import CliRunner
 
 from dsvr.cli import app
+
+ANSI_ESCAPE_RE = re.compile(r"\x1b\[[0-9;]*[A-Za-z]")
 
 
 def test_cli_commands_have_help() -> None:
@@ -27,7 +29,7 @@ def test_cli_commands_have_help() -> None:
 
     root = runner.invoke(app, ["--help"])
     assert root.exit_code == 0, root.output
-    help_output = unstyle(root.output)
+    help_output = ANSI_ESCAPE_RE.sub("", root.output)
     assert "Usage:" in help_output
     assert "doctor" in help_output
     assert "run" in help_output
