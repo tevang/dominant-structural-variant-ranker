@@ -46,8 +46,8 @@ from dsvr.models import (
     ProtomerRecord,
     RankedVariantRecord,
     SeedConformerRecord,
-    VariantRecord,
     ThermoRecord,
+    VariantRecord,
     WorkflowResult,
     make_protomer_id,
 )
