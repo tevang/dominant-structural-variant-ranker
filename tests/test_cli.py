@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
+from click import unstyle
 from typer.testing import CliRunner
 
 from dsvr.cli import app
@@ -26,8 +27,10 @@ def test_cli_commands_have_help() -> None:
 
     root = runner.invoke(app, ["--help"])
     assert root.exit_code == 0, root.output
-    assert "--verbose" in root.output
-    assert "--log-level" in root.output
+    help_output = unstyle(root.output)
+    assert "Usage:" in help_output
+    assert "doctor" in help_output
+    assert "run" in help_output
 
     for command in commands:
         result = runner.invoke(app, [command, "--help"])

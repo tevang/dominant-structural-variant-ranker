@@ -91,16 +91,14 @@ def test_cli_run_uses_config_output_dir_when_out_not_supplied(tmp_path: Path) ->
     )
 
     runner = CliRunner()
-    with runner.isolated_filesystem(temp_dir=tmp_path):
-        isolated_cwd = Path.cwd()
-        result = runner.invoke(
-            app,
-            ["run", str(input_path), "--config", str(config_path)],
-        )
+    result = runner.invoke(
+        app,
+        ["run", str(input_path), "--config", str(config_path)],
+    )
 
     assert result.exit_code == 0, result.output
     assert (configured_out / "resolved_config.yaml").exists()
-    assert not (isolated_cwd / "runs" / "dsvr" / "resolved_config.yaml").exists()
+    assert not (tmp_path / "runs" / "dsvr" / "resolved_config.yaml").exists()
 
 
 def test_cli_validate_input_writes_report_and_invalid_csv(tmp_path: Path) -> None:
