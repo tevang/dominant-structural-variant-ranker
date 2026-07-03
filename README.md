@@ -5,44 +5,81 @@ for ranking pH- and solvent-dependent structural variants of small molecules
 using maintained open-source tools.
 
 This repository is a wrapper/orchestrator. It does **not** vendor, mirror, or
-clone third-party repositories. Tools such as RDKit, molscrub, Auto3D, xTB,
-CREST, CENSO, Psi4, and PySCF remain external dependencies installed through
-conda-forge, pip, or their upstream installation instructions.
+clone third-party repositories. RDKit, molscrub, Auto3D, xTB, CREST, CENSO,
+Psi4, and PySCF remain external tools installed through conda-forge, pip,
+official binary distributions, or user-managed software modules.
 
-## Scope
+## Default Physics-Heavy Workflow
 
-The package coordinates:
+The package implements this default workflow:
 
-1. Input parsing from SMILES and SDF.
-2. Standardization and identifier generation.
-3. pH/protomer/protonation candidate generation through optional external tools.
-4. Tautomer and stereoisomer enumeration.
-5. RDKit or Auto3D seed conformer generation.
-6. Optional xTB/CREST conformer search and thermochemistry parsing.
-7. Optional CENSO, Psi4, or PySCF refinement/rescoring.
-8. Approximate population-oriented ranking and reporting.
+```text
+molscrub protonation/protomer generation at target pH
+-> RDKit tautomer enumeration
+-> RDKit stereoisomer enumeration
+-> RDKit ETKDG or Auto3D conformer seeding
+-> CREST/xTB conformer search and ensemble reduction
+-> xTB thermo / CREST entropy Delta G ranking
+-> optional CENSO
+-> optional Psi4/PySCF final rescoring
+```
 
-## Scientific Limitation
+Default implementation notes:
 
-Default pH handling controls candidate generation. It does not by itself produce
-rigorous pH-dependent populations across protonation states. Cross-protomer or
-cross-charge population estimates must be treated as approximate unless explicit
-micro-pKa or proton chemical-potential corrections are supplied by a future
-extension.
+- Default pH: `7.0`
+- Default solvent: `water`
+- Default temperature: `298.15 K`
+- Default initial seeder: RDKit ETKDG
+- Optional seeder/prefilter: Auto3D
+- Main decision engine: CREST/xTB
+- Optional high-confidence refinement: CENSO
+- Optional final QM rescoring: Psi4 or PySCF
 
-## Install
+## Scientific Warning
+
+DSVR does not perform rigorous pH-dependent population calculations unless a
+micro-pKa/proton chemical potential correction plugin is added. By default,
+molscrub is used for practical pH/protomer candidate generation, then
+CREST/xTB-derived free energies rank the generated candidates in the configured
+solvent model.
+
+Boltzmann populations are derived from relative free energies and must be
+labeled with their scope:
+
+- Comparable within the same formula/proton count.
+- Approximate across different protonation/protomer states unless corrections
+  are available.
+
+RDKit tautomer canonicalization is not stability ranking. RDKit stereoisomer
+enumeration is explicit and controlled by configuration. Auto3D can be useful
+for seed generation or prefiltering, but it must not double-enumerate tautomers
+or stereoisomers unless the user explicitly enables Auto3D internal enumeration.
+
+## Quick Start
 
 ```bash
 conda env create -f environment.yml
-conda activate dominant-structural-variant-ranker
+conda activate dsvr
 python -m pip install -e ".[dev]"
+dsvr doctor
+dsvr run examples/test_molecules_minimal.smi --config configs/fast_smoke.yaml --outdir runs/smoke
 ```
 
-Or use the bootstrap script:
+For a direct source-tree smoke check:
 
 ```bash
-scripts/bootstrap_conda.sh
+PYTHONPATH=src python -m dsvr.cli --help
+PYTHONPATH=src python -m pytest
 ```
+
+## Dependency Strategy
+
+- Do not vendor third-party repositories.
+- Install Python packages via conda or pip.
+- Install external binaries via conda, official binaries, or user-managed
+  modules.
+- Use `dsvr doctor` to verify the environment before running physics-heavy
+  workflows.
 
 Optional Python tools:
 
@@ -56,8 +93,18 @@ scripts/bootstrap_mamba.sh --with-auto3d --with-molscrub
 python -m dsvr.cli --help
 dsvr --help
 dsvr doctor
+dsvr inspect examples/test_molecules.smi
 dsvr run examples/test_molecules_minimal.smi --config configs/fast_smoke.yaml --outdir runs/smoke
 ```
+
+## Documentation
+
+- [Architecture](docs/architecture.md)
+- [Workflow](docs/workflow.md)
+- [Limitations](docs/limitations.md)
+- [External tools](docs/external_tools.md)
+- [File formats](docs/file_formats.md)
+- [Installation](docs/installation.md)
 
 ## Development
 
@@ -66,4 +113,3 @@ pytest
 ruff check src tests
 mypy src
 ```
-

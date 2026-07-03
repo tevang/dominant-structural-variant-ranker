@@ -1,10 +1,68 @@
-workflow:
+run_name: fast-smoke
+input_path: examples/test_molecules_minimal.smi
+input_format: auto
+output_dir: runs/smoke
+max_workers: 1
+dry_run: false
+overwrite: true
+resume: true
+
+chemistry:
   ph: 7.0
+  ph_low: null
+  ph_high: null
   solvent: water
   solvent_model: alpb
-  max_tautomers: 4
-  max_stereoisomers: 8
-  max_conformers: 3
-  execute_external: false
-  optional_refinement: none
+  temperature_kelvin: 298.15
+  standardize: true
+  keep_salts: false
+  largest_fragment_only: true
 
+enumeration:
+  max_protomers_per_molecule: 4
+  max_tautomers_per_protomer: 4
+  max_stereoisomers_per_tautomer: 4
+  stereo_try_embedding: true
+  stereo_only_unassigned: true
+  stereo_unique: true
+  stereo_random_seed: 61453
+  fail_on_enumeration_cap: false
+
+seeding:
+  method: etkdg
+  rdkit_num_conformers: 3
+  rdkit_prune_rms_thresh: 0.5
+  rdkit_forcefield: uff
+  auto3d_k: 1
+  auto3d_model: AIMNet2
+  auto3d_internal_tautomer_stereo_enum: false
+
+crest:
+  enabled: false
+  executable: crest
+  xtb_executable: xtb
+  gfn: 2
+  ewin_kcal_mol: 6.0
+  nproc: 1
+  walltime_minutes: null
+  command_template: null
+  extra_args: []
+
+thermo:
+  enabled: false
+  xtb_hessian: false
+  xtb_thermo: false
+  rrho_cutoff: 100.0
+  population_scope: same_formula
+  energy_unit: kcal/mol
+
+refinement:
+  censo_enabled: false
+  psi4_enabled: false
+  pyscf_enabled: false
+  max_candidates_for_refinement: 1
+
+logging:
+  level: INFO
+  save_subprocess_logs: true
+  tail_subprocess_logs: false

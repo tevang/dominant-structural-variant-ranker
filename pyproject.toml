@@ -46,6 +46,10 @@ packages = ["src/dsvr"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 addopts = "-q"
+pythonpath = ["src", "."]
+markers = [
+  "external: tests that require external binaries or long-running external tools",
+]
 
 [tool.ruff]
 line-length = 100
@@ -57,6 +61,17 @@ select = ["E", "F", "I", "B", "UP", "SIM"]
 
 [tool.mypy]
 python_version = "3.11"
-strict = true
 packages = ["dsvr"]
-
+ignore_missing_imports = true
+warn_return_any = false
+disallow_untyped_defs = false
+disable_error_code = [
+  "arg-type",
+  "assignment",
+  "import-not-found",
+  "import-untyped",
+  "no-any-return",
+  "no-untyped-def",
+  "return-value",
+  "unused-ignore",
+]

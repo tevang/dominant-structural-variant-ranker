@@ -1,4 +1,4 @@
-name: dominant-structural-variant-ranker
+name: dsvr
 channels:
   - conda-forge
 dependencies:
@@ -16,8 +16,8 @@ dependencies:
   - mypy
   - pip
   # Optional Python packages can be installed by the bootstrap scripts:
-  # - Auto3D
-  # - molscrub
-  # Optional external binaries such as xtb, crest, censo, and psi4 should be
-  # installed from conda-forge or upstream instructions when needed.
-
+  #   python -m pip install Auto3D
+  #   python -m pip install git+https://github.com/forlilab/molscrub.git
+  #   python -m pip install pyscf
+  # Optional external binaries such as xtb, crest, censo, and psi4 may be installed
+  # through conda-forge, upstream release binaries, or HPC module systems.
