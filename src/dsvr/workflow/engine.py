@@ -3,8 +3,9 @@ from __future__ import annotations
 import csv
 import json
 import shutil
+from collections.abc import Callable
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any
 
 from rdkit import Chem
 from rdkit.Chem import rdMolDescriptors
