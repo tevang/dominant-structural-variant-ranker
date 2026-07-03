@@ -50,6 +50,8 @@ def test_run_crest_for_seed_with_mocked_execution(
                 stdout="--gfn2 --chrg --uhf --alpb --gbsa --ewin -T\n",
                 stderr="",
             )
+        assert Path(command[1]).is_absolute()
+        assert Path(command[1]).exists()
         _write_mock_crest_outputs(Path(cwd))
         return subprocess.CompletedProcess(command, 0, stdout="crest done\n", stderr="")
 
@@ -101,6 +103,29 @@ def test_run_crest_failure_is_captured_in_json_provenance(
     workdir = crest_workdir(seed, config)
     assert (workdir / "crest_failures.json").exists()
     assert (workdir / "crest_provenance.jsonl").exists()
+
+
+def test_crest_cleanup_removes_intermediate_xyz_files(tmp_path: Path) -> None:
+    keep = tmp_path / "crest_conformer_0001.xyz"
+    keep.write_text("1\nkeep\nH 0 0 0\n", encoding="utf-8")
+    for index in range(100):
+        (tmp_path / f"struc{index}.xyz").write_text("1\nx\nH 0 0 0\n", encoding="utf-8")
+    (tmp_path / "crest.out").write_text("large log\n", encoding="utf-8")
+
+    crest_runner._cleanup_crest_workdir(
+        tmp_path,
+        RunConfig(
+            crest={
+                "max_conformers_to_keep": 1,
+                "delete_intermediate_xyz": True,
+                "compress_raw_outputs": True,
+            }
+        ),
+    )
+
+    assert keep.exists()
+    assert not list(tmp_path.glob("struc*.xyz"))
+    assert (tmp_path / "crest.out.gz").exists()
 
 
 def test_read_seed_sdf_preserves_seed_lineage(tmp_path: Path) -> None:

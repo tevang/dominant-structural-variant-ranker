@@ -1,11 +1,10 @@
-run_name: fast-smoke
-input_path: examples/test_molecules_minimal.smi
+run_name: production-balanced
+input_path: examples/test_molecules.smi
 input_format: auto
-output_dir: runs/smoke
-max_workers: 1
-dry_run: false
-overwrite: true
+output_dir: runs/production_balanced
+overwrite: false
 resume: true
+max_workers: 1
 
 chemistry:
   ph: 7.0
@@ -19,15 +18,15 @@ chemistry:
   largest_fragment_only: true
 
 enumeration:
-  max_protomers_per_molecule: 4
-  max_tautomers_per_protomer: 4
-  max_tautomer_transforms: 64
-  tautomer_timeout_seconds: 10
+  max_protomers_per_molecule: 8
+  max_tautomers_per_protomer: 32
+  max_tautomer_transforms: 256
+  tautomer_timeout_seconds: 30
   tautomer_strategy: safe
   tautomer_remove_bond_stereo: true
   tautomer_remove_sp3_stereo: true
   tautomer_reassign_stereo: true
-  max_stereoisomers_per_tautomer: 4
+  max_stereoisomers_per_tautomer: 32
   stereo_try_embedding: true
   stereo_only_unassigned: true
   stereo_unique: true
@@ -36,77 +35,94 @@ enumeration:
 
 seeding:
   method: etkdg
-  rdkit_num_conformers: 3
+  rdkit_num_conformers: 30
   rdkit_prune_rms_thresh: 0.5
   rdkit_forcefield: uff
-  auto3d_k: 1
+  auto3d_k: 3
   auto3d_model: AIMNet2
   auto3d_internal_tautomer_stereo_enum: false
 
+xtb_prefilter:
+  enabled: true
+  optimize: true
+  hessian: false
+  solvent_model: alpb
+  solvent: water
+  gfn: 2
+  max_variants_per_molecule: 16
+  keep_within_kcal_mol: 10.0
+  keep_top_n_per_molecule: 8
+  keep_top_n_per_charge: 3
+  keep_top_n_per_formula: 3
+  timeout_seconds_per_variant: 300
+  nproc: 4
+
 crest:
-  enabled: false
+  enabled: true
   executable: crest
   xtb_executable: xtb
   gfn: 2
   ewin_kcal_mol: 6.0
-  nproc: 1
-  walltime_minutes: null
+  nproc: 4
+  max_jobs_per_molecule: 8
+  max_conformers_to_parse: 20
+  max_conformers_to_keep: 5
+  keep_raw_xyz: false
+  compress_raw_outputs: true
+  delete_intermediate_xyz: true
+  cleanup_patterns: ["*.tmp", "coord.*", "struc*.xyz", "trial*.xyz"]
+  walltime_minutes: 30
   command_template: null
   extra_args: []
 
 thermo:
-  enabled: false
-  xtb_hessian: false
-  xtb_thermo: false
+  enabled: true
+  xtb_hessian: true
+  xtb_thermo: true
   rrho_cutoff: 100.0
   population_scope: same_formula
   energy_unit: kcal/mol
+  max_variants_per_molecule: 5
+  max_conformers_per_variant: 3
 
 refinement:
   censo_enabled: false
-  psi4_enabled: false
-  pyscf_enabled: false
-  max_candidates_for_refinement: 1
+  max_candidates_for_refinement: 3
+
+qm:
+  enabled: false
+  backend: none
+  max_candidates: 3
 
 logging:
   level: INFO
   save_subprocess_logs: true
-  tail_subprocess_logs: false
+  tail_subprocess_logs: true
 
 variant_filtering:
   enabled: true
   mode: balanced
-  max_variants_before_3d_per_molecule: 4
-  max_variants_after_cheap_score_per_molecule: 4
-  max_variants_for_xtb_prefilter_per_molecule: 4
-  max_variants_for_crest_per_molecule: 3
-  max_seeds_per_variant: 1
+  max_variants_before_3d_per_molecule: 64
+  max_variants_after_cheap_score_per_molecule: 24
+  max_variants_for_xtb_prefilter_per_molecule: 16
+  max_variants_for_crest_per_molecule: 8
+  max_seeds_per_variant: 2
   keep_original_state: true
   keep_best_per_charge_state: true
   keep_best_per_formula: true
   keep_best_per_protomer: true
   keep_best_per_tautomer_family: true
+  collapse_enantiomers: true
   absolute_penalty_cutoff: 12.0
   relative_penalty_cutoff: 7.0
-  min_variants_to_keep: 1
+  min_variants_to_keep: 3
   rescue_rules_enabled: true
-  collapse_enantiomers: true
 
 stereo_filtering:
   collapse_enantiomers_in_achiral_solvent: true
   solvent_is_chiral: false
   run_crest_for_enantiomer_pairs_once: true
   keep_mapping_to_all_stereo_outputs: true
-
-timeouts:
-  protomer_seconds_per_molecule: 60
-  tautomer_seconds_per_protomer: 30
-  stereo_seconds_per_tautomer: 30
-  etkdg_seconds_per_variant: 60
-  auto3d_seconds_per_batch: 600
-  xtb_prefilter_seconds_per_variant: 300
-  crest_seconds_per_variant: 1800
-  thermo_seconds_per_conformer: 600
 
 disk:
   cleanup_policy: compact

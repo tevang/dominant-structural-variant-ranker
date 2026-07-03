@@ -65,6 +65,17 @@ dsvr doctor
 dsvr run examples/test_molecules_minimal.smi --config configs/fast_smoke.yaml --outdir runs/smoke
 ```
 
+For production local runs, start with the bounded balanced profile:
+
+```bash
+dsvr run examples/test_molecules.smi \
+  --config configs/production_balanced.yaml \
+  --outdir runs/production_balanced_water_pH7
+```
+
+`configs/exhaustive_debug.yaml` is intentionally expensive and may generate
+very large variant and XYZ counts. Use it only for small molecules or debugging.
+
 For a direct source-tree smoke check:
 
 ```bash

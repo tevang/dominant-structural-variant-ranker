@@ -60,6 +60,49 @@ def test_cli_overrides_config_values(tmp_path: Path) -> None:
     assert resolved["refinement"]["censo_enabled"] is True
 
 
+def test_cli_run_uses_config_output_dir_when_out_not_supplied(tmp_path: Path) -> None:
+    input_path = tmp_path / "mols.smi"
+    input_path.write_text("CCO ethanol\n", encoding="utf-8")
+    configured_out = tmp_path / "configured-out"
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text(
+        "\n".join(
+            [
+                "run_name: cli-config-output",
+                f"input_path: {input_path}",
+                "input_format: auto",
+                f"output_dir: {configured_out}",
+                "enumeration:",
+                "  max_protomers_per_molecule: 1",
+                "  max_tautomers_per_protomer: 1",
+                "  max_stereoisomers_per_tautomer: 1",
+                "seeding:",
+                "  method: etkdg",
+                "  rdkit_num_conformers: 1",
+                "crest:",
+                "  enabled: false",
+                "thermo:",
+                "  enabled: false",
+                "  xtb_hessian: false",
+                "  xtb_thermo: false",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    runner = CliRunner()
+    with runner.isolated_filesystem(temp_dir=tmp_path):
+        isolated_cwd = Path.cwd()
+        result = runner.invoke(
+            app,
+            ["run", str(input_path), "--config", str(config_path)],
+        )
+
+    assert result.exit_code == 0, result.output
+    assert (configured_out / "resolved_config.yaml").exists()
+    assert not (isolated_cwd / "runs" / "dsvr" / "resolved_config.yaml").exists()
+
+
 def test_cli_validate_input_writes_report_and_invalid_csv(tmp_path: Path) -> None:
     input_path = tmp_path / "mols.smi"
     input_path.write_text("CCO ethanol\nnot_a_smiles bad\n", encoding="utf-8")

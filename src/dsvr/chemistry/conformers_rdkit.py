@@ -7,6 +7,7 @@ from rdkit import Chem
 from rdkit.Chem import AllChem, rdMolDescriptors
 
 from dsvr.config import RunConfig
+from dsvr.filtering.budgets import seed_budget
 from dsvr.models import SeedConformerRecord, StereoRecord, make_seed_id
 
 
@@ -25,7 +26,9 @@ def generate_rdkit_seeds(
     output_dir = config.output_dir / "seeding" / "rdkit"
     xyz_dir = output_dir / "xyz"
     output_dir.mkdir(parents=True, exist_ok=True)
-    xyz_dir.mkdir(parents=True, exist_ok=True)
+    write_raw_xyz = config.disk.keep_raw_xyz or config.disk.cleanup_policy == "debug_all"
+    if write_raw_xyz:
+        xyz_dir.mkdir(parents=True, exist_ok=True)
 
     mol = Chem.AddHs(Chem.Mol(stereo_record.rdkit_mol))
     params = _etkdg_params(config)
@@ -58,22 +61,40 @@ def generate_rdkit_seeds(
             )
         ]
 
-    records: list[SeedConformerRecord] = []
+    candidates: list[tuple[int, Chem.Mol, str, bool | None, float | None]] = []
     for index, conformer_id in enumerate(conformer_ids, start=1):
         seed_mol = Chem.Mol(mol)
         _remove_other_conformers(seed_mol, conformer_id)
         seed_mol.GetConformer().SetId(0)
         ff_status, converged, energy = _minimize(seed_mol, config)
+        candidates.append((index, seed_mol, ff_status, converged, energy))
+
+    selected_indexes, selection_rows = _select_seed_candidates(candidates, config)
+    records: list[SeedConformerRecord] = []
+    for selected_rank, (index, seed_mol, ff_status, converged, energy) in enumerate(
+        [candidate for candidate in candidates if candidate[0] in selected_indexes],
+        start=1,
+    ):
         canonical_smiles = Chem.MolToSmiles(seed_mol, canonical=True, isomericSmiles=False)
         isomeric_smiles = Chem.MolToSmiles(seed_mol, canonical=True, isomericSmiles=True)
-        xyz_path = xyz_dir / f"{stereo_record.id}_c{index:02d}.xyz"
-        _write_xyz(seed_mol, xyz_path, comment=f"{stereo_record.id} conformer {index}")
+        output_paths = [
+            output_dir / f"{stereo_record.id}_seeds.sdf",
+            output_dir / f"{stereo_record.id}_seeds.csv",
+            output_dir / f"{stereo_record.id}_seed_selection.csv",
+        ]
+        if write_raw_xyz:
+            xyz_path = xyz_dir / f"{stereo_record.id}_c{index:02d}.xyz"
+            _write_xyz(seed_mol, xyz_path, comment=f"{stereo_record.id} conformer {index}")
+            output_paths.append(xyz_path)
         metadata = {
             "rdkit_embedding": {
                 "method": "ETKDGv3" if hasattr(AllChem, "ETKDGv3") else "ETKDG",
                 "random_seed": config.enumeration.stereo_random_seed,
                 "requested_conformers": config.seeding.rdkit_num_conformers,
                 "prune_rms_thresh": config.seeding.rdkit_prune_rms_thresh,
+                "raw_xyz_written": write_raw_xyz,
+                "selected_seed_rank": selected_rank,
+                "selected_seed_count": len(selected_indexes),
             },
             "forcefield": {
                 "configured": config.seeding.rdkit_forcefield,
@@ -85,7 +106,7 @@ def generate_rdkit_seeds(
             SeedConformerRecord(
                 id=make_seed_id(
                     stereo_record.id,
-                    index,
+                    selected_rank,
                     canonical_smiles,
                     isomeric_smiles,
                     metadata,
@@ -100,14 +121,10 @@ def generate_rdkit_seeds(
                 explicit_proton_count=_explicit_proton_count(seed_mol),
                 source_software="rdkit",
                 source_python_function="dsvr.chemistry.conformers_rdkit.generate_rdkit_seeds",
-                output_paths=[
-                    output_dir / f"{stereo_record.id}_seeds.sdf",
-                    output_dir / f"{stereo_record.id}_seeds.csv",
-                    xyz_path,
-                ],
+                output_paths=output_paths,
                 warnings=[],
                 metadata=metadata,
-                conformer_index=index,
+                conformer_index=selected_rank,
                 energy_kcal_mol=energy,
                 rdkit_mol=seed_mol,
                 rdkit_conformer_id=0,
@@ -120,6 +137,7 @@ def generate_rdkit_seeds(
 
     _write_seed_sdf(output_dir / f"{stereo_record.id}_seeds.sdf", records)
     _write_seed_csv(output_dir / f"{stereo_record.id}_seeds.csv", records)
+    _write_seed_selection_csv(output_dir / f"{stereo_record.id}_seed_selection.csv", selection_rows)
     return records
 
 
@@ -229,6 +247,123 @@ def _remove_other_conformers(molecule: Chem.Mol, keep_conformer_id: int) -> None
             molecule.RemoveConformer(conformer.GetId())
 
 
+def _select_seed_candidates(
+    candidates: list[tuple[int, Chem.Mol, str, bool | None, float | None]],
+    config: RunConfig,
+) -> tuple[set[int], list[dict[str, object]]]:
+    max_seeds = seed_budget(config) or config.variant_filtering.max_seeds_per_variant
+    if max_seeds <= 0:
+        max_seeds = 1
+    ranked = sorted(
+        candidates,
+        key=lambda item: (float("inf") if item[4] is None else item[4], item[0]),
+    )
+    selected: list[tuple[int, Chem.Mol, str, bool | None, float | None]] = []
+    rows: list[dict[str, object]] = []
+    for candidate in ranked:
+        index, molecule, ff_status, converged, energy = candidate
+        if len(selected) >= max_seeds:
+            rows.append(
+                _seed_selection_row(
+                    candidate,
+                    False,
+                    "rejected_over_max_seeds_per_variant",
+                    None,
+                )
+            )
+            continue
+        min_rms = _minimum_rms(molecule, [item[1] for item in selected])
+        diverse = min_rms is None or min_rms >= config.seeding.rdkit_prune_rms_thresh
+        if diverse or not selected:
+            selected.append(candidate)
+            rows.append(
+                _seed_selection_row(
+                    candidate,
+                    True,
+                    "selected_low_energy_rms_diverse",
+                    min_rms,
+                )
+            )
+        else:
+            rows.append(
+                _seed_selection_row(
+                    candidate,
+                    False,
+                    "rejected_rms_duplicate",
+                    min_rms,
+                )
+            )
+    if len(selected) < max_seeds:
+        selected_ids = {item[0] for item in selected}
+        for candidate in ranked:
+            if len(selected) >= max_seeds:
+                break
+            if candidate[0] in selected_ids:
+                continue
+            selected.append(candidate)
+            selected_ids.add(candidate[0])
+            _replace_selection_row(
+                rows,
+                candidate[0],
+                _seed_selection_row(
+                    candidate,
+                    True,
+                    "selected_low_energy_fill_to_seed_budget",
+                    _minimum_rms(
+                        candidate[1],
+                        [item[1] for item in selected if item[0] != candidate[0]],
+                    ),
+                ),
+            )
+    selected_indexes = {item[0] for item in selected}
+    return selected_indexes, sorted(
+        rows,
+        key=lambda row: int(str(row["raw_conformer_index"])),
+    )
+
+
+def _seed_selection_row(
+    candidate: tuple[int, Chem.Mol, str, bool | None, float | None],
+    selected: bool,
+    reason: str,
+    min_rms_to_selected: float | None,
+) -> dict[str, object]:
+    index, _molecule, ff_status, converged, energy = candidate
+    return {
+        "raw_conformer_index": index,
+        "selected": selected,
+        "reason": reason,
+        "energy_kcal_mol": energy,
+        "forcefield_status": ff_status,
+        "minimization_converged": converged,
+        "min_rms_to_selected": min_rms_to_selected,
+    }
+
+
+def _replace_selection_row(
+    rows: list[dict[str, object]],
+    raw_conformer_index: int,
+    replacement: dict[str, object],
+) -> None:
+    for index, row in enumerate(rows):
+        if row["raw_conformer_index"] == raw_conformer_index:
+            rows[index] = replacement
+            return
+    rows.append(replacement)
+
+
+def _minimum_rms(molecule: Chem.Mol, selected: list[Chem.Mol]) -> float | None:
+    if not selected:
+        return None
+    values = []
+    for selected_mol in selected:
+        try:
+            values.append(float(AllChem.GetBestRMS(molecule, selected_mol)))
+        except (RuntimeError, ValueError):
+            continue
+    return min(values) if values else None
+
+
 def _write_seed_sdf(path: Path, records: list[SeedConformerRecord]) -> None:
     writer = Chem.SDWriter(str(path))
     for record in records:
@@ -284,6 +419,23 @@ def _write_seed_csv(path: Path, records: list[SeedConformerRecord]) -> None:
         for record in records:
             row = record.model_dump(mode="json")
             row["warnings"] = " | ".join(record.warnings)
+            writer.writerow({column: row.get(column) for column in columns})
+
+
+def _write_seed_selection_csv(path: Path, rows: list[dict[str, object]]) -> None:
+    columns = [
+        "raw_conformer_index",
+        "selected",
+        "reason",
+        "energy_kcal_mol",
+        "forcefield_status",
+        "minimization_converged",
+        "min_rms_to_selected",
+    ]
+    with path.open("w", encoding="utf-8", newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=columns)
+        writer.writeheader()
+        for row in rows:
             writer.writerow({column: row.get(column) for column in columns})
 
 

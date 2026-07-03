@@ -22,11 +22,32 @@ RDKit tautomer canonicalization is not stability ranking. It should not be used
 to assert the dominant tautomer in solution. Stability ranking requires a
 physics-based or empirically calibrated scoring layer and careful scope labels.
 
+RDKit tautomer enumeration is timeout- and cap-protected in DSVR. A timeout
+fallback keeps the parent protomer as a candidate so the workflow can continue,
+but that fallback is incomplete tautomer coverage and must be treated as a
+warning condition.
+
 ## Stereoisomers
 
 RDKit stereoisomer enumeration is explicit and controlled. The workflow can
 expand undefined stereocenters, but the resulting candidates are only as
 complete as the configured enumeration caps and input chemistry allow.
+
+In achiral solvent, DSVR may run CREST/xTB once for a pure enantiomeric pair and
+map the representative energy back to the partner. This is not valid for chiral
+environments such as asymmetric binding pockets, chiral chromatography, or
+chiral catalysts. Disable enantiomer collapse for those use cases.
+
+## SVPScore Filtering
+
+SVPScore is a transparent triage heuristic used to avoid spending CREST/xTB and
+thermochemistry time on implausible or low-priority generated variants. It is
+not final thermodynamics and is not a rigorous population model.
+
+SVPScore penalties for pH/protomer behavior are approximate unless a real
+micro-pKa or proton chemical-potential correction provider supplies explicit
+corrections. Complexity penalties are computational-priority terms, not physical
+instability claims.
 
 ## Auto3D Enumeration
 

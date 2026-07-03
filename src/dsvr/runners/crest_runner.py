@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import csv
+import gzip
 import json
 import re
 import shlex
@@ -12,6 +13,7 @@ from rdkit import Chem
 from rdkit.Chem import rdMolDescriptors
 
 from dsvr.config import RunConfig
+from dsvr.filtering.disk_guard import DiskLimitError, directory_size_gb, enforce_run_disk_limit
 from dsvr.models import CrestConformerRecord, SeedConformerRecord, make_crest_conformer_id
 from dsvr.parsing.crest_outputs import ParsedCrestOutput, parse_crest_outputs
 from dsvr.runners.subprocess_utils import ExternalToolError, run_command
@@ -32,6 +34,7 @@ def run_crest_for_seed(
 ) -> list[CrestConformerRecord]:
     workdir = crest_workdir(seed_record, config)
     workdir.mkdir(parents=True, exist_ok=True)
+    _enforce_disk_guard(config.output_dir, config, seed_record)
     input_xyz = workdir / "input.xyz"
     _write_seed_xyz(seed_record, input_xyz)
 
@@ -76,6 +79,17 @@ def run_crest_for_seed(
         )
         _write_outputs(workdir, [record])
         return [record]
+    except DiskLimitError as exc:
+        record = _failure_record(
+            seed_record,
+            config,
+            workdir,
+            command,
+            warnings + [f"CREST disk guard stopped job: {exc}"],
+            {"disk_guard": str(exc)},
+        )
+        _write_outputs(workdir, [record])
+        return [record]
 
     parsed = parse_crest_outputs(workdir)
     if not parsed.conformers:
@@ -91,6 +105,8 @@ def run_crest_for_seed(
         return [record]
     records = _records_from_parsed(seed_record, config, workdir, command, parsed, warnings)
     _write_outputs(workdir, records)
+    _cleanup_crest_workdir(workdir, config)
+    _enforce_disk_guard(config.output_dir, config, seed_record)
     return records
 
 
@@ -126,7 +142,7 @@ def build_crest_command(
             "this CREST installation to avoid unvalidated default flags."
         )
 
-    command = [executable, str(input_xyz)]
+    command = [executable, str(input_xyz.resolve())]
     _append_if_supported(command, help_text, f"--gfn{config.crest.gfn}", warnings)
     _append_pair_if_supported(command, help_text, "--chrg", str(charge), warnings)
     if uhf > 0:
@@ -228,7 +244,8 @@ def _records_from_parsed(
     warnings: list[str],
 ) -> list[CrestConformerRecord]:
     records: list[CrestConformerRecord] = []
-    for conformer in parsed.conformers:
+    kept_conformers = parsed.conformers[: config.crest.max_conformers_to_parse]
+    for conformer in kept_conformers:
         metadata = {
             "crest": {
                 "workdir": str(workdir),
@@ -272,10 +289,11 @@ def _records_from_parsed(
                 relative_energy_kcal_mol=conformer.relative_energy_kcal_mol,
             )
         )
-        (workdir / f"crest_conformer_{conformer.index:04d}.xyz").write_text(
-            conformer.xyz,
-            encoding="utf-8",
-        )
+        if conformer.index <= config.crest.max_conformers_to_keep or config.crest.keep_raw_xyz:
+            (workdir / f"crest_conformer_{conformer.index:04d}.xyz").write_text(
+                conformer.xyz,
+                encoding="utf-8",
+            )
     return records
 
 
@@ -333,6 +351,7 @@ def _write_outputs(workdir: Path, records: list[CrestConformerRecord]) -> None:
             json.dumps([record.model_dump(mode="json") for record in failures], indent=2) + "\n",
             encoding="utf-8",
         )
+    _write_energy_table(workdir / "crest_energy_table.csv", records)
 
 
 def _write_csv(path: Path, records: list[CrestConformerRecord]) -> None:
@@ -358,6 +377,71 @@ def _write_csv(path: Path, records: list[CrestConformerRecord]) -> None:
             row = record.model_dump(mode="json")
             row["warnings"] = " | ".join(record.warnings)
             writer.writerow({column: row.get(column) for column in columns})
+
+
+def _write_energy_table(path: Path, records: list[CrestConformerRecord]) -> None:
+    with path.open("w", encoding="utf-8", newline="") as handle:
+        writer = csv.DictWriter(
+            handle,
+            fieldnames=[
+                "conformer_id",
+                "crest_index",
+                "energy_kcal_mol",
+                "relative_energy_kcal_mol",
+            ],
+        )
+        writer.writeheader()
+        for record in records:
+            writer.writerow(
+                {
+                    "conformer_id": record.id,
+                    "crest_index": record.crest_index,
+                    "energy_kcal_mol": record.energy_kcal_mol,
+                    "relative_energy_kcal_mol": record.relative_energy_kcal_mol,
+                }
+            )
+
+
+def _cleanup_crest_workdir(workdir: Path, config: RunConfig) -> None:
+    if config.crest.delete_intermediate_xyz or config.disk.delete_intermediate_xyz:
+        for pattern in config.crest.cleanup_patterns:
+            for path in workdir.glob(pattern):
+                if path.is_file():
+                    path.unlink(missing_ok=True)
+    if not config.crest.keep_raw_xyz and not config.disk.keep_raw_xyz:
+        keep_names = {"input.xyz", "crest_conformers.xyz", "crest_ensemble.xyz", "crest_best.xyz"}
+        keep_names.update(
+            f"crest_conformer_{index:04d}.xyz"
+            for index in range(1, config.crest.max_conformers_to_keep + 1)
+        )
+        for path in workdir.glob("*.xyz"):
+            if path.name not in keep_names:
+                path.unlink(missing_ok=True)
+    if config.crest.compress_raw_outputs or config.disk.compress_raw_outputs:
+        for path in list(workdir.glob("*.log")) + list(workdir.glob("*.out")):
+            _gzip_file(path)
+
+
+def _gzip_file(path: Path) -> None:
+    if not path.exists() or path.suffix == ".gz":
+        return
+    gz_path = path.with_suffix(path.suffix + ".gz")
+    with path.open("rb") as source, gzip.open(gz_path, "wb") as target:
+        shutil.copyfileobj(source, target)
+    path.unlink(missing_ok=True)
+
+
+def _enforce_disk_guard(run_dir: Path, config: RunConfig, seed_record: SeedConformerRecord) -> None:
+    enforce_run_disk_limit(run_dir, config)
+    molecule_dir = config.output_dir / "crest" / seed_record.input_molecule_id
+    size_gb = directory_size_gb(molecule_dir)
+    if size_gb > config.disk.max_molecule_dir_gb:
+        message = (
+            f"CREST molecule directory {molecule_dir} is {size_gb:.2f} GiB, "
+            f"above {config.disk.max_molecule_dir_gb:.2f} GiB"
+        )
+        if config.disk.fail_on_disk_limit:
+            raise DiskLimitError(message)
 
 
 def _write_seed_xyz(seed_record: SeedConformerRecord, path: Path) -> None:
@@ -448,7 +532,7 @@ def _command_from_template(
     config: RunConfig,
 ) -> list[str]:
     rendered = template.format(
-        input_xyz=input_xyz,
+        input_xyz=input_xyz.resolve(),
         crest_executable=config.crest.executable,
         xtb_executable=config.crest.xtb_executable,
         gfn=config.crest.gfn,

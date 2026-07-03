@@ -95,6 +95,8 @@ def parse_xtb_thermo(logfile: Path | str) -> XtbThermo:
 def _read_text(logfile: Path | str) -> str:
     if isinstance(logfile, Path):
         return logfile.read_text(encoding="utf-8", errors="replace")
+    if not logfile:
+        return ""
     if "\n" in logfile or "TOTAL" in logfile.upper() or "GIBBS" in logfile.upper():
         return logfile
     path = Path(logfile)

@@ -16,6 +16,9 @@ PopulationScope = Literal["same_formula", "same_charge", "all_approximate"]
 EnergyUnit = Literal["kcal/mol"]
 LogLevel = Literal["DEBUG", "INFO", "WARNING", "ERROR"]
 QmBackend = Literal["psi4", "pyscf", "none"]
+FilteringMode = Literal["conservative", "balanced", "aggressive", "exhaustive"]
+CleanupPolicy = Literal["compact", "keep_selected", "debug_all"]
+TautomerStrategy = Literal["safe", "normal", "exhaustive"]
 
 KNOWN_SOLVENTS = {
     "acetone",
@@ -80,7 +83,13 @@ class ChemistryConfig(StrictModel):
 
 class EnumerationConfig(StrictModel):
     max_protomers_per_molecule: int = 32
-    max_tautomers_per_protomer: int = 64
+    max_tautomers_per_protomer: int = 32
+    max_tautomer_transforms: int = 256
+    tautomer_timeout_seconds: int = 30
+    tautomer_strategy: TautomerStrategy = "safe"
+    tautomer_remove_bond_stereo: bool = True
+    tautomer_remove_sp3_stereo: bool = True
+    tautomer_reassign_stereo: bool = True
     max_stereoisomers_per_tautomer: int = 64
     stereo_try_embedding: bool = True
     stereo_only_unassigned: bool = True
@@ -91,6 +100,8 @@ class EnumerationConfig(StrictModel):
     @field_validator(
         "max_protomers_per_molecule",
         "max_tautomers_per_protomer",
+        "max_tautomer_transforms",
+        "tautomer_timeout_seconds",
         "max_stereoisomers_per_tautomer",
     )
     @classmethod
@@ -102,10 +113,10 @@ class EnumerationConfig(StrictModel):
 
 class SeedingConfig(StrictModel):
     method: SeederMethod = "etkdg"
-    rdkit_num_conformers: int = 20
+    rdkit_num_conformers: int = 30
     rdkit_prune_rms_thresh: float = 0.5
     rdkit_forcefield: RdkitForcefield = "uff"
-    auto3d_k: int = 5
+    auto3d_k: int = 3
     auto3d_model: Auto3dModel = "AIMNet2"
     auto3d_internal_tautomer_stereo_enum: bool = False
 
@@ -131,15 +142,30 @@ class CrestConfig(StrictModel):
     gfn: int = 2
     ewin_kcal_mol: float = 6.0
     nproc: int = 4
-    walltime_minutes: int | None = None
+    max_jobs_per_molecule: int = 8
+    max_conformers_to_parse: int = 20
+    max_conformers_to_keep: int = 5
+    keep_raw_xyz: bool = False
+    compress_raw_outputs: bool = True
+    delete_intermediate_xyz: bool = True
+    cleanup_patterns: list[str] = Field(
+        default_factory=lambda: ["*.tmp", "coord.*", "struc*.xyz", "trial*.xyz"]
+    )
+    walltime_minutes: int | None = 30
     command_template: str | None = None
     extra_args: list[str] = Field(default_factory=list)
 
-    @field_validator("gfn", "nproc")
+    @field_validator(
+        "gfn",
+        "nproc",
+        "max_jobs_per_molecule",
+        "max_conformers_to_parse",
+        "max_conformers_to_keep",
+    )
     @classmethod
     def positive_int(cls, value: int) -> int:
         if value <= 0:
-            raise ValueError("gfn and nproc must be positive")
+            raise ValueError("CREST positive integer settings must be positive")
         return value
 
     @field_validator("ewin_kcal_mol")
@@ -157,6 +183,44 @@ class CrestConfig(StrictModel):
         return value
 
 
+class XtbPrefilterConfig(StrictModel):
+    enabled: bool = False
+    optimize: bool = True
+    hessian: bool = False
+    solvent_model: SolventModel = "alpb"
+    solvent: str = "water"
+    gfn: int = 2
+    max_variants_per_molecule: int = 16
+    keep_within_kcal_mol: float = 10.0
+    keep_top_n_per_molecule: int = 8
+    keep_top_n_per_charge: int = 3
+    keep_top_n_per_formula: int = 3
+    timeout_seconds_per_variant: int = 300
+    nproc: int = 4
+
+    @field_validator(
+        "gfn",
+        "max_variants_per_molecule",
+        "keep_top_n_per_molecule",
+        "keep_top_n_per_charge",
+        "keep_top_n_per_formula",
+        "timeout_seconds_per_variant",
+        "nproc",
+    )
+    @classmethod
+    def positive_prefilter_int(cls, value: int) -> int:
+        if value <= 0:
+            raise ValueError("xTB prefilter integer limits must be positive")
+        return value
+
+    @field_validator("keep_within_kcal_mol")
+    @classmethod
+    def nonnegative_prefilter_window(cls, value: float) -> float:
+        if value < 0:
+            raise ValueError("xTB prefilter energy window must be non-negative")
+        return value
+
+
 class ThermoConfig(StrictModel):
     enabled: bool = True
     xtb_hessian: bool = True
@@ -164,12 +228,21 @@ class ThermoConfig(StrictModel):
     rrho_cutoff: float = 100.0
     population_scope: PopulationScope = "same_formula"
     energy_unit: EnergyUnit = "kcal/mol"
+    max_variants_per_molecule: int = 5
+    max_conformers_per_variant: int = 3
 
     @field_validator("rrho_cutoff")
     @classmethod
     def nonnegative_rrho_cutoff(cls, value: float) -> float:
         if value < 0:
             raise ValueError("rrho_cutoff must be non-negative")
+        return value
+
+    @field_validator("max_variants_per_molecule", "max_conformers_per_variant")
+    @classmethod
+    def positive_thermo_limit(cls, value: int) -> int:
+        if value <= 0:
+            raise ValueError("thermo candidate limits must be positive")
         return value
 
 
@@ -186,7 +259,7 @@ class OptionalRefinementConfig(StrictModel):
     qm_single_point: bool = True
     psi4_enabled: bool = False
     pyscf_enabled: bool = False
-    max_candidates_for_refinement: int = 5
+    max_candidates_for_refinement: int = 3
 
     @field_validator("max_candidates_for_refinement")
     @classmethod
@@ -196,10 +269,114 @@ class OptionalRefinementConfig(StrictModel):
         return value
 
 
+class QmConfig(StrictModel):
+    enabled: bool = False
+    backend: QmBackend = "none"
+    max_candidates: int = 3
+
+    @field_validator("max_candidates")
+    @classmethod
+    def positive_qm_candidates(cls, value: int) -> int:
+        if value <= 0:
+            raise ValueError("qm.max_candidates must be positive")
+        return value
+
+
 class LoggingConfig(StrictModel):
     level: LogLevel = "INFO"
     save_subprocess_logs: bool = True
     tail_subprocess_logs: bool = True
+
+
+class VariantFilteringConfig(StrictModel):
+    enabled: bool = True
+    mode: FilteringMode = "balanced"
+    max_variants_before_3d_per_molecule: int = 64
+    max_variants_after_cheap_score_per_molecule: int = 24
+    max_variants_for_xtb_prefilter_per_molecule: int = 16
+    max_variants_for_crest_per_molecule: int = 8
+    max_seeds_per_variant: int = 2
+    keep_original_state: bool = True
+    keep_best_per_charge_state: bool = True
+    keep_best_per_formula: bool = True
+    keep_best_per_protomer: bool = True
+    keep_best_per_tautomer_family: bool = True
+    collapse_enantiomers: bool = True
+    absolute_penalty_cutoff: float = 12.0
+    relative_penalty_cutoff: float = 7.0
+    min_variants_to_keep: int = 3
+    rescue_rules_enabled: bool = True
+
+    @field_validator(
+        "max_variants_before_3d_per_molecule",
+        "max_variants_after_cheap_score_per_molecule",
+        "max_variants_for_xtb_prefilter_per_molecule",
+        "max_variants_for_crest_per_molecule",
+        "max_seeds_per_variant",
+        "min_variants_to_keep",
+    )
+    @classmethod
+    def positive_budget(cls, value: int) -> int:
+        if value <= 0:
+            raise ValueError("variant filtering budgets must be positive")
+        return value
+
+    @field_validator("absolute_penalty_cutoff", "relative_penalty_cutoff")
+    @classmethod
+    def nonnegative_cutoff(cls, value: float) -> float:
+        if value < 0:
+            raise ValueError("variant filtering cutoffs must be non-negative")
+        return value
+
+
+class StereoFilteringConfig(StrictModel):
+    collapse_enantiomers_in_achiral_solvent: bool = True
+    solvent_is_chiral: bool = False
+    run_crest_for_enantiomer_pairs_once: bool = True
+    keep_mapping_to_all_stereo_outputs: bool = True
+
+
+class TimeoutConfig(StrictModel):
+    protomer_seconds_per_molecule: int = 60
+    tautomer_seconds_per_protomer: int = 30
+    stereo_seconds_per_tautomer: int = 30
+    etkdg_seconds_per_variant: int = 60
+    auto3d_seconds_per_batch: int = 600
+    xtb_prefilter_seconds_per_variant: int = 300
+    crest_seconds_per_variant: int = 1800
+    thermo_seconds_per_conformer: int = 600
+
+    @field_validator("*")
+    @classmethod
+    def positive_timeout(cls, value: int) -> int:
+        if value <= 0:
+            raise ValueError("timeouts must be positive")
+        return value
+
+
+class DiskConfig(StrictModel):
+    cleanup_policy: CleanupPolicy = "compact"
+    keep_raw_xyz: bool = False
+    compress_raw_outputs: bool = True
+    delete_intermediate_xyz: bool = True
+    max_run_dir_gb: float = 20.0
+    max_molecule_dir_gb: float = 3.0
+    max_xyz_files_per_molecule: int = 500
+    fail_on_disk_limit: bool = True
+
+    @field_validator("max_run_dir_gb", "max_molecule_dir_gb")
+    @classmethod
+    def positive_disk_limit(cls, value: float) -> float:
+        if value <= 0:
+            raise ValueError("disk GB limits must be positive")
+        return value
+
+    @field_validator("max_xyz_files_per_molecule")
+    @classmethod
+    def positive_xyz_limit(cls, value: int) -> int:
+        if value <= 0:
+            raise ValueError("max_xyz_files_per_molecule must be positive")
+        return value
 
 
 class RunConfig(StrictModel):
@@ -215,9 +392,15 @@ class RunConfig(StrictModel):
     enumeration: EnumerationConfig = Field(default_factory=EnumerationConfig)
     seeding: SeedingConfig = Field(default_factory=SeedingConfig)
     crest: CrestConfig = Field(default_factory=CrestConfig)
+    xtb_prefilter: XtbPrefilterConfig = Field(default_factory=XtbPrefilterConfig)
     thermo: ThermoConfig = Field(default_factory=ThermoConfig)
     refinement: OptionalRefinementConfig = Field(default_factory=OptionalRefinementConfig)
+    qm: QmConfig = Field(default_factory=QmConfig)
     logging: LoggingConfig = Field(default_factory=LoggingConfig)
+    variant_filtering: VariantFilteringConfig = Field(default_factory=VariantFilteringConfig)
+    stereo_filtering: StereoFilteringConfig = Field(default_factory=StereoFilteringConfig)
+    timeouts: TimeoutConfig = Field(default_factory=TimeoutConfig)
+    disk: DiskConfig = Field(default_factory=DiskConfig)
 
     @field_validator("max_workers")
     @classmethod
@@ -230,6 +413,10 @@ class RunConfig(StrictModel):
 def load_config(path: Path) -> RunConfig:
     with path.open(encoding="utf-8") as handle:
         data = yaml.safe_load(handle) or {}
+    if path.name == "resolved_config.yaml":
+        output_dir = data.get("output_dir")
+        if output_dir is not None and not Path(output_dir).is_absolute():
+            data["output_dir"] = path.parent
     return RunConfig.model_validate(data)
 
 

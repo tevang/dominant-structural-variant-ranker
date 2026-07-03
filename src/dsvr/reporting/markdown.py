@@ -88,6 +88,9 @@ def _report_text(
         for warning in warnings
         if any(token in warning.lower() for token in ("failed", "unavailable", "error"))
     ]
+    tautomer_timeout_rows = _tautomer_timeout_rows(records)
+    stereo_reduction = manifest.get("filtering", {}).get("stereo_reduction", {})
+    xtb_prefilter = manifest.get("filtering", {}).get("xtb_prefilter", {})
     lines = [
         "# DSVR Run Report",
         "",
@@ -101,6 +104,12 @@ def _report_text(
         f"- Solvent model: {config.chemistry.solvent_model}",
         f"- Temperature K: {config.chemistry.temperature_kelvin}",
         f"- Population scope: {config.thermo.population_scope}",
+        f"- Thermo max variants per molecule: {config.thermo.max_variants_per_molecule}",
+        f"- Thermo max conformers per variant: {config.thermo.max_conformers_per_variant}",
+        f"- CENSO enabled: {config.refinement.censo_enabled}",
+        f"- CENSO max candidates: {config.refinement.max_candidates_for_refinement}",
+        f"- QM enabled: {config.qm.enabled}",
+        f"- QM max candidates: {config.qm.max_candidates}",
         "",
         "## Tool Versions",
         "",
@@ -141,6 +150,30 @@ def _report_text(
         ),
         *[f"- {warning}" for warning in warnings],
         "",
+        "## Tautomer Timeout Counts",
+        "",
+        "| Input ID | Molecule | Timeout fallback count |",
+        "| --- | --- | ---: |",
+        *(tautomer_timeout_rows or ["| none | none | 0 |"]),
+        "",
+        "## Stereo Reduction",
+        "",
+        (
+            "- CREST jobs saved by enantiomer collapse: "
+            f"{stereo_reduction.get('jobs_saved', 0)}"
+        ),
+        (
+            "- Enantiomer collapse assumes an achiral solvent/environment; disable "
+            "`stereo_filtering.collapse_enantiomers_in_achiral_solvent` or set "
+            "`stereo_filtering.solvent_is_chiral` for chiral binding-pocket evaluations."
+        ),
+        "",
+        "## xTB Prefilter",
+        "",
+        f"- Enabled: {xtb_prefilter.get('enabled', False)}",
+        f"- Decisions: {xtb_prefilter.get('decision_count', 0)}",
+        f"- Variants/seeds pruned before CREST: {xtb_prefilter.get('pruned_count', 0)}",
+        "",
         "## Failure Summary",
         "",
         *([f"- {failure}" for failure in failures] or ["- No failures recorded."]),
@@ -151,6 +184,19 @@ def _report_text(
         "",
     ]
     return "\n".join(lines)
+
+
+def _tautomer_timeout_rows(records: list[AnyLineageRecord]) -> list[str]:
+    counts: Counter[tuple[str, str]] = Counter()
+    for record in records:
+        if record.stage_name != "tautomer":
+            continue
+        if any("tautomer enumeration timeout" in warning.lower() for warning in record.warnings):
+            counts[(record.input_molecule_id, record.molname)] += 1
+    return [
+        f"| {input_id} | {molname} | {count} |"
+        for (input_id, molname), count in sorted(counts.items())
+    ]
 
 
 def _markdown_to_simple_html(markdown: str) -> str:

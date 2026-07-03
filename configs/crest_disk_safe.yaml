@@ -1,0 +1,33 @@
+run_name: crest-disk-safe
+input_path: examples/test_molecules_minimal.smi
+input_format: auto
+output_dir: runs/crest_disk_safe
+overwrite: false
+resume: true
+
+crest:
+  enabled: true
+  max_jobs_per_molecule: 4
+  max_conformers_to_parse: 10
+  max_conformers_to_keep: 3
+  keep_raw_xyz: false
+  compress_raw_outputs: true
+  delete_intermediate_xyz: true
+  cleanup_patterns: ["*.tmp", "coord.*", "struc*.xyz", "trial*.xyz"]
+  walltime_minutes: 30
+
+variant_filtering:
+  enabled: true
+  mode: conservative
+  max_variants_for_crest_per_molecule: 4
+  max_seeds_per_variant: 1
+
+disk:
+  cleanup_policy: compact
+  keep_raw_xyz: false
+  compress_raw_outputs: true
+  delete_intermediate_xyz: true
+  max_run_dir_gb: 10.0
+  max_molecule_dir_gb: 1.0
+  max_xyz_files_per_molecule: 250
+  fail_on_disk_limit: true

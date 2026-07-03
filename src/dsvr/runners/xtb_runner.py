@@ -133,7 +133,7 @@ def _base_xtb_command(
 ) -> list[str]:
     command = [
         _xtb_executable(config),
-        str(input_xyz),
+        str(input_xyz.resolve()),
         "--gfn",
         str(config.crest.gfn),
         "--chrg",

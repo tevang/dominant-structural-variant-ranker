@@ -130,6 +130,7 @@ def should_skip_step(step: WorkflowStep, input_hash: str, config: RunConfig) -> 
         done.get("step") == step.name
         and done.get("input_hash") == input_hash
         and done.get("config_hash") == config_hash(config)
+        and _step_artifacts_complete(step, done, config)
     )
 
 
@@ -184,6 +185,55 @@ def read_done(output_dir: Path) -> dict[str, Any]:
         return json.loads(path.read_text(encoding="utf-8"))
     except json.JSONDecodeError:
         return {}
+
+
+def _step_artifacts_complete(
+    step: WorkflowStep,
+    done: dict[str, Any],
+    config: RunConfig,
+) -> bool:
+    details = done.get("details", {})
+    count = details.get("count")
+    if step.name == "standardize":
+        return (step.output_dir / "standardized_inputs.csv").exists()
+    if step.name == "protonation":
+        return count != 0 and any(step.output_dir.glob("*_protomers.sdf"))
+    if step.name == "tautomers":
+        return count != 0 and any(step.output_dir.glob("*_tautomers.sdf"))
+    if step.name == "stereochemistry":
+        return count != 0 and any(step.output_dir.glob("*_stereoisomers.sdf"))
+    if step.name == "seeding":
+        return count != 0 and any(step.output_dir.glob("**/*_seeds.sdf"))
+    if step.name == "crest":
+        if not config.crest.enabled:
+            return False
+        return count != 0 and _has_successful_crest_records(step.output_dir)
+    if step.name == "xtb_thermo":
+        input_count = details.get("input_count", 0)
+        if not config.thermo.enabled or input_count == 0:
+            return True
+        return count != 0 and any(step.output_dir.glob("**/xtb_thermo.json"))
+    if step.name == "ranking":
+        return count != 0 and (step.output_dir / "ranked_variants.json").exists()
+    if step.name == "reports":
+        return (step.output_dir / "manifest.json").exists() and (
+            step.output_dir / "summary.md"
+        ).exists()
+    return True
+
+
+def _has_successful_crest_records(output_dir: Path) -> bool:
+    for path in output_dir.glob("**/crest_provenance.jsonl"):
+        for line in path.read_text(encoding="utf-8", errors="replace").splitlines():
+            if not line.strip():
+                continue
+            try:
+                record = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if record.get("crest_index", 0) and record.get("energy_kcal_mol") is not None:
+                return True
+    return False
 
 
 def write_dry_run_plan(config: RunConfig) -> Path:

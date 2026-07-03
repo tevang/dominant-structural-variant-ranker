@@ -19,6 +19,12 @@ chemistry:
 enumeration:
   max_protomers_per_molecule: 16
   max_tautomers_per_protomer: 16
+  max_tautomer_transforms: 256
+  tautomer_timeout_seconds: 30
+  tautomer_strategy: safe
+  tautomer_remove_bond_stereo: true
+  tautomer_remove_sp3_stereo: true
+  tautomer_reassign_stereo: true
   max_stereoisomers_per_tautomer: 16
   stereo_try_embedding: true
   stereo_only_unassigned: true
@@ -28,10 +34,10 @@ enumeration:
 
 seeding:
   method: etkdg
-  rdkit_num_conformers: 10
+  rdkit_num_conformers: 30
   rdkit_prune_rms_thresh: 0.5
   rdkit_forcefield: uff
-  auto3d_k: 5
+  auto3d_k: 3
   auto3d_model: AIMNet2
   auto3d_internal_tautomer_stereo_enum: false
 
@@ -64,3 +70,48 @@ logging:
   level: INFO
   save_subprocess_logs: true
   tail_subprocess_logs: true
+
+variant_filtering:
+  enabled: true
+  mode: balanced
+  max_variants_before_3d_per_molecule: 64
+  max_variants_after_cheap_score_per_molecule: 24
+  max_variants_for_xtb_prefilter_per_molecule: 16
+  max_variants_for_crest_per_molecule: 8
+  max_seeds_per_variant: 2
+  keep_original_state: true
+  keep_best_per_charge_state: true
+  keep_best_per_formula: true
+  keep_best_per_protomer: true
+  keep_best_per_tautomer_family: true
+  absolute_penalty_cutoff: 12.0
+  relative_penalty_cutoff: 7.0
+  min_variants_to_keep: 3
+  rescue_rules_enabled: true
+  collapse_enantiomers: true
+
+stereo_filtering:
+  collapse_enantiomers_in_achiral_solvent: true
+  solvent_is_chiral: false
+  run_crest_for_enantiomer_pairs_once: true
+  keep_mapping_to_all_stereo_outputs: true
+
+timeouts:
+  protomer_seconds_per_molecule: 60
+  tautomer_seconds_per_protomer: 30
+  stereo_seconds_per_tautomer: 30
+  etkdg_seconds_per_variant: 60
+  auto3d_seconds_per_batch: 600
+  xtb_prefilter_seconds_per_variant: 300
+  crest_seconds_per_variant: 1800
+  thermo_seconds_per_conformer: 600
+
+disk:
+  cleanup_policy: compact
+  keep_raw_xyz: false
+  compress_raw_outputs: true
+  delete_intermediate_xyz: true
+  max_run_dir_gb: 20.0
+  max_molecule_dir_gb: 3.0
+  max_xyz_files_per_molecule: 500
+  fail_on_disk_limit: true

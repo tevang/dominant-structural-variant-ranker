@@ -22,6 +22,7 @@ def test_generate_rdkit_seeds_for_simple_molecule(tmp_path: Path) -> None:
         input_path=tmp_path / "stereo.sdf",
         output_dir=tmp_path / "run",
         seeding={"rdkit_num_conformers": 3, "rdkit_forcefield": "uff"},
+        disk={"keep_raw_xyz": True},
     )
 
     records = generate_rdkit_seeds(stereo, config)
@@ -46,6 +47,7 @@ def test_xyz_output_is_basic_xtb_crest_compatible(tmp_path: Path) -> None:
         input_path=tmp_path / "stereo.sdf",
         output_dir=tmp_path / "run",
         seeding={"rdkit_num_conformers": 1},
+        disk={"keep_raw_xyz": True},
     )
 
     generate_rdkit_seeds(stereo, config)
@@ -72,6 +74,23 @@ def test_embedding_failure_is_recorded(tmp_path: Path, monkeypatch) -> None:
     assert records[0].embedding_status == "failed"
     assert "embedding exploded" in records[0].warnings[0]
     assert (tmp_path / "run" / "seeding" / "rdkit" / f"{stereo.id}_seeds.csv").exists()
+
+
+def test_etkdg_pool_is_reduced_to_seed_budget_without_xyz_tree(tmp_path: Path) -> None:
+    stereo = _stereo("hexane", "CCCCCC")
+    config = RunConfig(
+        input_path=tmp_path / "stereo.sdf",
+        output_dir=tmp_path / "run",
+        seeding={"rdkit_num_conformers": 30, "rdkit_forcefield": "uff"},
+        variant_filtering={"max_seeds_per_variant": 2},
+    )
+
+    records = generate_rdkit_seeds(stereo, config)
+
+    assert len(records) <= 2
+    seed_dir = tmp_path / "run" / "seeding" / "rdkit"
+    assert (seed_dir / f"{stereo.id}_seed_selection.csv").exists()
+    assert not (seed_dir / "xyz").exists()
 
 
 def test_cli_seed_etkdg_from_stereo_sdf(tmp_path: Path) -> None:

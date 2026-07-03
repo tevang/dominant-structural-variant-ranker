@@ -4,9 +4,13 @@ __pycache__/
 .pytest_cache/
 .ruff_cache/
 .mypy_cache/
+.idea/
+.junie/
 *.egg-info/
 build/
 dist/
 runs/
+examples/runs/
+logs/
 tmp/
 doctor_report.json

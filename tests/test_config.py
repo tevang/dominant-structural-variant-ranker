@@ -60,6 +60,29 @@ def test_load_config_from_yaml(tmp_path: Path) -> None:
     assert config.refinement.censo_enabled is True
 
 
+def test_load_resolved_config_anchors_relative_output_to_run_dir(tmp_path: Path) -> None:
+    run_dir = tmp_path / "runs" / "dsvr"
+    run_dir.mkdir(parents=True)
+    path = run_dir / "resolved_config.yaml"
+    input_path = tmp_path / "mols.smi"
+    input_path.write_text("CCO ethanol\n", encoding="utf-8")
+    path.write_text(
+        "\n".join(
+            [
+                "run_name: resolved",
+                f"input_path: {input_path}",
+                "input_format: smi",
+                "output_dir: runs/dsvr",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    config = load_config(path)
+
+    assert config.output_dir == run_dir
+
+
 def test_cli_override_merge_updates_nested_fields(tmp_path: Path) -> None:
     config = merge_cli_overrides(
         RunConfig(),
@@ -90,6 +113,17 @@ def test_write_resolved_config(tmp_path: Path) -> None:
     resolved = yaml.safe_load(path.read_text(encoding="utf-8"))
     assert resolved["chemistry"]["ph_low"] == 7.0
     assert resolved["seeding"]["method"] == "etkdg"
+
+
+def test_production_configs_load() -> None:
+    for path in [
+        Path("configs/production_balanced.yaml"),
+        Path("configs/production_conservative.yaml"),
+        Path("configs/exhaustive_debug.yaml"),
+        Path("configs/crest_disk_safe.yaml"),
+    ]:
+        config = load_config(path)
+        assert config.run_name
 
 
 def test_rejects_partial_ph_window() -> None:

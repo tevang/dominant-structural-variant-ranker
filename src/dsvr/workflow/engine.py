@@ -1,19 +1,41 @@
 from __future__ import annotations
 
 import csv
+import json
 import shutil
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 from rdkit import Chem
 from rdkit.Chem import rdMolDescriptors
 
 from dsvr.chemistry.conformers_auto3d import generate_auto3d_seeds
-from dsvr.chemistry.conformers_rdkit import generate_rdkit_seeds
+from dsvr.chemistry.conformers_rdkit import generate_rdkit_seeds, read_stereo_sdf
 from dsvr.chemistry.protonation import generate_protomer_candidates
-from dsvr.chemistry.stereochemistry import enumerate_stereoisomers
-from dsvr.chemistry.tautomers import enumerate_tautomers
+from dsvr.chemistry.stereochemistry import enumerate_stereoisomers, read_tautomers_sdf
+from dsvr.chemistry.tautomers import enumerate_tautomers, read_protomers_sdf
 from dsvr.config import RunConfig, write_resolved_config
+from dsvr.filtering.progress import decision_counts
+from dsvr.filtering.selection import (
+    FilteringDecision,
+    select_seed_records,
+    select_stereo_records,
+    write_filtering_csv,
+    write_filtering_decisions,
+    write_penalty_outputs,
+)
+from dsvr.filtering.stereo_reduce import (
+    StereoReductionResult,
+    expand_enantiomer_mapped_crest_records,
+    expand_enantiomer_mapped_thermo_records,
+    reduce_seeds_for_crest,
+    write_stereo_reduction_outputs,
+)
+from dsvr.filtering.xtb_prefilter import (
+    XtbPrefilterDecision,
+    apply_xtb_prefilter,
+    write_xtb_prefilter_outputs,
+)
 from dsvr.io.read_inputs import read_molecules
 from dsvr.io.write_outputs import write_final_ranked_outputs, write_json, write_ranked_csv
 from dsvr.models import (
@@ -24,14 +46,17 @@ from dsvr.models import (
     RankedVariantRecord,
     SeedConformerRecord,
     VariantRecord,
+    ThermoRecord,
     WorkflowResult,
     make_protomer_id,
 )
 from dsvr.ranking.population import compute_delta_g_and_populations, write_ranked_outputs
+from dsvr.reporting.audit import write_audit_tables
 from dsvr.reporting.markdown import write_run_report, write_summary_markdown
-from dsvr.runners.auto3d_runner import Auto3DUnavailableError
+from dsvr.reporting.progress import ProgressRecorder
+from dsvr.runners.auto3d_runner import Auto3DExecutionError, Auto3DUnavailableError
 from dsvr.runners.censo_runner import refine_top_ranked_with_censo
-from dsvr.runners.crest_runner import run_crest_for_seed
+from dsvr.runners.crest_runner import read_seed_sdf, run_crest_for_seed
 from dsvr.runners.molscrub_runner import MolscrubUnavailableError
 from dsvr.runners.psi4_runner import rescore_top_ranked_with_psi4
 from dsvr.runners.pyscf_runner import rescore_top_ranked_with_pyscf
@@ -56,6 +81,8 @@ def run_workflow(config: RunConfig) -> WorkflowResult:
     (outdir / "logs").mkdir(parents=True, exist_ok=True)
     configure_logging(level=config.logging.level, log_file=outdir / "logs" / "workflow.log")
     write_resolved_config(config, outdir)
+    progress = ProgressRecorder(outdir)
+    progress.record("Input validation", "started")
 
     if config.dry_run:
         plan_path = write_dry_run_plan(config)
@@ -67,7 +94,13 @@ def run_workflow(config: RunConfig) -> WorkflowResult:
     steps = {step.name: step for step in planned_steps(config)}
     states: list[StepState] = []
     records: list[AnyLineageRecord] = []
+    filtering_decisions: list[FilteringDecision] = []
     warnings: list[str] = []
+    if config.variant_filtering.enabled and config.variant_filtering.mode == "exhaustive":
+        warnings.append(
+            "variant_filtering.mode=exhaustive is expensive; "
+            "CREST/xTB may run on every generated seed."
+        )
     input_hash = file_hash(config.input_path)
 
     molecules = read_molecules(
@@ -75,12 +108,19 @@ def run_workflow(config: RunConfig) -> WorkflowResult:
         input_format=config.input_format,
         invalid_output_path=outdir / "invalid_inputs.csv",
     )
+    progress.record(
+        "Input validation",
+        "completed",
+        generated_count=len(molecules),
+        accepted_count=len(molecules),
+    )
     _ensure_invalid_inputs_csv(outdir / "invalid_inputs.csv")
     _write_input_table(outdir / "input" / "inputs.csv", molecules)
     states.append(mark_done(steps["input"], input_hash, config, details={"count": len(molecules)}))
 
     if should_skip_step(steps["standardize"], records_hash(molecules), config):
         states.append(skipped_state(steps["standardize"], records_hash(molecules), config))
+        molecules = _standardize_molecules(molecules, config)
     else:
         molecules = _standardize_molecules(molecules, config)
         _write_input_table(outdir / "input" / "standardized_inputs.csv", molecules)
@@ -94,12 +134,17 @@ def run_workflow(config: RunConfig) -> WorkflowResult:
         )
 
     protomers: list[ProtomerRecord] = []
+    progress.record("Protomer generation", "started", generated_count=len(molecules))
     protomer_hash = records_hash(molecules)
     if should_skip_step(steps["protonation"], protomer_hash, config):
         states.append(skipped_state(steps["protonation"], protomer_hash, config))
         protomers = _load_protomers(outdir)
     else:
         for molecule in molecules:
+            existing = _load_existing_protomer_outputs(molecule, outdir, config)
+            if existing:
+                protomers.extend(existing)
+                continue
             try:
                 protomers.extend(generate_protomer_candidates(molecule, config))
             except MolscrubUnavailableError as exc:
@@ -114,45 +159,76 @@ def run_workflow(config: RunConfig) -> WorkflowResult:
             )
         )
     records.extend(protomers)
+    progress.record("Protomer generation", "completed", generated_count=len(protomers))
 
+    progress.record("Tautomer enumeration", "started", generated_count=len(protomers))
     tautomers = _run_step_list(
         "tautomers",
         protomers,
         config,
         states,
         lambda item: enumerate_tautomers(item, config),
+        resume_loader=lambda: _load_tautomers(outdir),
+        existing_loader=lambda item: _load_existing_tautomer_outputs(item, outdir, config),
     )
     records.extend(tautomers)
+    progress.record("Tautomer enumeration", "completed", generated_count=len(tautomers))
 
+    progress.record("Stereoisomer enumeration", "started", generated_count=len(tautomers))
     stereos = _run_step_list(
         "stereochemistry",
         tautomers,
         config,
         states,
         lambda item: enumerate_stereoisomers(item, config),
+        resume_loader=lambda: _load_stereos(outdir),
+        existing_loader=lambda item: _load_existing_stereo_outputs(item, outdir, config),
     )
     records.extend(stereos)
+    progress.record("Stereoisomer enumeration", "completed", generated_count=len(stereos))
+    progress.record("Cheap variant scoring", "started", generated_count=len(stereos))
+    stereos_for_seeding, decisions = select_stereo_records(stereos, config, "pre_3d")
+    filtering_decisions.extend(decisions)
+    stereos_for_seeding, decisions = select_stereo_records(
+        stereos_for_seeding,
+        config,
+        "cheap_score",
+    )
+    filtering_decisions.extend(decisions)
+    progress.record(
+        "Cheap variant scoring",
+        "completed",
+        generated_count=len(stereos),
+        accepted_count=len(stereos_for_seeding),
+        rejected_count=max(0, len(stereos) - len(stereos_for_seeding)),
+    )
 
     seeds: list[SeedConformerRecord] = []
-    seed_input_hash = records_hash(stereos)
+    progress.record("3D seeding", "started", generated_count=len(stereos_for_seeding))
+    seed_input_hash = records_hash(stereos_for_seeding)
     if should_skip_step(steps["seeding"], seed_input_hash, config):
         states.append(skipped_state(steps["seeding"], seed_input_hash, config))
-        seeds = []
+        seeds = _load_seeds(outdir)
     else:
+        seed_config = _config_for_seed_budget(config)
         if config.seeding.method in {"etkdg", "both"}:
-            for stereo in stereos:
-                seeds.extend(generate_rdkit_seeds(stereo, config))
+            for stereo in stereos_for_seeding:
+                existing = _load_existing_seed_outputs(stereo, outdir, config)
+                if existing:
+                    seeds.extend(existing)
+                else:
+                    seeds.extend(generate_rdkit_seeds(stereo, seed_config))
         if config.seeding.method in {"auto3d", "both"}:
             try:
-                seeds.extend(generate_auto3d_seeds(stereos, config))
-            except Auto3DUnavailableError as exc:
+                seeds.extend(generate_auto3d_seeds(stereos_for_seeding, seed_config))
+            except (Auto3DExecutionError, Auto3DUnavailableError) as exc:
                 warnings.append(str(exc))
                 if config.seeding.method == "auto3d":
                     warnings.append(
-                        "Auto3D unavailable in integrated workflow; falling back to RDKit ETKDG."
+                        "Auto3D failed in integrated workflow; falling back to RDKit ETKDG."
                     )
-                    for stereo in stereos:
-                        seeds.extend(generate_rdkit_seeds(stereo, config))
+                    for stereo in stereos_for_seeding:
+                        seeds.extend(generate_rdkit_seeds(stereo, seed_config))
         states.append(
             mark_done(
                 steps["seeding"],
@@ -162,26 +238,102 @@ def run_workflow(config: RunConfig) -> WorkflowResult:
             )
         )
     records.extend(seeds)
+    progress.record("3D seeding", "completed", generated_count=len(seeds))
+    progress.record("3D seed filtering", "started", generated_count=len(seeds))
+    crest_seeds, decisions = select_seed_records(seeds, config)
+    filtering_decisions.extend(decisions)
+    progress.record("3D seed filtering", "completed", accepted_count=len(crest_seeds))
+    progress.record("xTB prefilter", "started", generated_count=len(crest_seeds))
+    crest_seeds, xtb_prefilter_decisions = apply_xtb_prefilter(crest_seeds, config)
+    progress.record(
+        "xTB prefilter",
+        "completed",
+        accepted_count=len(crest_seeds),
+        rejected_count=len([item for item in xtb_prefilter_decisions if not item.selected]),
+    )
+    stereo_reduction = reduce_seeds_for_crest(crest_seeds, stereos_for_seeding, config)
+    _write_filtering_outputs(
+        outdir,
+        filtering_decisions,
+        stereo_reduction,
+        xtb_prefilter_decisions,
+    )
 
-    crest_records = _run_crest_or_seed_ranking(seeds, config, states, warnings)
+    progress.record("CREST/xTB", "started", generated_count=len(stereo_reduction.selected_seeds))
+    representative_crest_records = _run_crest_or_seed_ranking(
+        stereo_reduction.selected_seeds,
+        config,
+        states,
+        warnings,
+    )
+    progress.record(
+        "CREST/xTB",
+        "completed",
+        generated_count=len(representative_crest_records),
+        skipped_count=stereo_reduction.jobs_saved,
+    )
+    crest_records = expand_enantiomer_mapped_crest_records(
+        representative_crest_records,
+        {seed.id: seed for seed in crest_seeds},
+        stereo_reduction,
+        config,
+    )
     records.extend(crest_records)
 
     thermo_records = []
-    if config.thermo.enabled and crest_records and _tool_available(config.crest.xtb_executable):
-        for conformer in crest_records:
+    thermo_inputs = _select_thermo_inputs(representative_crest_records, config)
+    progress.record("xTB thermo", "started", generated_count=len(thermo_inputs))
+    thermo_input_hash = records_hash(thermo_inputs)
+    if should_skip_step(steps["xtb_thermo"], thermo_input_hash, config):
+        states.append(skipped_state(steps["xtb_thermo"], thermo_input_hash, config))
+        thermo_records = _load_thermo_records(outdir)
+    elif (
+        config.thermo.enabled
+        and thermo_inputs
+        and _tool_available(config.crest.xtb_executable)
+    ):
+        for conformer in thermo_inputs:
             thermo_records.append(run_xtb_thermo(conformer, config))
-    records.extend(thermo_records)
-    states.append(
-        mark_done(
-            steps["xtb_thermo"],
-            records_hash(crest_records),
+        thermo_records = expand_enantiomer_mapped_thermo_records(
+            thermo_records,
+            crest_records,
             config,
-            details={"count": len(thermo_records), "enabled": config.thermo.enabled},
         )
-    )
+        states.append(
+            mark_done(
+                steps["xtb_thermo"],
+                thermo_input_hash,
+                config,
+                details={
+                    "count": len(thermo_records),
+                    "input_count": len(thermo_inputs),
+                    "enabled": config.thermo.enabled,
+                    "max_variants_per_molecule": config.thermo.max_variants_per_molecule,
+                    "max_conformers_per_variant": config.thermo.max_conformers_per_variant,
+                },
+            )
+        )
+    else:
+        states.append(
+            mark_done(
+                steps["xtb_thermo"],
+                thermo_input_hash,
+                config,
+                details={
+                    "count": len(thermo_records),
+                    "input_count": len(thermo_inputs),
+                    "enabled": config.thermo.enabled,
+                    "max_variants_per_molecule": config.thermo.max_variants_per_molecule,
+                    "max_conformers_per_variant": config.thermo.max_conformers_per_variant,
+                },
+            )
+        )
+    records.extend(thermo_records)
+    progress.record("xTB thermo", "completed", generated_count=len(thermo_records))
 
     rank_source = thermo_records if thermo_records else crest_records
     ranked = compute_delta_g_and_populations(rank_source, config)
+    progress.record("Final reporting", "ranking", generated_count=len(ranked))
     write_ranked_outputs(ranked, outdir / "ranking")
     states.append(
         mark_done(
@@ -194,6 +346,7 @@ def run_workflow(config: RunConfig) -> WorkflowResult:
     records.extend(ranked)
 
     censo_records = []
+    progress.record("CENSO", "started", generated_count=len(ranked))
     if config.refinement.censo_enabled and _tool_available(config.refinement.censo_executable):
         censo_records = refine_top_ranked_with_censo(ranked, config)
     elif config.refinement.censo_enabled:
@@ -211,7 +364,9 @@ def run_workflow(config: RunConfig) -> WorkflowResult:
             details={"count": len(censo_records), "enabled": config.refinement.censo_enabled},
         )
     )
+    progress.record("CENSO", "completed", generated_count=len(censo_records))
 
+    progress.record("QM rescoring", "started", generated_count=len(ranked_for_qm))
     qm_records = _run_optional_qm(ranked_for_qm, config)
     records.extend(qm_records)
     states.append(
@@ -222,8 +377,16 @@ def run_workflow(config: RunConfig) -> WorkflowResult:
             details={"count": len(qm_records), "backend": config.refinement.qm_backend},
         )
     )
+    progress.record("QM rescoring", "completed", generated_count=len(qm_records))
 
     write_all_provenance_outputs(records, outdir)
+    write_audit_tables(
+        outdir,
+        records,
+        filtering_decisions,
+        xtb_prefilter_decisions,
+        stereo_reduction,
+    )
     write_final_ranked_outputs(outdir, ranked, config)
     write_summary_markdown(
         outdir / "summary.md",
@@ -231,6 +394,25 @@ def run_workflow(config: RunConfig) -> WorkflowResult:
         variant_count=len(ranked),
     )
     manifest = _manifest(config, states, warnings, dry_run=False)
+    manifest["filtering"] = {
+        "mode": config.variant_filtering.mode,
+        "enabled": config.variant_filtering.enabled,
+        "decision_counts": decision_counts(filtering_decisions),
+        "decision_count": len(filtering_decisions),
+        "stereo_reduction": {
+            "jobs_saved": stereo_reduction.jobs_saved,
+            "decision_count": len(stereo_reduction.decisions),
+            "enabled": config.stereo_filtering.collapse_enantiomers_in_achiral_solvent
+            and not config.stereo_filtering.solvent_is_chiral,
+        },
+        "xtb_prefilter": {
+            "enabled": config.xtb_prefilter.enabled,
+            "decision_count": len(xtb_prefilter_decisions),
+            "pruned_count": len(
+                [decision for decision in xtb_prefilter_decisions if not decision.selected]
+            ),
+        },
+    }
     write_json(outdir / "manifest.json", manifest)
     write_run_report(
         outdir / "report.md",
@@ -261,6 +443,7 @@ def run_workflow(config: RunConfig) -> WorkflowResult:
     ]
     write_ranked_csv(outdir / "ranked.csv", legacy_records)
     write_json(outdir / "provenance.json", build_provenance(config.input_path, config, molecules))
+    progress.record("Final reporting", "completed", generated_count=len(ranked))
     return WorkflowResult(
         outdir=outdir,
         molecule_count=len(molecules),
@@ -278,17 +461,54 @@ def _run_step_list(
     config: RunConfig,
     states: list[StepState],
     fn,
+    resume_loader=None,
+    existing_loader: Callable[[Any], list[Any]] | None = None,
 ) -> list[Any]:
     step = {item.name: item for item in planned_steps(config)}[step_name]
     input_hash = records_hash(inputs)
     if should_skip_step(step, input_hash, config):
         states.append(skipped_state(step, input_hash, config))
+        if resume_loader is not None:
+            return resume_loader()
         return []
     outputs = []
     for item in inputs:
-        outputs.extend(fn(item))
+        existing = existing_loader(item) if existing_loader is not None else []
+        if existing:
+            outputs.extend(existing)
+        else:
+            outputs.extend(fn(item))
     states.append(mark_done(step, input_hash, config, details={"count": len(outputs)}))
     return outputs
+
+
+def _config_for_seed_budget(config: RunConfig) -> RunConfig:
+    if (
+        not config.variant_filtering.enabled
+        or config.variant_filtering.mode == "exhaustive"
+    ):
+        return config
+    data = config.model_dump(mode="python")
+    data["seeding"]["auto3d_k"] = min(
+        config.seeding.auto3d_k,
+        config.variant_filtering.max_seeds_per_variant,
+    )
+    return RunConfig.model_validate(data)
+
+
+def _write_filtering_outputs(
+    outdir: Path,
+    decisions: list[FilteringDecision],
+    stereo_reduction: StereoReductionResult | None = None,
+    xtb_prefilter_decisions: list[XtbPrefilterDecision] | None = None,
+) -> None:
+    write_filtering_decisions(outdir / "filtering" / "filtering_decisions.jsonl", decisions)
+    write_filtering_csv(outdir / "filtering" / "filtering_decisions.csv", decisions)
+    write_penalty_outputs(outdir / "filtering", decisions)
+    if stereo_reduction is not None:
+        write_stereo_reduction_outputs(outdir / "filtering", stereo_reduction)
+    if xtb_prefilter_decisions is not None:
+        write_xtb_prefilter_outputs(outdir / "filtering", xtb_prefilter_decisions)
 
 
 def _standardize_molecules(
@@ -364,7 +584,7 @@ def _run_crest_or_seed_ranking(
     seed_hash = records_hash(seeds)
     if should_skip_step(step, seed_hash, config):
         states.append(skipped_state(step, seed_hash, config))
-        return []
+        return _load_crest_records(config.output_dir)
     records = []
     crest_tools_available = _tool_available(config.crest.executable) and _tool_available(
         config.crest.xtb_executable
@@ -427,11 +647,47 @@ def _run_optional_qm(
     ranked: list[RankedVariantRecord],
     config: RunConfig,
 ) -> list[RankedVariantRecord]:
-    if config.refinement.qm_backend == "psi4" or config.refinement.psi4_enabled:
+    if not config.qm.enabled:
+        return []
+    ranked = sorted(ranked, key=lambda record: (record.rank, record.id))[: config.qm.max_candidates]
+    backend = config.qm.backend if config.qm.backend != "none" else config.refinement.qm_backend
+    if backend == "psi4" or config.refinement.psi4_enabled:
         return rescore_top_ranked_with_psi4(ranked, config)
-    if config.refinement.qm_backend == "pyscf" or config.refinement.pyscf_enabled:
+    if backend == "pyscf" or config.refinement.pyscf_enabled:
         return rescore_top_ranked_with_pyscf(ranked, config)
     return []
+
+
+def _select_thermo_inputs(
+    records: list[CrestConformerRecord],
+    config: RunConfig,
+) -> list[CrestConformerRecord]:
+    by_molecule: dict[str, list[CrestConformerRecord]] = {}
+    for record in records:
+        if record.energy_kcal_mol is None:
+            continue
+        by_molecule.setdefault(record.input_molecule_id, []).append(record)
+
+    selected: list[CrestConformerRecord] = []
+    for molecule_records in by_molecule.values():
+        by_variant: dict[str | None, list[CrestConformerRecord]] = {}
+        for record in sorted(molecule_records, key=lambda item: (item.energy_kcal_mol, item.id)):
+            by_variant.setdefault(record.parent_id, []).append(record)
+        ranked_variants = sorted(
+            by_variant.items(),
+            key=lambda item: (
+                min(record.energy_kcal_mol or float("inf") for record in item[1]),
+                str(item[0]),
+            ),
+        )[: config.thermo.max_variants_per_molecule]
+        for _variant_id, variant_records in ranked_variants:
+            selected.extend(
+                sorted(
+                    variant_records,
+                    key=lambda item: (item.energy_kcal_mol or float("inf"), item.id),
+                )[: config.thermo.max_conformers_per_variant]
+            )
+    return selected
 
 
 def _load_protomers(outdir: Path) -> list[ProtomerRecord]:
@@ -441,6 +697,109 @@ def _load_protomers(outdir: Path) -> list[ProtomerRecord]:
     for path in sorted((outdir / "enumeration" / "protomers").glob("*_protomers.sdf")):
         records.extend(read_protomers_sdf(path))
     return records
+
+
+def _load_tautomers(outdir: Path) -> list[Any]:
+    from dsvr.chemistry.stereochemistry import read_tautomers_sdf
+
+    records = []
+    for path in sorted((outdir / "enumeration" / "tautomers").glob("*_tautomers.sdf")):
+        records.extend(read_tautomers_sdf(path))
+    return records
+
+
+def _load_stereos(outdir: Path) -> list[Any]:
+    from dsvr.chemistry.conformers_rdkit import read_stereo_sdf
+
+    records = []
+    for path in sorted((outdir / "enumeration" / "stereoisomers").glob("*_stereoisomers.sdf")):
+        records.extend(read_stereo_sdf(path))
+    return records
+
+
+def _load_seeds(outdir: Path) -> list[SeedConformerRecord]:
+    records: list[SeedConformerRecord] = []
+    for path in sorted((outdir / "seeding").glob("**/*_seeds.sdf")):
+        records.extend(read_seed_sdf(path))
+    return records
+
+
+def _load_crest_records(outdir: Path) -> list[CrestConformerRecord]:
+    records: list[CrestConformerRecord] = []
+    for path in sorted((outdir / "crest").glob("**/crest_provenance.jsonl")):
+        for line in path.read_text(encoding="utf-8", errors="replace").splitlines():
+            if not line.strip():
+                continue
+            try:
+                records.append(CrestConformerRecord.model_validate(json.loads(line)))
+            except (json.JSONDecodeError, ValueError):
+                continue
+    return records
+
+
+def _load_thermo_records(outdir: Path) -> list[ThermoRecord]:
+    records: list[ThermoRecord] = []
+    for path in sorted((outdir / "xtb").glob("**/xtb_thermo.json")):
+        try:
+            records.append(ThermoRecord.model_validate_json(path.read_text(encoding="utf-8")))
+        except ValueError:
+            continue
+    return records
+
+
+def _load_existing_protomer_outputs(
+    molecule: MoleculeInput,
+    outdir: Path,
+    config: RunConfig,
+) -> list[ProtomerRecord]:
+    if config.overwrite or not config.resume:
+        return []
+    path = outdir / "enumeration" / "protomers" / f"{molecule.input_id}_protomers.sdf"
+    return _load_records_if_complete(path, read_protomers_sdf)
+
+
+def _load_existing_tautomer_outputs(
+    protomer: ProtomerRecord,
+    outdir: Path,
+    config: RunConfig,
+) -> list[Any]:
+    if config.overwrite or not config.resume:
+        return []
+    path = outdir / "enumeration" / "tautomers" / f"{protomer.id}_tautomers.sdf"
+    return _load_records_if_complete(path, read_tautomers_sdf)
+
+
+def _load_existing_stereo_outputs(
+    tautomer: AnyLineageRecord,
+    outdir: Path,
+    config: RunConfig,
+) -> list[Any]:
+    if config.overwrite or not config.resume:
+        return []
+    path = outdir / "enumeration" / "stereoisomers" / f"{tautomer.id}_stereoisomers.sdf"
+    return _load_records_if_complete(path, read_stereo_sdf)
+
+
+def _load_existing_seed_outputs(
+    stereo: AnyLineageRecord,
+    outdir: Path,
+    config: RunConfig,
+) -> list[SeedConformerRecord]:
+    if config.overwrite or not config.resume:
+        return []
+    path = outdir / "seeding" / "rdkit" / f"{stereo.id}_seeds.sdf"
+    return _load_records_if_complete(path, read_seed_sdf)
+
+
+def _load_records_if_complete(path: Path, loader: Callable[[Path], list[Any]]) -> list[Any]:
+    companion_csv = path.with_suffix(".csv")
+    if not path.exists() or not companion_csv.exists():
+        return []
+    try:
+        records = loader(path)
+    except (OSError, RuntimeError, ValueError):
+        return []
+    return records if records else []
 
 
 def _write_input_table(path: Path, molecules: list[MoleculeInput]) -> None:

@@ -57,13 +57,67 @@ canonicalization can be useful for deduplication or representative naming, but
 the workflow must not treat the canonical tautomer as the physically dominant
 tautomer.
 
+Tautomer enumeration is timeout-protected. DSVR runs RDKit
+`TautomerEnumerator` in a separate process for each protomer so problematic
+molecules can be killed without stopping the full workflow. Safe mode defaults
+to `max_tautomers_per_protomer: 32`, `max_tautomer_transforms: 256`, and
+`tautomer_timeout_seconds: 30`.
+
+If tautomer enumeration times out, DSVR keeps the parent protomer itself as a
+fallback tautomer candidate, labels the record with `tautomer enumeration
+timeout`, and continues. If the enumeration cap is hit, DSVR records a warning
+and prioritizes the retained subset using SVPScore/RDKit tautomer heuristic
+features. `tautomer_strategy: exhaustive` is available, but it is explicitly
+expensive and should be used only for targeted investigations.
+
 RDKit stereoisomer enumeration is explicit and controlled. The workflow should
 record stereochemistry assumptions, maximum enumeration counts, skipped states,
 and whether undefined stereocenters were expanded.
 
+In achiral solvent calculations, DSVR reduces redundant downstream work for
+pure enantiomeric pairs. RDKit stereoisomer records are still preserved, but
+only one representative enantiomer is sent to CREST/xTB when
+`stereo_filtering.collapse_enantiomers_in_achiral_solvent` and
+`stereo_filtering.run_crest_for_enantiomer_pairs_once` are enabled. The
+representative energy or thermochemistry is mapped back to the equivalent
+enantiomeric partner with warnings and provenance annotations.
+
+Diastereomers are not collapsed. If a molecule will later be evaluated in a
+chiral binding pocket, set `stereo_filtering.solvent_is_chiral: true` or disable
+`collapse_enantiomers_in_achiral_solvent`.
+
 Auto3D can internally enumerate tautomers and stereoisomers. DSVR should disable
 that behavior by default when RDKit already performed enumeration. Enable Auto3D
 internal enumeration only when the user explicitly selects that mode.
+
+## SVPScore Filtering
+
+DSVR uses an open heuristic Structural Variant Penalty Score, SVPScore, to
+triage generated variants before expensive CREST/xTB and thermochemistry. This
+score is inspired by the general idea of state-penalty triage, but it is not a
+proprietary formula and is not a thermodynamic population model.
+
+SVPScore combines transparent components for protomer plausibility, tautomer
+features, stereochemical enumeration uncertainty, chemistry sanity checks,
+computational complexity, and cheap 3D relative energy when available. The
+complexity component affects scheduling priority only; it is not evidence that a
+variant is physically less stable.
+
+pH-related SVPScore terms are approximate unless a real micro-pKa or proton
+chemical-potential correction provider is configured. Without such a provider,
+molscrub controls pH/protomer candidate generation and SVPScore uses only
+conservative rule-based penalties.
+
+Filtering decisions are written to:
+
+- `filtering/variant_penalties.csv`
+- `filtering/accepted_variants.csv`
+- `filtering/rejected_variants.csv`
+- `filtering/penalty_breakdown.jsonl`
+
+Every rejected variant records a reason. Rescue candidates, such as the original
+input state and the best candidate per formula, formal charge, protomer, and
+tautomer family, record a rescue reason when accepted.
 
 ## Ranking and Population Scope
 

@@ -40,6 +40,7 @@ from dsvr.runners.pyscf_runner import PySCFUnavailableError, rescore_top_ranked_
 from dsvr.runners.xtb_runner import XtbExecutionError, XtbUnavailableError, run_xtb_thermo
 from dsvr.utils.tool_check import check_tools
 from dsvr.workflow.engine import run_workflow
+from dsvr.workflow.status import run_status
 from dsvr.workflow.steps import planned_steps
 
 app = typer.Typer(help="Rank pH- and solvent-dependent structural variants of small molecules.")
@@ -241,6 +242,33 @@ def inspect(
     console.print(table)
 
 
+@app.command(name="status")
+def status_command(
+    run_dir: Annotated[Path, typer.Argument(exists=True, file_okay=False)],
+) -> None:
+    """Show current or last known workflow status for a run directory."""
+    status = run_status(run_dir)
+    table = Table(title=f"DSVR status: {run_dir}")
+    table.add_column("Field")
+    table.add_column("Value")
+    for key in (
+        "last_stage",
+        "last_status",
+        "last_completed_molecule",
+        "active_command",
+        "disk_usage_mb",
+        "xyz_file_count",
+    ):
+        table.add_row(key, str(status.get(key, "")))
+    console.print(table)
+    console.print("Stage counts:")
+    for stage, count in dict(status.get("stage_counts", {})).items():
+        console.print(f"- {stage}: {count}")
+    if status.get("latest_log_tail"):
+        console.print("Latest log tail:")
+        console.print(str(status["latest_log_tail"]))
+
+
 @app.command(name="validate-input")
 def validate_input(
     input_path: Annotated[Path, typer.Argument(exists=True, dir_okay=False)],
@@ -363,11 +391,34 @@ def enumerate_tautomers_command(
         int | None,
         typer.Option("--max-tautomers", help="Override max tautomers per protomer."),
     ] = None,
+    max_transforms: Annotated[
+        int | None,
+        typer.Option("--max-transforms", help="Override RDKit max tautomer transforms."),
+    ] = None,
+    timeout_seconds: Annotated[
+        int | None,
+        typer.Option("--timeout", help="Tautomer enumeration timeout per protomer in seconds."),
+    ] = None,
+    strategy: Annotated[
+        str | None,
+        typer.Option("--strategy", help="Tautomer strategy: safe, normal, or exhaustive."),
+    ] = None,
 ) -> None:
     """Enumerate RDKit tautomer candidate states from protomer SDF."""
     config_kwargs = {"input_path": protomers_sdf, "output_dir": out}
+    enumeration_config: dict[str, Any] = {}
     if max_tautomers is not None:
-        config_kwargs["enumeration"] = {"max_tautomers_per_protomer": max_tautomers}
+        enumeration_config["max_tautomers_per_protomer"] = max_tautomers
+    if max_transforms is not None:
+        enumeration_config["max_tautomer_transforms"] = max_transforms
+    if timeout_seconds is not None:
+        enumeration_config["tautomer_timeout_seconds"] = timeout_seconds
+    if strategy is not None:
+        if strategy not in {"safe", "normal", "exhaustive"}:
+            raise typer.BadParameter("strategy must be one of: safe, normal, exhaustive")
+        enumeration_config["tautomer_strategy"] = strategy
+    if enumeration_config:
+        config_kwargs["enumeration"] = enumeration_config
     config = RunConfig(**config_kwargs)
     protomers = read_protomers_sdf(protomers_sdf)
     all_records = []
@@ -381,6 +432,11 @@ def enumerate_tautomers_command(
         "scope_warning": (
             "RDKit tautomer enumeration is candidate generation only; no tautomer "
             "stability ranking is implied. CREST/xTB ranking occurs later."
+        ),
+        "timeout_count": sum(
+            1
+            for record in all_records
+            if any("tautomer enumeration timeout" in warning for warning in record.warnings)
         ),
         "tautomer_ids": [record.id for record in all_records],
     }
@@ -456,6 +512,7 @@ def seed_etkdg_command(
         input_path=stereo_sdf,
         output_dir=out,
         seeding={"rdkit_num_conformers": num_conformers},
+        disk={"keep_raw_xyz": True},
     )
     stereo_records = read_stereo_sdf(stereo_sdf)
     all_records = []
@@ -764,9 +821,9 @@ def run(
         typer.Option("--config", "-c", exists=True, dir_okay=False, help="YAML workflow config."),
     ] = None,
     output_dir: Annotated[
-        Path,
+        Path | None,
         typer.Option("--out", "--outdir", "-o", help="Run output directory."),
-    ] = Path("runs/dsvr"),
+    ] = None,
     dry_run: Annotated[
         bool,
         typer.Option("--dry-run", help="Show planned workflow steps without external execution."),
@@ -817,6 +874,14 @@ def run(
         overwrite=overwrite,
         resume=resume,
     )
+    if (
+        config.variant_filtering.mode == "exhaustive"
+        or (effective_config_path is not None and "exhaustive_debug" in effective_config_path.name)
+    ):
+        console.print(
+            "[red]WARNING: exhaustive mode may generate extremely large numbers of "
+            "variants and XYZ files. Use only for small molecules or debugging.[/red]"
+        )
     result = run_workflow(config=config)
     if config.dry_run:
         console.print(f"Wrote dry-run plan to [bold]{result.outdir / 'dry_run_plan.json'}[/bold]")

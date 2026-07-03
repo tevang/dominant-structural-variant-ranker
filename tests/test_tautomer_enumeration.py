@@ -3,7 +3,8 @@ from pathlib import Path
 from rdkit import Chem
 from typer.testing import CliRunner
 
-from dsvr.chemistry.tautomers import enumerate_tautomers
+from dsvr.chemistry import tautomers as tautomer_module
+from dsvr.chemistry.tautomers import TautomerEnumerationTimeout, enumerate_tautomers
 from dsvr.cli import app
 from dsvr.config import RunConfig
 from dsvr.models import ProtomerRecord, make_input_id, make_protomer_id
@@ -52,6 +53,31 @@ def test_tautomer_enumeration_cap_warns(tmp_path: Path) -> None:
 
     assert len(records) == 1
     assert any("max_tautomers_per_protomer" in warning for warning in records[0].warnings)
+
+
+def test_tautomer_timeout_falls_back_to_parent_candidate(tmp_path: Path, monkeypatch) -> None:
+    protomer = _protomer("acetylacetone", "CC(=O)CC(C)=O")
+    config = RunConfig(
+        input_path=tmp_path / "input.sdf",
+        output_dir=tmp_path / "run",
+        enumeration={"tautomer_timeout_seconds": 1},
+    )
+
+    def timeout_worker(*args, **kwargs):
+        raise TautomerEnumerationTimeout("mock timeout")
+
+    monkeypatch.setattr(tautomer_module, "_enumerate_molblocks_with_timeout", timeout_worker)
+
+    records = enumerate_tautomers(protomer, config)
+
+    assert len(records) == 1
+    assert records[0].metadata["fallback"] is True
+    assert (
+        records[0].metadata["fallback_reason"]
+        == "tautomer enumeration timeout or worker failure"
+    )
+    assert any("tautomer enumeration timeout" in warning for warning in records[0].warnings)
+    assert any("parent protomer itself" in warning for warning in records[0].warnings)
 
 
 def test_cli_enumerate_tautomers_from_protomer_sdf(tmp_path: Path) -> None:
