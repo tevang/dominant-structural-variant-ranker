@@ -10,7 +10,11 @@ from typing import Any
 from rdkit import Chem
 from rdkit.Chem import rdMolDescriptors
 
-from dsvr.chemistry.conformers_auto3d import generate_auto3d_seeds
+from dsvr.chemistry.conformers_auto3d import (
+    generate_auto3d_seeds,
+    generate_auto3d_seeds_from_protomers,
+    reduce_auto3d_entropy_ensemble,
+)
 from dsvr.chemistry.conformers_rdkit import generate_rdkit_seeds, read_stereo_sdf
 from dsvr.chemistry.protonation import generate_protomer_candidates
 from dsvr.chemistry.stereochemistry import enumerate_stereoisomers, read_tautomers_sdf
@@ -82,7 +86,11 @@ def run_workflow(config: RunConfig) -> WorkflowResult:
     (outdir / "logs").mkdir(parents=True, exist_ok=True)
     configure_logging(level=config.logging.level, log_file=outdir / "logs" / "workflow.log")
     write_resolved_config(config, outdir)
-    progress = ProgressRecorder(outdir)
+    progress = ProgressRecorder(
+        outdir,
+        terminal=config.logging.level.upper() != "ERROR",
+        planned_stages=_progress_stage_names(config),
+    )
     progress.record("Input validation", "started")
 
     if config.dry_run:
@@ -122,7 +130,9 @@ def run_workflow(config: RunConfig) -> WorkflowResult:
     if should_skip_step(steps["standardize"], records_hash(molecules), config):
         states.append(skipped_state(steps["standardize"], records_hash(molecules), config))
         molecules = _standardize_molecules(molecules, config)
+        progress.record("Standardization", "skipped", generated_count=len(molecules))
     else:
+        progress.record("Standardization", "started", generated_count=len(molecules))
         molecules = _standardize_molecules(molecules, config)
         _write_input_table(outdir / "input" / "standardized_inputs.csv", molecules)
         states.append(
@@ -133,6 +143,7 @@ def run_workflow(config: RunConfig) -> WorkflowResult:
                 details={"enabled": config.chemistry.standardize},
             )
         )
+        progress.record("Standardization", "completed", generated_count=len(molecules))
 
     protomers: list[ProtomerRecord] = []
     progress.record("Protomer generation", "started", generated_count=len(molecules))
@@ -140,17 +151,26 @@ def run_workflow(config: RunConfig) -> WorkflowResult:
     if should_skip_step(steps["protonation"], protomer_hash, config):
         states.append(skipped_state(steps["protonation"], protomer_hash, config))
         protomers = _load_protomers(outdir)
+        progress.record("Protomer generation", "skipped", generated_count=len(protomers))
     else:
-        for molecule in molecules:
+        for index, molecule in enumerate(molecules, start=1):
             existing = _load_existing_protomer_outputs(molecule, outdir, config)
             if existing:
                 protomers.extend(existing)
-                continue
-            try:
-                protomers.extend(generate_protomer_candidates(molecule, config))
-            except MolscrubUnavailableError as exc:
-                warnings.append(str(exc))
-                protomers.extend(_fallback_protomer(molecule, config))
+            else:
+                try:
+                    protomers.extend(generate_protomer_candidates(molecule, config))
+                except MolscrubUnavailableError as exc:
+                    warnings.append(str(exc))
+                    protomers.extend(_fallback_protomer(molecule, config))
+            progress.record(
+                "Protomer generation",
+                "running",
+                molecule_index=index,
+                molecule_total=len(molecules),
+                molecule_name=molecule.molname,
+                generated_count=len(protomers),
+            )
         states.append(
             mark_done(
                 steps["protonation"],
@@ -162,6 +182,17 @@ def run_workflow(config: RunConfig) -> WorkflowResult:
     records.extend(protomers)
     progress.record("Protomer generation", "completed", generated_count=len(protomers))
 
+    if config.protocol == "auto3d_entropy":
+        return _run_auto3d_entropy_protocol(
+            config=config,
+            molecules=molecules,
+            protomers=protomers,
+            records=records,
+            states=states,
+            warnings=warnings,
+            progress=progress,
+        )
+
     progress.record("Tautomer enumeration", "started", generated_count=len(protomers))
     tautomers = _run_step_list(
         "tautomers",
@@ -171,6 +202,8 @@ def run_workflow(config: RunConfig) -> WorkflowResult:
         lambda item: enumerate_tautomers(item, config),
         resume_loader=lambda: _load_tautomers(outdir),
         existing_loader=lambda item: _load_existing_tautomer_outputs(item, outdir, config),
+        progress=progress,
+        progress_stage="Tautomer enumeration",
     )
     records.extend(tautomers)
     progress.record("Tautomer enumeration", "completed", generated_count=len(tautomers))
@@ -184,6 +217,8 @@ def run_workflow(config: RunConfig) -> WorkflowResult:
         lambda item: enumerate_stereoisomers(item, config),
         resume_loader=lambda: _load_stereos(outdir),
         existing_loader=lambda item: _load_existing_stereo_outputs(item, outdir, config),
+        progress=progress,
+        progress_stage="Stereoisomer enumeration",
     )
     records.extend(stereos)
     progress.record("Stereoisomer enumeration", "completed", generated_count=len(stereos))
@@ -210,17 +245,32 @@ def run_workflow(config: RunConfig) -> WorkflowResult:
     if should_skip_step(steps["seeding"], seed_input_hash, config):
         states.append(skipped_state(steps["seeding"], seed_input_hash, config))
         seeds = _load_seeds(outdir)
+        progress.record("3D seeding", "skipped", generated_count=len(seeds))
     else:
         seed_config = _config_for_seed_budget(config)
         if config.seeding.method in {"etkdg", "both"}:
-            for stereo in stereos_for_seeding:
+            for index, stereo in enumerate(stereos_for_seeding, start=1):
                 existing = _load_existing_seed_outputs(stereo, outdir, config)
                 if existing:
                     seeds.extend(existing)
                 else:
                     seeds.extend(generate_rdkit_seeds(stereo, seed_config))
+                progress.record(
+                    "3D seeding",
+                    "running",
+                    molecule_index=index,
+                    molecule_total=len(stereos_for_seeding),
+                    molecule_name=stereo.molname,
+                    generated_count=len(seeds),
+                )
         if config.seeding.method in {"auto3d", "both"}:
             try:
+                progress.record(
+                    "3D seeding",
+                    "running",
+                    generated_count=len(stereos_for_seeding),
+                    message="Running Auto3D batch seeding.",
+                )
                 seeds.extend(generate_auto3d_seeds(stereos_for_seeding, seed_config))
             except (Auto3DExecutionError, Auto3DUnavailableError) as exc:
                 warnings.append(str(exc))
@@ -228,8 +278,16 @@ def run_workflow(config: RunConfig) -> WorkflowResult:
                     warnings.append(
                         "Auto3D failed in integrated workflow; falling back to RDKit ETKDG."
                     )
-                    for stereo in stereos_for_seeding:
+                    for index, stereo in enumerate(stereos_for_seeding, start=1):
                         seeds.extend(generate_rdkit_seeds(stereo, seed_config))
+                        progress.record(
+                            "3D seeding",
+                            "running",
+                            molecule_index=index,
+                            molecule_total=len(stereos_for_seeding),
+                            molecule_name=stereo.molname,
+                            generated_count=len(seeds),
+                        )
         states.append(
             mark_done(
                 steps["seeding"],
@@ -266,6 +324,7 @@ def run_workflow(config: RunConfig) -> WorkflowResult:
         config,
         states,
         warnings,
+        progress,
     )
     progress.record(
         "CREST/xTB",
@@ -288,13 +347,22 @@ def run_workflow(config: RunConfig) -> WorkflowResult:
     if should_skip_step(steps["xtb_thermo"], thermo_input_hash, config):
         states.append(skipped_state(steps["xtb_thermo"], thermo_input_hash, config))
         thermo_records = _load_thermo_records(outdir)
+        progress.record("xTB thermo", "skipped", generated_count=len(thermo_records))
     elif (
         config.thermo.enabled
         and thermo_inputs
         and _tool_available(config.crest.xtb_executable)
     ):
-        for conformer in thermo_inputs:
+        for index, conformer in enumerate(thermo_inputs, start=1):
             thermo_records.append(run_xtb_thermo(conformer, config))
+            progress.record(
+                "xTB thermo",
+                "running",
+                molecule_index=index,
+                molecule_total=len(thermo_inputs),
+                molecule_name=conformer.molname,
+                generated_count=len(thermo_records),
+            )
         thermo_records = expand_enantiomer_mapped_thermo_records(
             thermo_records,
             crest_records,
@@ -333,8 +401,8 @@ def run_workflow(config: RunConfig) -> WorkflowResult:
     progress.record("xTB thermo", "completed", generated_count=len(thermo_records))
 
     rank_source = thermo_records if thermo_records else crest_records
+    progress.record("Ranking", "started", generated_count=len(rank_source))
     ranked = compute_delta_g_and_populations(rank_source, config)
-    progress.record("Final reporting", "ranking", generated_count=len(ranked))
     write_ranked_outputs(ranked, outdir / "ranking")
     states.append(
         mark_done(
@@ -345,6 +413,7 @@ def run_workflow(config: RunConfig) -> WorkflowResult:
         )
     )
     records.extend(ranked)
+    progress.record("Ranking", "completed", generated_count=len(ranked))
 
     censo_records = []
     progress.record("CENSO", "started", generated_count=len(ranked))
@@ -380,6 +449,7 @@ def run_workflow(config: RunConfig) -> WorkflowResult:
     )
     progress.record("QM rescoring", "completed", generated_count=len(qm_records))
 
+    progress.record("Final reporting", "started", generated_count=len(ranked))
     write_all_provenance_outputs(records, outdir)
     write_audit_tables(
         outdir,
@@ -456,6 +526,219 @@ def run_smoke_workflow(config: RunConfig) -> WorkflowResult:
     return run_workflow(config)
 
 
+def _progress_stage_names(config: RunConfig) -> list[str]:
+    if config.protocol == "auto3d_entropy":
+        return [
+            "Input validation",
+            "Standardization",
+            "Protomer generation",
+            "Auto3D protocol",
+            "Auto3D entropy reduction",
+            "Ranking",
+            "Final reporting",
+        ]
+    return [
+        "Input validation",
+        "Standardization",
+        "Protomer generation",
+        "Tautomer enumeration",
+        "Stereoisomer enumeration",
+        "Cheap variant scoring",
+        "3D seeding",
+        "3D seed filtering",
+        "xTB prefilter",
+        "CREST/xTB",
+        "xTB thermo",
+        "Ranking",
+        "CENSO",
+        "QM rescoring",
+        "Final reporting",
+    ]
+
+
+def _run_auto3d_entropy_protocol(
+    *,
+    config: RunConfig,
+    molecules: list[MoleculeInput],
+    protomers: list[ProtomerRecord],
+    records: list[AnyLineageRecord],
+    states: list[StepState],
+    warnings: list[str],
+    progress: ProgressRecorder,
+) -> WorkflowResult:
+    outdir = config.output_dir
+    steps = {step.name: step for step in planned_steps(config)}
+
+    for step_name in ("tautomers", "stereochemistry"):
+        states.append(
+            mark_done(
+                steps[step_name],
+                records_hash(protomers),
+                config,
+                details={
+                    "count": 0,
+                    "skipped_by_protocol": "auto3d_entropy",
+                    "reason": "Auto3D performs tautomer/stereoisomer enumeration.",
+                },
+            )
+        )
+
+    progress.record("Auto3D protocol", "started", generated_count=len(protomers))
+    seed_hash = records_hash(protomers)
+    if should_skip_step(steps["seeding"], seed_hash, config):
+        states.append(skipped_state(steps["seeding"], seed_hash, config))
+        seeds = _load_seeds(outdir)
+        progress.record("Auto3D protocol", "skipped", generated_count=len(seeds))
+    else:
+        progress.record(
+            "Auto3D protocol",
+            "running",
+            generated_count=len(protomers),
+            message="Running Auto3D tautomer, stereo, conformer, and optimization steps.",
+        )
+        seeds = generate_auto3d_seeds_from_protomers(protomers, config)
+        states.append(
+            mark_done(
+                steps["seeding"],
+                seed_hash,
+                config,
+                details={
+                    "count": len(seeds),
+                    "protocol": "auto3d_entropy",
+                    "auto3d_internal_tautomer_stereo_enum": True,
+                },
+            )
+        )
+    records.extend(seeds)
+    progress.record("Auto3D protocol", "completed", generated_count=len(seeds))
+
+    empty_stereo_reduction = StereoReductionResult(
+        selected_seeds=[],
+        decisions=[],
+        representative_to_equivalent_seed_ids={},
+        jobs_saved=0,
+    )
+    _write_filtering_outputs(outdir, [], empty_stereo_reduction, [])
+
+    for step_name in ("crest", "xtb_thermo"):
+        states.append(
+            mark_done(
+                steps[step_name],
+                records_hash(seeds),
+                config,
+                details={
+                    "count": 0,
+                    "enabled": False,
+                    "skipped_by_protocol": "auto3d_entropy",
+                },
+            )
+        )
+
+    progress.record("Auto3D entropy reduction", "started", generated_count=len(seeds))
+    thermo_records = reduce_auto3d_entropy_ensemble(seeds, config)
+    records.extend(thermo_records)
+    progress.record(
+        "Auto3D entropy reduction",
+        "completed",
+        generated_count=len(thermo_records),
+    )
+
+    progress.record("Ranking", "started", generated_count=len(thermo_records))
+    ranked = compute_delta_g_and_populations(thermo_records, config)
+    write_ranked_outputs(ranked, outdir / "ranking")
+    states.append(
+        mark_done(
+            steps["ranking"],
+            records_hash(thermo_records),
+            config,
+            details={"count": len(ranked), "source": "auto3d_entropy"},
+        )
+    )
+    records.extend(ranked)
+    progress.record("Ranking", "completed", generated_count=len(ranked))
+
+    states.append(
+        mark_done(
+            steps["censo"],
+            records_hash(ranked),
+            config,
+            details={"count": 0, "enabled": False, "skipped_by_protocol": "auto3d_entropy"},
+        )
+    )
+    states.append(
+        mark_done(
+            steps["qm"],
+            records_hash(ranked),
+            config,
+            details={"count": 0, "backend": "none", "skipped_by_protocol": "auto3d_entropy"},
+        )
+    )
+
+    progress.record("Final reporting", "started", generated_count=len(ranked))
+    write_all_provenance_outputs(records, outdir)
+    write_audit_tables(outdir, records, [], [], empty_stereo_reduction)
+    write_final_ranked_outputs(outdir, ranked, config)
+    write_summary_markdown(
+        outdir / "summary.md",
+        molecule_count=len(molecules),
+        variant_count=len(ranked),
+    )
+    manifest = _manifest(config, states, warnings, dry_run=False)
+    manifest["protocol"] = "auto3d_entropy"
+    manifest["filtering"] = {
+        "mode": "protocol_disabled",
+        "enabled": False,
+        "decision_counts": {},
+        "decision_count": 0,
+        "stereo_reduction": {
+            "jobs_saved": 0,
+            "decision_count": 0,
+            "enabled": False,
+        },
+        "xtb_prefilter": {
+            "enabled": False,
+            "decision_count": 0,
+            "pruned_count": 0,
+        },
+    }
+    write_json(outdir / "manifest.json", manifest)
+    write_run_report(
+        outdir / "report.md",
+        config=config,
+        records=records,
+        ranked_records=ranked,
+        manifest=manifest,
+        output_files=_final_output_files(outdir),
+    )
+    states.append(
+        mark_done(
+            steps["reports"],
+            records_hash(records),
+            config,
+            details={"manifest": "manifest.json"},
+        )
+    )
+    legacy_records = [
+        VariantRecord(
+            variant_id=record.id,
+            parent_name=record.molname,
+            smiles=record.isomeric_smiles,
+            relative_energy_kcal_mol=record.relative_free_energy_kcal_mol,
+            approximate_population=record.boltzmann_population,
+            status="ranked",
+        )
+        for record in ranked
+    ]
+    write_ranked_csv(outdir / "ranked.csv", legacy_records)
+    write_json(outdir / "provenance.json", build_provenance(config.input_path, config, molecules))
+    progress.record("Final reporting", "completed", generated_count=len(ranked))
+    return WorkflowResult(
+        outdir=outdir,
+        molecule_count=len(molecules),
+        ranked_records=legacy_records,
+    )
+
+
 def _run_step_list(
     step_name: str,
     inputs: list[Any],
@@ -464,21 +747,37 @@ def _run_step_list(
     fn,
     resume_loader=None,
     existing_loader: Callable[[Any], list[Any]] | None = None,
+    progress: ProgressRecorder | None = None,
+    progress_stage: str | None = None,
 ) -> list[Any]:
     step = {item.name: item for item in planned_steps(config)}[step_name]
     input_hash = records_hash(inputs)
     if should_skip_step(step, input_hash, config):
         states.append(skipped_state(step, input_hash, config))
         if resume_loader is not None:
-            return resume_loader()
+            loaded = resume_loader()
+            if progress is not None and progress_stage is not None:
+                progress.record(progress_stage, "skipped", generated_count=len(loaded))
+            return loaded
+        if progress is not None and progress_stage is not None:
+            progress.record(progress_stage, "skipped")
         return []
     outputs = []
-    for item in inputs:
+    for index, item in enumerate(inputs, start=1):
         existing = existing_loader(item) if existing_loader is not None else []
         if existing:
             outputs.extend(existing)
         else:
             outputs.extend(fn(item))
+        if progress is not None and progress_stage is not None:
+            progress.record(
+                progress_stage,
+                "running",
+                molecule_index=index,
+                molecule_total=len(inputs),
+                molecule_name=getattr(item, "molname", None),
+                generated_count=len(outputs),
+            )
     states.append(mark_done(step, input_hash, config, details={"count": len(outputs)}))
     return outputs
 
@@ -580,25 +879,46 @@ def _run_crest_or_seed_ranking(
     config: RunConfig,
     states: list[StepState],
     warnings: list[str],
+    progress: ProgressRecorder | None = None,
 ) -> list[CrestConformerRecord]:
     step = {item.name: item for item in planned_steps(config)}["crest"]
     seed_hash = records_hash(seeds)
     if should_skip_step(step, seed_hash, config):
         states.append(skipped_state(step, seed_hash, config))
-        return _load_crest_records(config.output_dir)
+        records = _load_crest_records(config.output_dir)
+        if progress is not None:
+            progress.record("CREST/xTB", "skipped", generated_count=len(records))
+        return records
     records = []
     crest_tools_available = _tool_available(config.crest.executable) and _tool_available(
         config.crest.xtb_executable
     )
     if config.crest.enabled and crest_tools_available:
-        for seed in seeds:
+        for index, seed in enumerate(seeds, start=1):
             records.extend(run_crest_for_seed(seed, config))
+            if progress is not None:
+                progress.record(
+                    "CREST/xTB",
+                    "running",
+                    molecule_index=index,
+                    molecule_total=len(seeds),
+                    molecule_name=seed.molname,
+                    generated_count=len(records),
+                )
     else:
         if config.crest.enabled:
             warnings.append(
                 "CREST/xTB requested but unavailable; using seed energies for smoke ranking."
             )
         records.extend(_crest_like_records_from_seeds(seeds, config))
+        if progress is not None and seeds:
+            progress.record(
+                "CREST/xTB",
+                "running",
+                molecule_index=len(seeds),
+                molecule_total=len(seeds),
+                generated_count=len(records),
+            )
     states.append(
         mark_done(
             step,

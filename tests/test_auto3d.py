@@ -4,10 +4,16 @@ from rdkit import Chem
 from typer.testing import CliRunner
 
 from dsvr.chemistry import conformers_auto3d
-from dsvr.chemistry.conformers_auto3d import generate_auto3d_seeds
+from dsvr.chemistry.conformers_auto3d import (
+    generate_auto3d_seeds,
+    generate_auto3d_seeds_from_protomers,
+    reduce_auto3d_entropy_ensemble,
+)
 from dsvr.cli import app
 from dsvr.config import RunConfig
 from dsvr.models import (
+    ProtomerRecord,
+    SeedConformerRecord,
     StereoRecord,
     make_input_id,
     make_protomer_id,
@@ -35,13 +41,14 @@ def test_generate_auto3d_seeds_from_mock_output_preserves_parent(
         k: int,
         model: str,
         internal_tautomer_stereo_enum: bool,
+        **kwargs,
     ) -> tuple[Path, list[str]]:
         assert input_path.exists()
         assert k == 2
         assert model == "AIMNet2"
         assert internal_tautomer_stereo_enum is False
         output_sdf = output_dir / "mock_auto3d.sdf"
-        _write_auto3d_output(output_sdf, "CCO", stereo.id, energy="-12.34")
+        _write_auto3d_output(output_sdf, "CCO", stereo.id, energy="-12.34", prop="E_kcal_mol")
         return output_sdf, ["auto3d", "run", str(input_path)]
 
     monkeypatch.setattr(conformers_auto3d, "run_auto3d", fake_run_auto3d)
@@ -81,10 +88,11 @@ def test_auto3d_internal_enum_marks_less_controlled_lineage(
         k: int,
         model: str,
         internal_tautomer_stereo_enum: bool,
+        **kwargs,
     ) -> tuple[Path, list[str]]:
         assert internal_tautomer_stereo_enum is True
         output_sdf = output_dir / "mock_auto3d_internal.sdf"
-        _write_auto3d_output(output_sdf, "CCO", None, energy="-1.0")
+        _write_auto3d_output(output_sdf, "CCO", None, energy="-1.0", prop="E_kcal_mol")
         return output_sdf, ["auto3d", "run", str(input_path)]
 
     monkeypatch.setattr(conformers_auto3d, "run_auto3d", fake_run_auto3d)
@@ -128,10 +136,11 @@ def test_cli_seed_auto3d_success_with_mocked_runner(tmp_path: Path, monkeypatch)
         k: int,
         model: str,
         internal_tautomer_stereo_enum: bool,
+        **kwargs,
     ) -> tuple[Path, list[str]]:
         assert internal_tautomer_stereo_enum is False
         output_sdf = output_dir / "mock_auto3d.sdf"
-        _write_auto3d_output(output_sdf, "CCO", stereo.id, energy="-12.34")
+        _write_auto3d_output(output_sdf, "CCO", stereo.id, energy="-12.34", prop="E_kcal_mol")
         return output_sdf, ["auto3d", "run", str(input_path)]
 
     monkeypatch.setattr(conformers_auto3d, "run_auto3d", fake_run_auto3d)
@@ -144,6 +153,96 @@ def test_cli_seed_auto3d_success_with_mocked_runner(tmp_path: Path, monkeypatch)
     assert result.exit_code == 0, result.output
     assert (tmp_path / "out" / "seeding" / "auto3d" / "auto3d_report.json").exists()
     assert "internal tautomer/stereo enumeration disabled" in result.output
+
+
+def test_generate_auto3d_protocol_seeds_from_protomers(tmp_path: Path, monkeypatch) -> None:
+    protomer = _protomer("ethanol", "CCO")
+    config = RunConfig(
+        protocol="auto3d_entropy",
+        input_path=tmp_path / "protomers.sdf",
+        output_dir=tmp_path / "run",
+        seeding={
+            "method": "auto3d",
+            "auto3d_k": 3,
+            "auto3d_model": "ANI2xt",
+            "auto3d_max_confs": 10,
+            "auto3d_patience": 200,
+            "auto3d_threshold": 0.3,
+            "auto3d_opt_steps": 2000,
+        },
+    )
+
+    def fake_run_auto3d(
+        input_path: Path,
+        output_dir: Path,
+        *,
+        k: int,
+        model: str,
+        internal_tautomer_stereo_enum: bool,
+        mpi_np: int | None,
+        cpu_workers: int | None,
+        memory_gb: int | None,
+        capacity: int | None,
+        max_confs: int | None,
+        patience: int | None,
+        threshold: float | None,
+        opt_steps: int | None,
+        use_gpu: bool,
+        stream_output: bool,
+    ) -> tuple[Path, list[str]]:
+        assert input_path.exists()
+        assert k == 3
+        assert model == "ANI2xt"
+        assert internal_tautomer_stereo_enum is True
+        assert mpi_np == 4
+        assert cpu_workers is None
+        assert memory_gb is None
+        assert capacity is None
+        assert max_confs == 10
+        assert patience == 200
+        assert threshold == 0.3
+        assert opt_steps == 2000
+        assert use_gpu is False
+        assert stream_output is True
+        output_sdf = output_dir / "mock_auto3d_protocol.sdf"
+        _write_auto3d_output(output_sdf, "CCO", protomer.id, energy="-1.0", prop="E_kcal_mol")
+        return output_sdf, ["auto3d", "run", str(input_path), "--enumerate-tautomer"]
+
+    monkeypatch.setattr(conformers_auto3d, "run_auto3d", fake_run_auto3d)
+
+    records = generate_auto3d_seeds_from_protomers([protomer], config)
+
+    assert len(records) == 1
+    assert records[0].parent_id == protomer.id
+    assert records[0].energy_kcal_mol == -1.0
+    assert records[0].metadata["auto3d"]["lineage_mode"] == (
+        "protomer_to_auto3d_internal_tautomer_stereo_enum"
+    )
+    assert (tmp_path / "run" / "seeding" / "auto3d_protocol" / "auto3d_protocol_seeds.sdf").exists()
+
+
+def test_reduce_auto3d_entropy_ensemble_includes_configurational_entropy(
+    tmp_path: Path,
+) -> None:
+    protomer = _protomer("ethanol", "CCO")
+    config = RunConfig(
+        protocol="auto3d_entropy",
+        input_path=tmp_path / "protomers.sdf",
+        output_dir=tmp_path / "run",
+    )
+    seeds = [
+        _seed_from_protomer(protomer, 1, -10.0),
+        _seed_from_protomer(protomer, 2, -9.5),
+    ]
+
+    records = reduce_auto3d_entropy_ensemble(seeds, config)
+
+    assert len(records) == 1
+    assert records[0].free_energy_kcal_mol is not None
+    assert records[0].free_energy_kcal_mol < -10.0
+    assert records[0].entropy_cal_mol_k is not None
+    assert records[0].entropy_cal_mol_k > 0.0
+    assert (tmp_path / "run" / "auto3d_entropy" / "auto3d_entropy_records.csv").exists()
 
 
 def _stereo(molname: str, smiles: str) -> StereoRecord:
@@ -171,19 +270,64 @@ def _stereo(molname: str, smiles: str) -> StereoRecord:
     )
 
 
+def _protomer(molname: str, smiles: str) -> ProtomerRecord:
+    molecule = Chem.MolFromSmiles(smiles)
+    canonical = Chem.MolToSmiles(molecule, canonical=True, isomericSmiles=False)
+    isomeric = Chem.MolToSmiles(molecule, canonical=True, isomericSmiles=True)
+    input_id = make_input_id(molname, canonical)
+    protomer_id = make_protomer_id(input_id, 1, canonical, isomeric)
+    return ProtomerRecord(
+        id=protomer_id,
+        parent_id=input_id,
+        input_molecule_id=input_id,
+        molname=molname,
+        canonical_smiles=canonical,
+        isomeric_smiles=isomeric,
+        molecular_formula="C2H6O",
+        formal_charge=Chem.GetFormalCharge(molecule),
+        explicit_proton_count=6,
+        source_software="test",
+        source_python_function="test",
+        protomer_index=1,
+        rdkit_mol=molecule,
+    )
+
+
+def _seed_from_protomer(
+    protomer: ProtomerRecord,
+    index: int,
+    energy: float,
+) -> SeedConformerRecord:
+    return SeedConformerRecord(
+        id=f"{protomer.id}_seed_{index}",
+        parent_id=protomer.id,
+        input_molecule_id=protomer.input_molecule_id,
+        molname=protomer.molname,
+        canonical_smiles=protomer.canonical_smiles,
+        isomeric_smiles=protomer.isomeric_smiles,
+        molecular_formula=protomer.molecular_formula,
+        formal_charge=protomer.formal_charge,
+        explicit_proton_count=protomer.explicit_proton_count,
+        source_software="auto3d",
+        energy_kcal_mol=energy,
+        conformer_index=index,
+    )
+
+
 def _write_auto3d_output(
     path: Path,
     smiles: str,
     stereo_id: str | None,
     *,
     energy: str,
+    prop: str = "E_tot",
 ) -> None:
     mol = Chem.MolFromSmiles(smiles)
     mol = Chem.AddHs(mol)
     mol.SetProp("_Name", stereo_id or "auto3d_internal_output")
     if stereo_id is not None:
         mol.SetProp("DSVR_STEREO_ID", stereo_id)
-    mol.SetProp("E_tot", energy)
+    mol.SetProp(prop, energy)
     writer = Chem.SDWriter(str(path))
     writer.write(mol)
     writer.close()

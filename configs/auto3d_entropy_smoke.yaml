@@ -1,0 +1,86 @@
+description: Fast smoke test configuration for the Auto3D entropy protocol.
+protocol: auto3d_entropy
+run_name: auto3d-entropy-smoke
+input_path: examples/test_molecules_minimal.smi
+input_format: auto
+output_dir: runs/auto3d-entropy-smoke
+max_workers: 1
+dry_run: false
+overwrite: true
+resume: true
+
+chemistry:
+  ph: 7.0
+  ph_low: null
+  ph_high: null
+  solvent: water
+  solvent_model: alpb
+  temperature_kelvin: 298.15
+  standardize: true
+  keep_salts: false
+  largest_fragment_only: true
+
+enumeration:
+  max_protomers_per_molecule: 1
+  max_tautomers_per_protomer: 1
+  max_tautomer_transforms: 16
+  tautomer_timeout_seconds: 10
+  tautomer_strategy: safe
+  tautomer_remove_bond_stereo: true
+  tautomer_remove_sp3_stereo: true
+  tautomer_reassign_stereo: true
+  max_stereoisomers_per_tautomer: 1
+  stereo_try_embedding: true
+  stereo_only_unassigned: true
+  stereo_unique: true
+  stereo_random_seed: 61453
+  fail_on_enumeration_cap: false
+
+seeding:
+  method: auto3d
+  auto3d_k: 1
+  auto3d_model: AIMNET
+  auto3d_internal_tautomer_stereo_enum: true
+  auto3d_mpi_np: 28
+  auto3d_cpu_workers: 2
+  auto3d_memory_gb: 1
+  auto3d_capacity: 1
+  auto3d_max_confs: 2
+  auto3d_patience: 50
+  auto3d_threshold: 0.5
+  auto3d_opt_steps: 300
+  auto3d_use_gpu: false
+
+crest:
+  enabled: false
+
+xtb_prefilter:
+  enabled: false
+
+thermo:
+  enabled: false
+  xtb_hessian: false
+  xtb_thermo: false
+
+qm:
+  enabled: false
+
+refinement:
+  censo_enabled: false
+  psi4_enabled: false
+  pyscf_enabled: false
+  qm_backend: none
+
+variant_filtering:
+  enabled: false
+
+stereo_filtering:
+  collapse_enantiomers_in_achiral_solvent: false
+  solvent_is_chiral: false
+  run_crest_for_enantiomer_pairs_once: false
+  keep_mapping_to_all_stereo_outputs: true
+
+logging:
+  level: INFO
+  save_subprocess_logs: true
+  tail_subprocess_logs: true

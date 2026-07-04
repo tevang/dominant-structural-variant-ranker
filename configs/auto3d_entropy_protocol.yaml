@@ -1,8 +1,9 @@
-description: High-accuracy physics-intensive configuration with CENSO refinement enabled.
-run_name: physics-heavy
+description: Protocol using Auto3D for enumeration, conformer generation, and configurational entropy ranking.
+protocol: auto3d_entropy
+run_name: auto3d-entropy-protocol
 input_path: examples/test_molecules.smi
 input_format: auto
-output_dir: runs/physics-heavy
+output_dir: runs/auto3d-entropy-protocol
 max_workers: 1
 dry_run: false
 overwrite: false
@@ -21,14 +22,14 @@ chemistry:
 
 enumeration:
   max_protomers_per_molecule: 32
-  max_tautomers_per_protomer: 128
-  max_tautomer_transforms: 512
-  tautomer_timeout_seconds: 60
-  tautomer_strategy: normal
+  max_tautomers_per_protomer: 32
+  max_tautomer_transforms: 256
+  tautomer_timeout_seconds: 30
+  tautomer_strategy: safe
   tautomer_remove_bond_stereo: true
   tautomer_remove_sp3_stereo: true
   tautomer_reassign_stereo: true
-  max_stereoisomers_per_tautomer: 128
+  max_stereoisomers_per_tautomer: 64
   stereo_try_embedding: true
   stereo_only_unassigned: true
   stereo_unique: true
@@ -36,38 +37,85 @@ enumeration:
   fail_on_enumeration_cap: false
 
 seeding:
-  method: etkdg
+  method: auto3d
   rdkit_num_conformers: 30
   rdkit_prune_rms_thresh: 0.5
   rdkit_forcefield: uff
   auto3d_k: 3
-  auto3d_model: AIMNet2
-  auto3d_internal_tautomer_stereo_enum: false
+  auto3d_model: AIMNET
+  auto3d_internal_tautomer_stereo_enum: true
+  auto3d_mpi_np: 28
+  auto3d_cpu_workers: 28
+  auto3d_memory_gb: 1
+  auto3d_capacity: 1
+  auto3d_max_confs: 10
+  auto3d_patience: 200
+  auto3d_threshold: 0.3
+  auto3d_opt_steps: 2000
+  auto3d_use_gpu: false
 
 crest:
-  enabled: true
+  enabled: false
   executable: crest
   xtb_executable: xtb
   gfn: 2
   ewin_kcal_mol: 6.0
-  nproc: 8
+  nproc: 4
+  max_jobs_per_molecule: 8
+  max_conformers_to_parse: 20
+  max_conformers_to_keep: 5
+  keep_raw_xyz: false
+  compress_raw_outputs: true
+  delete_intermediate_xyz: true
+  cleanup_patterns: ["*.tmp", "coord.*", "struc*.xyz", "trial*.xyz"]
   walltime_minutes: null
   command_template: null
   extra_args: []
 
+xtb_prefilter:
+  enabled: false
+  optimize: true
+  hessian: false
+  solvent_model: alpb
+  solvent: water
+  gfn: 2
+  max_variants_per_molecule: 16
+  keep_within_kcal_mol: 10.0
+  keep_top_n_per_molecule: 8
+  keep_top_n_per_charge: 3
+  keep_top_n_per_formula: 3
+  timeout_seconds_per_variant: 300
+  nproc: 4
+
 thermo:
-  enabled: true
-  xtb_hessian: true
-  xtb_thermo: true
+  enabled: false
+  xtb_hessian: false
+  xtb_thermo: false
   rrho_cutoff: 100.0
   population_scope: same_formula
   energy_unit: kcal/mol
+  max_variants_per_molecule: 5
+  max_conformers_per_variant: 3
 
 refinement:
-  censo_enabled: true
+  censo_enabled: false
+  censo_executable: censo
+  censo_command_template: null
+  censo_extra_args: []
+  qm_backend: none
+  qm_method: b3lyp
+  qm_basis: def2-svp
+  qm_solvent: null
+  qm_optimize: false
+  qm_single_point: true
   psi4_enabled: false
   pyscf_enabled: false
-  max_candidates_for_refinement: 5
+  max_candidates_for_refinement: 3
+
+qm:
+  enabled: false
+  backend: none
+  max_candidates: 3
 
 logging:
   level: INFO
@@ -75,28 +123,28 @@ logging:
   tail_subprocess_logs: true
 
 variant_filtering:
-  enabled: true
+  enabled: false
   mode: balanced
   max_variants_before_3d_per_molecule: 64
   max_variants_after_cheap_score_per_molecule: 24
   max_variants_for_xtb_prefilter_per_molecule: 16
   max_variants_for_crest_per_molecule: 8
-  max_seeds_per_variant: 2
+  max_seeds_per_variant: 3
   keep_original_state: true
   keep_best_per_charge_state: true
   keep_best_per_formula: true
   keep_best_per_protomer: true
   keep_best_per_tautomer_family: true
+  collapse_enantiomers: true
   absolute_penalty_cutoff: 12.0
   relative_penalty_cutoff: 7.0
   min_variants_to_keep: 3
   rescue_rules_enabled: true
-  collapse_enantiomers: true
 
 stereo_filtering:
-  collapse_enantiomers_in_achiral_solvent: true
+  collapse_enantiomers_in_achiral_solvent: false
   solvent_is_chiral: false
-  run_crest_for_enantiomer_pairs_once: true
+  run_crest_for_enantiomer_pairs_once: false
   keep_mapping_to_all_stereo_outputs: true
 
 timeouts:

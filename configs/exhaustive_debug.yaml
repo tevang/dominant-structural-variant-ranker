@@ -1,3 +1,4 @@
+description: Computationally expensive configuration for exhaustive enumeration and debugging.
 run_name: exhaustive-debug
 input_path: examples/test_molecules_minimal.smi
 input_format: auto

@@ -1,3 +1,4 @@
+description: Default configuration for the physics-heavy workflow (molscrub -> RDKit -> CREST/xTB).
 run_name: default
 input_path: examples/test_molecules.smi
 input_format: auto

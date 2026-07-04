@@ -1,3 +1,4 @@
+description: Conservative production profile with aggressive filtering and smaller budgets for faster runs.
 run_name: production-conservative
 input_path: examples/test_molecules.smi
 input_format: auto

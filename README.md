@@ -24,6 +24,39 @@ molscrub protonation/protomer generation at target pH
 -> optional Psi4/PySCF final rescoring
 ```
 
+## Auto3D Entropy Protocol
+
+The repository also includes an Auto3D-owned enumeration and ranking protocol:
+
+```text
+molscrub protonation/protomer generation at target pH
+-> Auto3D tautomer enumeration
+-> Auto3D stereoisomer enumeration
+-> Auto3D conformer generation
+-> Auto3D geometry optimization ensemble reduction
+-> Auto3D configurational entropy Delta G ranking
+```
+
+Run it with:
+
+```bash
+dsvr run examples/test_molecules.smi \
+  --config configs/auto3d_entropy_protocol.yaml \
+  --outdir runs/auto3d_entropy_water_pH7
+```
+
+For a fast sanity-check, use:
+
+```bash
+dsvr run examples/test_molecules_minimal.smi \
+  --config configs/auto3d_entropy_smoke.yaml \
+  --outdir runs/auto3d_entropy_smoke
+```
+
+The corresponding Auto3D-native parameter template is
+`configs/auto3d_entropy.auto3d.yaml`. DSVR writes lineage and ranking outputs
+under `seeding/auto3d_protocol`, `auto3d_entropy`, and `ranking`.
+
 Default implementation notes:
 
 - Default pH: `7.0`
@@ -81,6 +114,20 @@ For a direct source-tree smoke check:
 ```bash
 PYTHONPATH=src python -m dsvr.cli --help
 PYTHONPATH=src python -m pytest
+```
+
+For GitHub Actions debugging, use:
+
+```bash
+python scripts/inspect_ci_run.py https://github.com/tevang/dominant-structural-variant-ranker/actions/runs/<run_id>
+```
+
+If `GH_TOKEN` is not set, the script will reuse `GITHUB_TOKEN` when available.
+
+Short form:
+
+```bash
+make ci-log RUN=https://github.com/tevang/dominant-structural-variant-ranker/actions/runs/<run_id>
 ```
 
 ## Dependency Strategy

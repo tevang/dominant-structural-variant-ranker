@@ -1,3 +1,4 @@
+description: Fast smoke test configuration for the default physics-heavy workflow.
 run_name: fast-smoke
 input_path: examples/test_molecules_minimal.smi
 input_format: auto

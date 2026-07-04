@@ -121,9 +121,27 @@ def test_production_configs_load() -> None:
         Path("configs/production_conservative.yaml"),
         Path("configs/exhaustive_debug.yaml"),
         Path("configs/crest_disk_safe.yaml"),
+        Path("configs/auto3d_entropy_protocol.yaml"),
+        Path("configs/auto3d_entropy_smoke.yaml"),
     ]:
         config = load_config(path)
         assert config.run_name
+
+
+def test_auto3d_entropy_protocol_config_loads() -> None:
+    config = load_config(Path("configs/auto3d_entropy_protocol.yaml"))
+
+    assert config.protocol == "auto3d_entropy"
+    assert config.seeding.method == "auto3d"
+    assert config.seeding.auto3d_internal_tautomer_stereo_enum is True
+    assert config.seeding.auto3d_mpi_np == 28
+    assert config.seeding.auto3d_cpu_workers == 28
+    assert config.seeding.auto3d_memory_gb == 1
+    assert config.seeding.auto3d_capacity == 1
+    assert config.seeding.auto3d_model == "AIMNET"
+    assert config.seeding.auto3d_max_confs == 10
+    assert config.crest.enabled is False
+    assert config.thermo.enabled is False
 
 
 def test_rejects_partial_ph_window() -> None:

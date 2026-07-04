@@ -58,31 +58,55 @@ def planned_steps(config: RunConfig) -> list[WorkflowStep]:
         ),
         WorkflowStep(
             "tautomers",
-            "Enumerate RDKit tautomer candidates.",
+            (
+                "Auto3D tautomer enumeration."
+                if config.protocol == "auto3d_entropy"
+                else "Enumerate RDKit tautomer candidates."
+            ),
             root / "enumeration" / "tautomers",
+            ["Auto3D"] if config.protocol == "auto3d_entropy" else [],
         ),
         WorkflowStep(
             "stereochemistry",
-            "Enumerate explicit RDKit stereoisomer candidates.",
+            (
+                "Auto3D stereoisomer enumeration."
+                if config.protocol == "auto3d_entropy"
+                else "Enumerate explicit RDKit stereoisomer candidates."
+            ),
             root / "enumeration" / "stereoisomers",
+            ["Auto3D"] if config.protocol == "auto3d_entropy" else [],
         ),
         WorkflowStep(
             "seeding",
-            f"Generate 3D seeds with {config.seeding.method}.",
+            (
+                "Run Auto3D conformer generation, geometry optimization, and ensemble reduction."
+                if config.protocol == "auto3d_entropy"
+                else f"Generate 3D seeds with {config.seeding.method}."
+            ),
             root / "seeding",
-            ["Auto3D"] if config.seeding.method in {"auto3d", "both"} else [],
+            ["Auto3D"]
+            if config.protocol == "auto3d_entropy" or config.seeding.method in {"auto3d", "both"}
+            else [],
         ),
         WorkflowStep(
             "crest",
-            "Run CREST/xTB conformer search and ensemble reduction.",
+            (
+                "Skipped by Auto3D entropy protocol."
+                if config.protocol == "auto3d_entropy"
+                else "Run CREST/xTB conformer search and ensemble reduction."
+            ),
             root / "crest",
-            ["crest", "xtb"],
+            [] if config.protocol == "auto3d_entropy" else ["crest", "xtb"],
         ),
         WorkflowStep(
             "xtb_thermo",
-            "Run xTB Hessian/thermo and collect free-energy estimates.",
+            (
+                "Auto3D entropy Delta G ranking input."
+                if config.protocol == "auto3d_entropy"
+                else "Run xTB Hessian/thermo and collect free-energy estimates."
+            ),
             root / "xtb",
-            ["xtb"],
+            [] if config.protocol == "auto3d_entropy" else ["xtb"],
         ),
         WorkflowStep("ranking", "Compute ΔG and approximate populations.", root / "ranking"),
         WorkflowStep(

@@ -7,6 +7,7 @@ import os
 import re
 import shutil
 import subprocess
+import sys
 import tempfile
 import threading
 import time
@@ -53,6 +54,7 @@ def run_command(
     log_dir: Path | None = None,
     command_name: str | None = None,
     show_progress: bool = False,
+    stream_output: bool = False,
     check: bool = True,
     env: dict[str, str] | None = None,
 ) -> subprocess.CompletedProcess[str]:
@@ -78,6 +80,7 @@ def run_command(
         "duration_seconds": None,
         "returncode": None,
         "timeout_seconds": timeout_s,
+        "env_overrides": env or {},
         "stdout_log": str(stdout_path),
         "stderr_log": str(stderr_path),
         "combined_log": str(combined_path),
@@ -121,12 +124,26 @@ def run_command(
         threads = [
             threading.Thread(
                 target=_stream_pipe,
-                args=(process.stdout, stdout_handle, combined_handle, stdout_chunks, "stdout"),
+                args=(
+                    process.stdout,
+                    stdout_handle,
+                    combined_handle,
+                    stdout_chunks,
+                    "stdout",
+                    stream_output,
+                ),
                 daemon=True,
             ),
             threading.Thread(
                 target=_stream_pipe,
-                args=(process.stderr, stderr_handle, combined_handle, stderr_chunks, "stderr"),
+                args=(
+                    process.stderr,
+                    stderr_handle,
+                    combined_handle,
+                    stderr_chunks,
+                    "stderr",
+                    stream_output,
+                ),
                 daemon=True,
             ),
         ]
@@ -317,6 +334,7 @@ def _stream_pipe(
     combined_handle,
     chunks: list[str],
     stream_name: str,
+    stream_output: bool = False,
 ) -> None:
     if pipe is None:
         return
@@ -326,6 +344,10 @@ def _stream_pipe(
         stream_handle.flush()
         combined_handle.write(f"[{stream_name}] {line}")
         combined_handle.flush()
+        if stream_output:
+            target = sys.stdout if stream_name == "stdout" else sys.stderr
+            target.write(line)
+            target.flush()
 
 
 def _prepare_log_dir(

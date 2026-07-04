@@ -1,3 +1,4 @@
+description: Balanced production profile with reasonable budgets and filtering for typical drug-like molecules.
 run_name: production-balanced
 input_path: examples/test_molecules.smi
 input_format: auto

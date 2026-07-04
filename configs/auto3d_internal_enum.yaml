@@ -1,3 +1,4 @@
+description: Configuration enabling Auto3D's internal tautomer and stereoisomer enumeration.
 run_name: auto3d-internal-enum
 input_path: examples/test_molecules.smi
 input_format: auto

@@ -11,7 +11,8 @@ InputFormat = Literal["auto", "smi", "smiles", "sdf"]
 SolventModel = Literal["alpb", "gbsa", "none"]
 SeederMethod = Literal["etkdg", "auto3d", "both"]
 RdkitForcefield = Literal["uff", "mmff", "none"]
-Auto3dModel = Literal["AIMNet2", "ANI2x", "ANI2xt", "auto"]
+Auto3dModel = Literal["AIMNET", "AIMNet2", "ANI2x", "ANI2xt", "auto"]
+WorkflowProtocol = Literal["default", "auto3d_entropy"]
 PopulationScope = Literal["same_formula", "same_charge", "all_approximate"]
 EnergyUnit = Literal["kcal/mol"]
 LogLevel = Literal["DEBUG", "INFO", "WARNING", "ERROR"]
@@ -119,12 +120,35 @@ class SeedingConfig(StrictModel):
     auto3d_k: int = 3
     auto3d_model: Auto3dModel = "AIMNet2"
     auto3d_internal_tautomer_stereo_enum: bool = False
+    auto3d_mpi_np: int = 4
+    auto3d_cpu_workers: int | None = None
+    auto3d_memory_gb: int | None = None
+    auto3d_capacity: int | None = None
+    auto3d_max_confs: int | None = None
+    auto3d_patience: int | None = None
+    auto3d_threshold: float | None = None
+    auto3d_opt_steps: int | None = None
+    auto3d_use_gpu: bool = False
 
-    @field_validator("rdkit_num_conformers", "auto3d_k")
+    @field_validator("rdkit_num_conformers", "auto3d_k", "auto3d_mpi_np")
     @classmethod
     def positive_count(cls, value: int) -> int:
         if value <= 0:
             raise ValueError("conformer counts must be positive")
+        return value
+
+    @field_validator(
+        "auto3d_cpu_workers",
+        "auto3d_memory_gb",
+        "auto3d_capacity",
+        "auto3d_max_confs",
+        "auto3d_patience",
+        "auto3d_opt_steps",
+    )
+    @classmethod
+    def optional_positive_auto3d_int(cls, value: int | None) -> int | None:
+        if value is not None and value <= 0:
+            raise ValueError("Auto3D integer settings must be positive when set")
         return value
 
     @field_validator("rdkit_prune_rms_thresh")
@@ -132,6 +156,13 @@ class SeedingConfig(StrictModel):
     def nonnegative_rms(cls, value: float) -> float:
         if value < 0:
             raise ValueError("rdkit_prune_rms_thresh must be non-negative")
+        return value
+
+    @field_validator("auto3d_threshold")
+    @classmethod
+    def optional_nonnegative_auto3d_threshold(cls, value: float | None) -> float | None:
+        if value is not None and value < 0:
+            raise ValueError("auto3d_threshold must be non-negative when set")
         return value
 
 
@@ -380,6 +411,8 @@ class DiskConfig(StrictModel):
 
 
 class RunConfig(StrictModel):
+    description: str | None = None
+    protocol: WorkflowProtocol = "default"
     run_name: str = "dsvr-run"
     input_path: Path = Path("examples/test_molecules_minimal.smi")
     input_format: InputFormat = "auto"
