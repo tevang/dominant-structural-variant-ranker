@@ -20,7 +20,7 @@ def test_default_config_resolves_ph_window() -> None:
     assert config.chemistry.ph_high == 7.0
     assert config.chemistry.solvent == "water"
     assert config.seeding.method == "etkdg"
-    assert config.seeding.auto3d_allow_rdkit_fallback is False
+    assert config.seeding.auto3d_allow_rdkit_fallback is True
     assert config.refinement.censo_enabled is False
 
 

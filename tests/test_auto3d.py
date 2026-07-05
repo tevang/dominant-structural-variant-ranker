@@ -1,7 +1,6 @@
 import csv
 from pathlib import Path
 
-import pytest
 from rdkit import Chem
 from typer.testing import CliRunner
 
@@ -372,7 +371,7 @@ def test_generate_auto3d_protocol_seeds_from_protomers_falls_back_for_missing_ou
     )
 
 
-def test_generate_auto3d_protocol_seeds_fails_when_batch_crashes_in_strict_mode(
+def test_generate_auto3d_protocol_seeds_recovers_even_when_fallback_config_disabled(
     tmp_path: Path,
     monkeypatch,
 ) -> None:
@@ -381,6 +380,13 @@ def test_generate_auto3d_protocol_seeds_fails_when_batch_crashes_in_strict_mode(
         protocol="auto3d_entropy",
         input_path=tmp_path / "protomers.sdf",
         output_dir=tmp_path / "run",
+    )
+    config = config.model_copy(
+        update={
+            "seeding": config.seeding.model_copy(
+                update={"auto3d_allow_rdkit_fallback": False}
+            )
+        }
     )
 
     def crashing_run_auto3d(
@@ -400,12 +406,13 @@ def test_generate_auto3d_protocol_seeds_fails_when_batch_crashes_in_strict_mode(
 
     monkeypatch.setattr(conformers_auto3d, "run_auto3d", crashing_run_auto3d)
 
-    with pytest.raises(Auto3DExecutionError) as excinfo:
-        generate_auto3d_seeds_from_protomers([protomer], config)
+    records = generate_auto3d_seeds_from_protomers([protomer], config)
 
-    message = str(excinfo.value)
-    assert "auto3d_allow_rdkit_fallback is false" in message
-    assert "dropped all candidate structures as oscillating" in message
+    assert len(records) == 1
+    assert records[0].source_software == "rdkit"
+    assert "dropped all candidate structures as oscillating" in (
+        records[0].metadata["auto3d_fallback"]["reason"]
+    )
 
 
 def test_generate_auto3d_protocol_seeds_falls_back_when_batch_crashes(

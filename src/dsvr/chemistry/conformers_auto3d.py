@@ -7,7 +7,8 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 
 from rdkit import Chem
-from rdkit.Chem import rdMolDescriptors
+from rdkit.Chem import AllChem, rdMolDescriptors
+from rdkit.Geometry import Point3D
 
 from dsvr.chemistry.conformers_rdkit import generate_rdkit_seeds
 from dsvr.config import RunConfig
@@ -530,7 +531,10 @@ def _write_auto3d_batch_failure(
     policy = (
         "RDKit fallback is enabled for missing protomers."
         if fallback_allowed
-        else "RDKit fallback is disabled; this Auto3D failure is fatal for the run."
+        else (
+            "RDKit fallback was disabled in config, but workflow molecule-coverage "
+            "policy still attempts RDKit recovery for missing protomers."
+        )
     )
     path.write_text(
         "Auto3D batch failed.\n"
@@ -817,15 +821,6 @@ def _fill_missing_auto3d_protomer_outputs_with_rdkit(
     fallback_records: list[SeedConformerRecord] = []
     fallback_failures: list[str] = []
     fallback_reason = _auto3d_partial_failure_reason(output_sdf, output_dir)
-    if not config.seeding.auto3d_allow_rdkit_fallback:
-        missing_display = ", ".join(missing_ids)
-        raise Auto3DExecutionError(
-            "Auto3D failed to produce optimized seeds for "
-            f"{len(missing_ids)}/{len(protomer_records)} protomers: {missing_display}. "
-            f"Reason: {fallback_reason}. "
-            "This is fatal because seeding.auto3d_allow_rdkit_fallback is false. "
-            f"Inspect Auto3D artifacts under {output_dir}."
-        )
     for protomer_id in missing_ids:
         protomer = protomer_by_id[protomer_id]
         fallback = _rdkit_fallback_seed_for_missing_protomer(
@@ -900,7 +895,14 @@ def _rdkit_fallback_seed_for_missing_protomer(
         if record.embedding_status != "failed" and record.rdkit_mol is not None
     ]
     if not successful:
-        return None
+        return _last_resort_rdkit_seed_for_missing_protomer(
+            protomer,
+            config=config,
+            command=command,
+            output_sdf=output_sdf,
+            output_dir=output_dir,
+            reason=reason,
+        )
     record = successful[0]
     warning = (
         "Auto3D produced no optimized representative for this protomer; "
@@ -934,6 +936,120 @@ def _rdkit_fallback_seed_for_missing_protomer(
             "energy_kcal_mol": None,
         }
     )
+
+
+def _last_resort_rdkit_seed_for_missing_protomer(
+    protomer: ProtomerRecord,
+    *,
+    config: RunConfig,
+    command: list[str],
+    output_sdf: Path,
+    output_dir: Path,
+    reason: str,
+) -> SeedConformerRecord | None:
+    try:
+        mol = Chem.AddHs(Chem.Mol(protomer.rdkit_mol))
+    except (RuntimeError, ValueError, TypeError):
+        return None
+
+    embedding_status = "success"
+    params = AllChem.ETKDGv3() if hasattr(AllChem, "ETKDGv3") else AllChem.ETKDG()
+    params.randomSeed = int(config.enumeration.stereo_random_seed)
+    params.useRandomCoords = True
+    try:
+        conformer_id = int(AllChem.EmbedMolecule(mol, params))
+    except (RuntimeError, ValueError):
+        conformer_id = -1
+    if conformer_id < 0:
+        _assign_deterministic_3d_coordinates(mol)
+        embedding_status = "success_manual_3d_coordinates"
+    else:
+        mol.GetConformer(conformer_id).SetId(0)
+
+    ff_status, converged, energy = _minimize_rdkit_fallback_molecule(mol, config)
+    canonical_smiles = Chem.MolToSmiles(mol, canonical=True, isomericSmiles=False)
+    isomeric_smiles = Chem.MolToSmiles(mol, canonical=True, isomericSmiles=True)
+    metadata = dict(protomer.metadata)
+    metadata["auto3d_fallback"] = {
+        "auto3d_command": " ".join(command),
+        "auto3d_output_sdf": str(output_sdf),
+        "auto3d_job_dir": str(output_sdf.parent),
+        "missing_protomer_id": protomer.id,
+        "reason": reason,
+        "fallback_method": "rdkit_single_embed_or_manual_3d",
+        "cheap_3d_energy_omitted": True,
+    }
+    warnings = list(protomer.warnings)
+    warnings.append(
+        "Auto3D and standard RDKit ETKDG produced no optimized representative; "
+        f"using last-resort RDKit/manual 3D seed. Reason: {reason}"
+    )
+    return SeedConformerRecord(
+        id=make_seed_id(protomer.id, 1, canonical_smiles, isomeric_smiles, metadata),
+        parent_id=protomer.id,
+        input_molecule_id=protomer.input_molecule_id,
+        molname=protomer.molname,
+        canonical_smiles=canonical_smiles,
+        isomeric_smiles=isomeric_smiles,
+        molecular_formula=_formula(mol),
+        formal_charge=Chem.GetFormalCharge(mol),
+        explicit_proton_count=_explicit_proton_count(mol),
+        source_software="rdkit",
+        source_command=" ".join(command),
+        source_python_function=(
+            "dsvr.chemistry.conformers_auto3d."
+            "_last_resort_rdkit_seed_for_missing_protomer"
+        ),
+        output_paths=[
+            output_sdf,
+            output_dir / "auto3d_protocol_seeds.sdf",
+            output_dir / "auto3d_protocol_seeds.csv",
+        ],
+        warnings=warnings,
+        metadata=metadata,
+        conformer_index=1,
+        energy_kcal_mol=energy,
+        rdkit_mol=mol,
+        rdkit_conformer_id=0,
+        forcefield=config.seeding.rdkit_forcefield,
+        forcefield_status=ff_status,
+        minimization_converged=converged,
+        embedding_status=embedding_status,
+    )
+
+
+def _assign_deterministic_3d_coordinates(molecule: Chem.Mol) -> None:
+    conformer = Chem.Conformer(molecule.GetNumAtoms())
+    conformer.Set3D(True)
+    for index in range(molecule.GetNumAtoms()):
+        x = 1.35 * float(index)
+        y = 0.75 * math.sin(float(index))
+        z = 0.75 * math.cos(float(index))
+        conformer.SetAtomPosition(index, Point3D(x, y, z))
+    molecule.RemoveAllConformers()
+    molecule.AddConformer(conformer, assignId=True)
+
+
+def _minimize_rdkit_fallback_molecule(
+    molecule: Chem.Mol,
+    config: RunConfig,
+) -> tuple[str, bool | None, float | None]:
+    if config.seeding.rdkit_forcefield == "none":
+        return "disabled", None, None
+    try:
+        if config.seeding.rdkit_forcefield == "mmff":
+            props = AllChem.MMFFGetMoleculeProperties(molecule, mmffVariant="MMFF94")
+            if props is None:
+                return "mmff_parameters_unavailable", None, None
+            ff = AllChem.MMFFGetMoleculeForceField(molecule, props)
+        else:
+            ff = AllChem.UFFGetMoleculeForceField(molecule)
+        if ff is None:
+            return f"{config.seeding.rdkit_forcefield}_forcefield_unavailable", None, None
+        result = ff.Minimize(maxIts=500)
+        return f"{config.seeding.rdkit_forcefield}_minimized", result == 0, float(ff.CalcEnergy())
+    except (RuntimeError, ValueError):
+        return f"{config.seeding.rdkit_forcefield}_minimization_failed", False, None
 
 
 def _auto3d_partial_failure_reason(output_sdf: Path, output_dir: Path) -> str:

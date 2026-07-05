@@ -118,11 +118,16 @@ def test_workflow_auto3d_entropy_protocol_with_mocked_auto3d(
     assert (outdir / "auto3d_protocol_seeds.sdf").exists()
     assert (outdir / "auto3d_protocol_seeds.csv").exists()
     assert (outdir / "auto3d_adaptive_plan.csv").exists()
+    assert (outdir / "all_protomers.sdf").exists()
+    assert (outdir / "all_tautomers.sdf").exists()
+    assert (outdir / "all_stereoisomers.sdf").exists()
+    assert (outdir / "all_3d_conformers.sdf").exists()
     assert (outdir / "structure_generation_summary.csv").exists()
     assert (outdir / "structure_failures.csv").exists()
     assert (outdir / "run_outputs.csv").exists()
     summary = (outdir / "structure_generation_summary.csv").read_text(encoding="utf-8")
     assert "Auto3D representative generation" in summary
+    assert "all_3d_conformers.sdf" in summary
     assert "ranked_variants.sdf" in summary
     manifest = (outdir / "manifest.json").read_text(encoding="utf-8")
     assert '"protocol": "auto3d_entropy"' in manifest

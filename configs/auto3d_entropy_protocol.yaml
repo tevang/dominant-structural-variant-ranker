@@ -53,7 +53,7 @@ seeding:
   auto3d_threshold: 0.5
   auto3d_opt_steps: 400
   auto3d_use_gpu: true
-  auto3d_allow_rdkit_fallback: false
+  auto3d_allow_rdkit_fallback: true
 
 crest:
   enabled: false

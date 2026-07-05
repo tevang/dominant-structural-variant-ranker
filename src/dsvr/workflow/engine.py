@@ -180,6 +180,7 @@ def run_workflow(config: RunConfig) -> WorkflowResult:
             )
         )
     records.extend(protomers)
+    _write_stage_summary_sdf(outdir / "all_protomers.sdf", protomers)
     progress.record("Protomer generation", "completed", generated_count=len(protomers))
 
     if config.protocol == "auto3d_entropy":
@@ -206,6 +207,7 @@ def run_workflow(config: RunConfig) -> WorkflowResult:
         progress_stage="Tautomer enumeration",
     )
     records.extend(tautomers)
+    _write_stage_summary_sdf(outdir / "all_tautomers.sdf", tautomers)
     progress.record("Tautomer enumeration", "completed", generated_count=len(tautomers))
 
     progress.record("Stereoisomer enumeration", "started", generated_count=len(tautomers))
@@ -221,6 +223,7 @@ def run_workflow(config: RunConfig) -> WorkflowResult:
         progress_stage="Stereoisomer enumeration",
     )
     records.extend(stereos)
+    _write_stage_summary_sdf(outdir / "all_stereoisomers.sdf", stereos)
     progress.record("Stereoisomer enumeration", "completed", generated_count=len(stereos))
     progress.record("Cheap variant scoring", "started", generated_count=len(stereos))
     stereos_for_seeding, decisions = select_stereo_records(stereos, config, "pre_3d")
@@ -297,6 +300,7 @@ def run_workflow(config: RunConfig) -> WorkflowResult:
             )
         )
     records.extend(seeds)
+    _write_stage_summary_sdf(outdir / "all_3d_conformers.sdf", seeds)
     progress.record("3D seeding", "completed", generated_count=len(seeds))
     progress.record("3D seed filtering", "started", generated_count=len(seeds))
     crest_seeds, decisions = select_seed_records(seeds, config)
@@ -571,6 +575,9 @@ def _run_auto3d_entropy_protocol(
     outdir = config.output_dir
     steps = {step.name: step for step in planned_steps(config)}
 
+    _write_stage_summary_sdf(outdir / "all_tautomers.sdf", [])
+    _write_stage_summary_sdf(outdir / "all_stereoisomers.sdf", [])
+
     for step_name in ("tautomers", "stereochemistry"):
         states.append(
             mark_done(
@@ -615,6 +622,7 @@ def _run_auto3d_entropy_protocol(
             )
         )
     records.extend(seeds)
+    _write_stage_summary_sdf(outdir / "all_3d_conformers.sdf", seeds)
     progress.record("Auto3D representative generation", "completed", generated_count=len(seeds))
 
     empty_stereo_reduction = StereoReductionResult(
@@ -798,7 +806,7 @@ def _write_auto3d_protocol_structure_summary(
             "failed_molecules": len(molecules)
             - len({item.input_molecule_id for item in protomers}),
             "fallback_structures": 0,
-            "output_sdf": "enumeration/protomers/*_protomers.sdf",
+            "output_sdf": "all_protomers.sdf",
             "output_csv": "enumeration/protomers/*_protomers.csv",
             "notes": (
                 "molscrub protomer candidates, or original molecule fallback "
@@ -812,7 +820,7 @@ def _write_auto3d_protocol_structure_summary(
             "molecules_with_structures": len(molecule_ids_with_seeds),
             "failed_molecules": len(molecules_without_structures),
             "fallback_structures": len(fallback_seeds),
-            "output_sdf": "auto3d_protocol_seeds.sdf",
+            "output_sdf": "all_3d_conformers.sdf",
             "output_csv": "auto3d_protocol_seeds.csv",
             "notes": (
                 f"{len(fallback_seeds)} protomer(s) used RDKit fallback after Auto3D failed; "
@@ -906,6 +914,10 @@ def _publish_top_level_run_outputs(outdir: Path) -> None:
         outdir / "ranked_variants.sdf",
         outdir / "ranked_variants.csv",
         outdir / "ranked_variants.json",
+        outdir / "all_protomers.sdf",
+        outdir / "all_tautomers.sdf",
+        outdir / "all_stereoisomers.sdf",
+        outdir / "all_3d_conformers.sdf",
         outdir / "auto3d_protocol_seeds.sdf",
         outdir / "auto3d_protocol_seeds.csv",
         outdir / "auto3d_adaptive_plan.csv",
@@ -1412,6 +1424,53 @@ def _ensure_invalid_inputs_csv(path: Path) -> None:
     path.write_text("record_index,raw_record,error\n", encoding="utf-8")
 
 
+def _write_stage_summary_sdf(path: Path, records: list[AnyLineageRecord]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    writer = Chem.SDWriter(str(path))
+    for record in records:
+        molecule = getattr(record, "rdkit_mol", None)
+        if molecule is None:
+            continue
+        mol = Chem.Mol(molecule)
+        mol.SetProp("_Name", record.id)
+        props = {
+            "DSVR_STAGE": record.stage_name,
+            "DSVR_RECORD_ID": record.id,
+            "DSVR_PARENT_ID": record.parent_id or "",
+            "DSVR_INPUT_ID": record.input_molecule_id,
+            "DSVR_MOLNAME": record.molname,
+            "DSVR_CANONICAL_SMILES": record.canonical_smiles or "",
+            "DSVR_ISOMERIC_SMILES": record.isomeric_smiles or "",
+            "DSVR_FORMULA": record.molecular_formula or "",
+            "DSVR_FORMAL_CHARGE": "" if record.formal_charge is None else str(record.formal_charge),
+            "DSVR_EXPLICIT_PROTON_COUNT": ""
+            if record.explicit_proton_count is None
+            else str(record.explicit_proton_count),
+        }
+        if isinstance(record, ProtomerRecord):
+            props["DSVR_PROTOMER_ID"] = record.id
+        elif record.stage_name == "tautomer":
+            props["DSVR_TAUTOMER_ID"] = record.id
+            props["DSVR_PARENT_PROTOMER_ID"] = record.parent_id or ""
+        elif record.stage_name == "stereo":
+            props["DSVR_STEREO_ID"] = record.id
+            props["DSVR_PARENT_TAUTOMER_ID"] = record.parent_id or ""
+        elif isinstance(record, SeedConformerRecord):
+            props["DSVR_SEED_ID"] = record.id
+            props["DSVR_PARENT_STEREO_ID"] = record.parent_id or ""
+            props["DSVR_FORCEFIELD"] = record.forcefield or ""
+            props["DSVR_FORCEFIELD_STATUS"] = record.forcefield_status
+            props["DSVR_EMBEDDING_STATUS"] = record.embedding_status
+            props["DSVR_ENERGY_KCAL_MOL"] = (
+                "" if record.energy_kcal_mol is None else str(record.energy_kcal_mol)
+            )
+            props["DSVR_AUTO3D_FALLBACK"] = str("auto3d_fallback" in record.metadata)
+        for key, value in props.items():
+            mol.SetProp(key, value)
+        writer.write(mol)
+    writer.close()
+
+
 def _write_protomer_outputs(record: ProtomerRecord) -> None:
     sdf_path, csv_path = record.output_paths
     writer = Chem.SDWriter(str(sdf_path))
@@ -1473,6 +1532,10 @@ def _final_output_files(outdir: Path) -> list[Path]:
         "protomers.csv",
         "tautomers.csv",
         "stereoisomers.csv",
+        "all_protomers.sdf",
+        "all_tautomers.sdf",
+        "all_stereoisomers.sdf",
+        "all_3d_conformers.sdf",
         "seeds.csv",
         "crest_conformers.csv",
         "thermo.csv",
