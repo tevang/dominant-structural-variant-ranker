@@ -48,6 +48,8 @@ scripts/bootstrap_mamba.sh \
 
 If `crest` is unavailable from conda-forge on your platform, install CREST from official release binaries or your package manager, then ensure `crest` and `xtb` are on `PATH`.
 
+For the local `dsvr` conda environment used in this repository, we also install a conda activation hook that sets up both tools automatically. After `conda activate dsvr`, `xtb` and `crest` should already be on `PATH` and `XTBHOME` / `CRESTHOME` should be set for the session.
+
 Check the result:
 
 ```bash

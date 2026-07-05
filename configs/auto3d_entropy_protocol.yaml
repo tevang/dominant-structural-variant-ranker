@@ -1,9 +1,9 @@
-description: Protocol using Auto3D for enumeration, conformer generation, and configurational entropy ranking.
+description: Practical Auto3D protocol for protomer generation, Auto3D tautomer/stereo enumeration, representative conformer generation, and SVPScore plausibility ranking.
 protocol: auto3d_entropy
-run_name: auto3d-entropy-protocol
+run_name: auto3d-representative-protocol
 input_path: examples/test_molecules.smi
 input_format: auto
-output_dir: runs/auto3d-entropy-protocol
+output_dir: runs/auto3d-representative-protocol
 max_workers: 1
 dry_run: false
 overwrite: false
@@ -21,15 +21,15 @@ chemistry:
   largest_fragment_only: true
 
 enumeration:
-  max_protomers_per_molecule: 32
-  max_tautomers_per_protomer: 32
+  max_protomers_per_molecule: 16
+  max_tautomers_per_protomer: 16
   max_tautomer_transforms: 256
   tautomer_timeout_seconds: 30
   tautomer_strategy: safe
   tautomer_remove_bond_stereo: true
   tautomer_remove_sp3_stereo: true
   tautomer_reassign_stereo: true
-  max_stereoisomers_per_tautomer: 64
+  max_stereoisomers_per_tautomer: 16
   stereo_try_embedding: true
   stereo_only_unassigned: true
   stereo_unique: true
@@ -41,18 +41,18 @@ seeding:
   rdkit_num_conformers: 30
   rdkit_prune_rms_thresh: 0.5
   rdkit_forcefield: uff
-  auto3d_k: 3
+  auto3d_k: 1
   auto3d_model: AIMNET
   auto3d_internal_tautomer_stereo_enum: true
   auto3d_mpi_np: 28
   auto3d_cpu_workers: 28
   auto3d_memory_gb: 1
   auto3d_capacity: 1
-  auto3d_max_confs: 10
-  auto3d_patience: 200
-  auto3d_threshold: 0.3
-  auto3d_opt_steps: 2000
-  auto3d_use_gpu: false
+  auto3d_max_confs: 1
+  auto3d_patience: 40
+  auto3d_threshold: 0.5
+  auto3d_opt_steps: 400
+  auto3d_use_gpu: true
 
 crest:
   enabled: false
@@ -92,10 +92,10 @@ thermo:
   xtb_hessian: false
   xtb_thermo: false
   rrho_cutoff: 100.0
-  population_scope: same_formula
+  population_scope: all_approximate
   energy_unit: kcal/mol
-  max_variants_per_molecule: 5
-  max_conformers_per_variant: 3
+  max_variants_per_molecule: 16
+  max_conformers_per_variant: 1
 
 refinement:
   censo_enabled: false

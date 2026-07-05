@@ -8,6 +8,7 @@ from dsvr.chemistry.conformers_auto3d import (
     generate_auto3d_seeds,
     generate_auto3d_seeds_from_protomers,
     reduce_auto3d_entropy_ensemble,
+    score_auto3d_representative_variants,
 )
 from dsvr.cli import app
 from dsvr.config import RunConfig
@@ -202,7 +203,7 @@ def test_generate_auto3d_protocol_seeds_from_protomers(tmp_path: Path, monkeypat
         assert patience == 200
         assert threshold == 0.3
         assert opt_steps == 2000
-        assert use_gpu is False
+        assert use_gpu is True
         assert stream_output is True
         output_sdf = output_dir / "mock_auto3d_protocol.sdf"
         _write_auto3d_output(output_sdf, "CCO", protomer.id, energy="-1.0", prop="E_kcal_mol")
@@ -243,6 +244,34 @@ def test_reduce_auto3d_entropy_ensemble_includes_configurational_entropy(
     assert records[0].entropy_cal_mol_k is not None
     assert records[0].entropy_cal_mol_k > 0.0
     assert (tmp_path / "run" / "auto3d_entropy" / "auto3d_entropy_records.csv").exists()
+
+
+def test_score_auto3d_representative_variants_uses_svp_score(
+    tmp_path: Path,
+) -> None:
+    protomer = _protomer("ethanol", "CCO")
+    config = RunConfig(
+        protocol="auto3d_entropy",
+        input_path=tmp_path / "protomers.sdf",
+        output_dir=tmp_path / "run",
+        thermo={"enabled": False, "population_scope": "all_approximate"},
+    )
+    seeds = [
+        _seed_from_protomer(protomer, 1, -10.0),
+        _seed_from_protomer(protomer, 2, -9.5),
+    ]
+
+    records = score_auto3d_representative_variants(seeds, config)
+
+    assert len(records) == 1
+    assert records[0].free_energy_kcal_mol is not None
+    assert records[0].free_energy_kcal_mol >= 0.0
+    assert records[0].entropy_cal_mol_k is None
+    assert records[0].metadata["auto3d_representative"]["candidate_conformer_count"] == 2
+    assert "svp_score" in records[0].metadata
+    assert (
+        tmp_path / "run" / "auto3d_representatives" / "auto3d_representative_scores.csv"
+    ).exists()
 
 
 def _stereo(molname: str, smiles: str) -> StereoRecord:

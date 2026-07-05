@@ -3,6 +3,7 @@ from __future__ import annotations
 import importlib.util
 import shutil
 import uuid
+import sys
 from pathlib import Path
 
 from dsvr.runners.subprocess_utils import run_command
@@ -44,7 +45,8 @@ def run_auto3d(
     stream_output: bool = False,
 ) -> tuple[Path, list[str]]:
     executable = _find_executable()
-    if executable is None:
+    python_api_available = importlib.util.find_spec("Auto3D") is not None
+    if executable is None and not python_api_available:
         raise Auto3DUnavailableError(
             "Auto3D is required for Auto3D seeding but is not installed. Install it with "
             "`pip install Auto3D` or `conda install -c conda-forge auto3d`, then run "
@@ -132,7 +134,7 @@ def _command_candidates(
     use_gpu: bool,
 ) -> list[list[str]]:
     wrapper = [
-        _python_executable(),
+        sys.executable,
         str(wrapper_script.resolve()),
         str(input_path.resolve()),
         "--k",
@@ -153,51 +155,54 @@ def _command_candidates(
     if mpi_np is not None:
         wrapper.extend(["--mpi_np", str(mpi_np)])
     if cpu_workers is not None and cpu_workers > 1:
-        wrapper.extend(["--gpu_idx", _cpu_worker_indices(cpu_workers)])
+        wrapper.extend(["--gpu_idx", "0"])
     if memory_gb is not None:
         wrapper.extend(["--memory", str(memory_gb)])
     if capacity is not None:
         wrapper.extend(["--capacity", str(capacity)])
-    commands = [
-        wrapper,
-        [
-            executable,
-            str(input_path.resolve()),
-            "--k",
-            str(k),
-            "--job_name",
-            f"{job_name_base}_legacy1",
-            "--optimizing_engine",
-            model,
-            "--isomer_engine",
-            "rdkit",
-            "--tauto_engine",
-            "rdkit",
-        ],
-        [
-            executable,
-            str(input_path.resolve()),
-            "--k",
-            str(k),
-            "--job_name",
-            f"{job_name_base}_legacy2",
-            "--enumerate_tautomer",
-            "True" if internal_tautomer_stereo_enum else "False",
-            "--enumerate_isomer",
-            "True" if internal_tautomer_stereo_enum else "False",
-            "--optimizing_engine",
-            model,
-            "--isomer_engine",
-            "rdkit",
-            "--tauto_engine",
-            "rdkit",
-        ],
-    ]
+    commands = [wrapper]
+    if executable is not None:
+        commands.extend(
+            [
+                [
+                    executable,
+                    str(input_path.resolve()),
+                    "--k",
+                    str(k),
+                    "--job_name",
+                    f"{job_name_base}_legacy1",
+                    "--optimizing_engine",
+                    model,
+                    "--isomer_engine",
+                    "rdkit",
+                    "--tauto_engine",
+                    "rdkit",
+                ],
+                [
+                    executable,
+                    str(input_path.resolve()),
+                    "--k",
+                    str(k),
+                    "--job_name",
+                    f"{job_name_base}_legacy2",
+                    "--enumerate_tautomer",
+                    "True" if internal_tautomer_stereo_enum else "False",
+                    "--enumerate_isomer",
+                    "True" if internal_tautomer_stereo_enum else "False",
+                    "--optimizing_engine",
+                    model,
+                    "--isomer_engine",
+                    "rdkit",
+                    "--tauto_engine",
+                    "rdkit",
+                ],
+            ]
+        )
     for command in commands[1:]:
         if mpi_np is not None:
             command.extend(["--mpi_np", str(mpi_np)])
         if cpu_workers is not None and cpu_workers > 1:
-            command.extend(["--gpu_idx", _cpu_worker_indices(cpu_workers)])
+            command.extend(["--gpu_idx", "0"])
         if memory_gb is not None:
             command.extend(["--memory", str(memory_gb)])
         if capacity is not None:

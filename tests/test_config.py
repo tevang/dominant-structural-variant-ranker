@@ -139,9 +139,14 @@ def test_auto3d_entropy_protocol_config_loads() -> None:
     assert config.seeding.auto3d_memory_gb == 1
     assert config.seeding.auto3d_capacity == 1
     assert config.seeding.auto3d_model == "AIMNET"
-    assert config.seeding.auto3d_max_confs == 10
+    assert config.seeding.auto3d_k == 1
+    assert config.seeding.auto3d_max_confs == 1
+    assert config.seeding.auto3d_patience == 40
+    assert config.seeding.auto3d_threshold == 0.5
+    assert config.seeding.auto3d_opt_steps == 400
     assert config.crest.enabled is False
     assert config.thermo.enabled is False
+    assert config.thermo.population_scope == "all_approximate"
 
 
 def test_rejects_partial_ph_window() -> None:

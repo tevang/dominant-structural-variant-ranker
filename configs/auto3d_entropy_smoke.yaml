@@ -1,9 +1,9 @@
-description: Fast smoke test configuration for the Auto3D entropy protocol.
+description: Fast smoke test configuration for the Auto3D representative protocol.
 protocol: auto3d_entropy
-run_name: auto3d-entropy-smoke
+run_name: auto3d-representative-smoke
 input_path: examples/test_molecules_minimal.smi
 input_format: auto
-output_dir: runs/auto3d-entropy-smoke
+output_dir: runs/auto3d-representative-smoke
 max_workers: 1
 dry_run: false
 overwrite: true
@@ -45,11 +45,11 @@ seeding:
   auto3d_cpu_workers: 2
   auto3d_memory_gb: 1
   auto3d_capacity: 1
-  auto3d_max_confs: 2
-  auto3d_patience: 50
+  auto3d_max_confs: 1
+  auto3d_patience: 20
   auto3d_threshold: 0.5
-  auto3d_opt_steps: 300
-  auto3d_use_gpu: false
+  auto3d_opt_steps: 200
+  auto3d_use_gpu: true
 
 crest:
   enabled: false
@@ -61,6 +61,7 @@ thermo:
   enabled: false
   xtb_hessian: false
   xtb_thermo: false
+  population_scope: all_approximate
 
 qm:
   enabled: false

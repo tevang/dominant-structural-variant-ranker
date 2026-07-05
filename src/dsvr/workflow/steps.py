@@ -79,7 +79,7 @@ def planned_steps(config: RunConfig) -> list[WorkflowStep]:
         WorkflowStep(
             "seeding",
             (
-                "Run Auto3D conformer generation, geometry optimization, and ensemble reduction."
+                "Run Auto3D representative conformer generation."
                 if config.protocol == "auto3d_entropy"
                 else f"Generate 3D seeds with {config.seeding.method}."
             ),
@@ -101,14 +101,14 @@ def planned_steps(config: RunConfig) -> list[WorkflowStep]:
         WorkflowStep(
             "xtb_thermo",
             (
-                "Auto3D entropy Delta G ranking input."
+                "Skipped by Auto3D representative protocol."
                 if config.protocol == "auto3d_entropy"
                 else "Run xTB Hessian/thermo and collect free-energy estimates."
             ),
             root / "xtb",
             [] if config.protocol == "auto3d_entropy" else ["xtb"],
         ),
-        WorkflowStep("ranking", "Compute ΔG and approximate populations.", root / "ranking"),
+        WorkflowStep("ranking", "Rank variants and approximate populations.", root / "ranking"),
         WorkflowStep(
             "censo",
             "Optionally refine top candidates with CENSO.",

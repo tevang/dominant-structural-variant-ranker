@@ -43,6 +43,7 @@ seeding:
   auto3d_k: 3
   auto3d_model: AIMNet2
   auto3d_internal_tautomer_stereo_enum: true
+  auto3d_use_gpu: true
 
 crest:
   enabled: true

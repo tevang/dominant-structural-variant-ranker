@@ -3,13 +3,13 @@ tauto_engine: rdkit
 enumerate_isomer: true
 isomer_engine: rdkit
 optimizing_engine: AIMNET
-max_confs: 10
+max_confs: 1
 memory: 1
 capacity: 1
-patience: 200
-opt_steps: 2000
-threshold: 0.3
-k: 3
+patience: 40
+opt_steps: 400
+threshold: 0.5
+k: 1
 mpi_np: 28
-gpu_idx: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27]
-use_gpu: false
+gpu_idx: [0]
+use_gpu: true

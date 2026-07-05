@@ -13,7 +13,7 @@ from rdkit.Chem import rdMolDescriptors
 from dsvr.chemistry.conformers_auto3d import (
     generate_auto3d_seeds,
     generate_auto3d_seeds_from_protomers,
-    reduce_auto3d_entropy_ensemble,
+    score_auto3d_representative_variants,
 )
 from dsvr.chemistry.conformers_rdkit import generate_rdkit_seeds, read_stereo_sdf
 from dsvr.chemistry.protonation import generate_protomer_candidates
@@ -532,8 +532,8 @@ def _progress_stage_names(config: RunConfig) -> list[str]:
             "Input validation",
             "Standardization",
             "Protomer generation",
-            "Auto3D protocol",
-            "Auto3D entropy reduction",
+            "Auto3D representative generation",
+            "Representative plausibility scoring",
             "Ranking",
             "Final reporting",
         ]
@@ -583,18 +583,21 @@ def _run_auto3d_entropy_protocol(
             )
         )
 
-    progress.record("Auto3D protocol", "started", generated_count=len(protomers))
+    progress.record("Auto3D representative generation", "started", generated_count=len(protomers))
     seed_hash = records_hash(protomers)
     if should_skip_step(steps["seeding"], seed_hash, config):
         states.append(skipped_state(steps["seeding"], seed_hash, config))
         seeds = _load_seeds(outdir)
-        progress.record("Auto3D protocol", "skipped", generated_count=len(seeds))
+        progress.record("Auto3D representative generation", "skipped", generated_count=len(seeds))
     else:
         progress.record(
-            "Auto3D protocol",
+            "Auto3D representative generation",
             "running",
             generated_count=len(protomers),
-            message="Running Auto3D tautomer, stereo, conformer, and optimization steps.",
+            message=(
+                "Running Auto3D tautomer/stereo enumeration with "
+                "representative conformer generation."
+            ),
         )
         seeds = generate_auto3d_seeds_from_protomers(protomers, config)
         states.append(
@@ -610,7 +613,7 @@ def _run_auto3d_entropy_protocol(
             )
         )
     records.extend(seeds)
-    progress.record("Auto3D protocol", "completed", generated_count=len(seeds))
+    progress.record("Auto3D representative generation", "completed", generated_count=len(seeds))
 
     empty_stereo_reduction = StereoReductionResult(
         selected_seeds=[],
@@ -634,24 +637,24 @@ def _run_auto3d_entropy_protocol(
             )
         )
 
-    progress.record("Auto3D entropy reduction", "started", generated_count=len(seeds))
-    thermo_records = reduce_auto3d_entropy_ensemble(seeds, config)
-    records.extend(thermo_records)
+    progress.record("Representative plausibility scoring", "started", generated_count=len(seeds))
+    score_records = score_auto3d_representative_variants(seeds, config)
+    records.extend(score_records)
     progress.record(
-        "Auto3D entropy reduction",
+        "Representative plausibility scoring",
         "completed",
-        generated_count=len(thermo_records),
+        generated_count=len(score_records),
     )
 
-    progress.record("Ranking", "started", generated_count=len(thermo_records))
-    ranked = compute_delta_g_and_populations(thermo_records, config)
+    progress.record("Ranking", "started", generated_count=len(score_records))
+    ranked = compute_delta_g_and_populations(score_records, config)
     write_ranked_outputs(ranked, outdir / "ranking")
     states.append(
         mark_done(
             steps["ranking"],
-            records_hash(thermo_records),
+            records_hash(score_records),
             config,
-            details={"count": len(ranked), "source": "auto3d_entropy"},
+            details={"count": len(ranked), "source": "auto3d_representative_svp_score"},
         )
     )
     records.extend(ranked)

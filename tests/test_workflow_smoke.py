@@ -112,7 +112,7 @@ def test_workflow_auto3d_entropy_protocol_with_mocked_auto3d(
 
     assert result.molecule_count == 1
     assert (outdir / "seeding" / "auto3d_protocol" / "auto3d_protocol_seeds.sdf").exists()
-    assert (outdir / "auto3d_entropy" / "auto3d_entropy_records.csv").exists()
+    assert (outdir / "auto3d_representatives" / "auto3d_representative_scores.csv").exists()
     assert (outdir / "ranking" / "ranked_variants.csv").exists()
     manifest = (outdir / "manifest.json").read_text(encoding="utf-8")
     assert '"protocol": "auto3d_entropy"' in manifest

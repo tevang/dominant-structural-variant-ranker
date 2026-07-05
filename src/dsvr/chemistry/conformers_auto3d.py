@@ -2,12 +2,14 @@ from __future__ import annotations
 
 import csv
 import math
+from dataclasses import asdict
 from pathlib import Path
 
 from rdkit import Chem
 from rdkit.Chem import rdMolDescriptors
 
 from dsvr.config import RunConfig
+from dsvr.filtering.variant_score import score_variant
 from dsvr.models import (
     ProtomerRecord,
     SeedConformerRecord,
@@ -174,6 +176,108 @@ def reduce_auto3d_entropy_ensemble(
         )
     _write_auto3d_entropy_outputs(output_dir, thermo_records)
     return thermo_records
+
+
+def score_auto3d_representative_variants(
+    records: list[SeedConformerRecord],
+    config: RunConfig,
+) -> list[ThermoRecord]:
+    output_dir = config.output_dir / "auto3d_representatives"
+    output_dir.mkdir(parents=True, exist_ok=True)
+    grouped: dict[tuple[str, str, str, int | None, int | None], list[SeedConformerRecord]] = {}
+    for record in records:
+        grouped.setdefault(_auto3d_variant_key(record), []).append(record)
+
+    representatives = [
+        sorted(
+            ensemble,
+            key=lambda item: (
+                float("inf") if item.energy_kcal_mol is None else item.energy_kcal_mol,
+                item.id,
+            ),
+        )[0]
+        for ensemble in grouped.values()
+        if ensemble
+    ]
+    best_energy_by_population_group: dict[tuple[object, ...], float] = {}
+    for representative in representatives:
+        if representative.energy_kcal_mol is None:
+            continue
+        key = _plausibility_population_group_key(representative, config)
+        best_energy_by_population_group[key] = min(
+            best_energy_by_population_group.get(key, float("inf")),
+            representative.energy_kcal_mol,
+        )
+
+    scored_records = []
+    for index, representative in enumerate(representatives, start=1):
+        ensemble = grouped[_auto3d_variant_key(representative)]
+        best_energy = best_energy_by_population_group.get(
+            _plausibility_population_group_key(representative, config)
+        )
+        breakdown = score_variant(
+            representative,
+            {
+                "ph": config.chemistry.ph,
+                "best_energy": best_energy,
+                "achiral_environment": not config.stereo_filtering.solvent_is_chiral,
+            },
+        )
+        breakdown_dict = asdict(breakdown)
+        metadata = {
+            "auto3d_representative": {
+                "protocol": "molscrub_auto3d_representative",
+                "source_record_ids": [item.id for item in ensemble],
+                "representative_record_id": representative.id,
+                "candidate_conformer_count": len(ensemble),
+                "representative_rule": "lowest_auto3d_energy_then_stable_id",
+                "auto3d_energy_kcal_mol": representative.energy_kcal_mol,
+                "score_field": "free_energy_kcal_mol stores SVPScore plausibility penalty",
+            },
+            "svp_score": breakdown_dict,
+        }
+        warnings = sorted(
+            set(
+                [
+                    *representative.warnings,
+                    *breakdown.warnings,
+                    "Auto3D representative protocol ranks variants by SVPScore plausibility; "
+                    "this is not conformer entropy, RRHO thermochemistry, or QM rescoring.",
+                    "The score is stored in free_energy_kcal_mol only to reuse the existing "
+                    "ranking/population output schema.",
+                ]
+            )
+        )
+        scored_records.append(
+            ThermoRecord(
+                id=f"{representative.input_molecule_id}_auto3d_repr_{index:04d}",
+                parent_id=representative.id,
+                input_molecule_id=representative.input_molecule_id,
+                molname=representative.molname,
+                canonical_smiles=representative.canonical_smiles,
+                isomeric_smiles=representative.isomeric_smiles,
+                molecular_formula=representative.molecular_formula,
+                formal_charge=representative.formal_charge,
+                explicit_proton_count=representative.explicit_proton_count,
+                source_software="dsvr-svpscore",
+                source_command=representative.source_command,
+                source_python_function=(
+                    "dsvr.chemistry.conformers_auto3d."
+                    "score_auto3d_representative_variants"
+                ),
+                output_paths=[
+                    output_dir / "auto3d_representative_scores.csv",
+                    output_dir / "auto3d_representative_scores.jsonl",
+                ],
+                warnings=warnings,
+                metadata=metadata,
+                temperature_kelvin=config.chemistry.temperature_kelvin,
+                free_energy_kcal_mol=breakdown.total,
+                entropy_cal_mol_k=None,
+            )
+        )
+    _write_auto3d_representative_outputs(output_dir, scored_records)
+    return scored_records
 
 
 def _write_auto3d_input(path: Path, stereo_records: list[StereoRecord]) -> None:
@@ -498,6 +602,86 @@ def _ensemble_free_energy_and_entropy(
     )
     entropy_cal_mol_k = (mean_energy - free_energy) * 1000.0 / temperature
     return free_energy, entropy_cal_mol_k
+
+
+def _auto3d_variant_key(
+    record: SeedConformerRecord,
+) -> tuple[str, str, str, int | None, int | None]:
+    return (
+        record.input_molecule_id,
+        record.isomeric_smiles or record.canonical_smiles or record.id,
+        record.molecular_formula or "",
+        record.formal_charge,
+        record.explicit_proton_count,
+    )
+
+
+def _plausibility_population_group_key(
+    record: SeedConformerRecord,
+    config: RunConfig,
+) -> tuple[object, ...]:
+    if config.thermo.population_scope == "same_formula":
+        return (
+            "same_formula",
+            record.molecular_formula,
+            record.explicit_proton_count,
+        )
+    if config.thermo.population_scope == "same_charge":
+        return ("same_charge", record.formal_charge)
+    return ("all_approximate", "all")
+
+
+def _write_auto3d_representative_outputs(
+    output_dir: Path,
+    records: list[ThermoRecord],
+) -> None:
+    csv_path = output_dir / "auto3d_representative_scores.csv"
+    jsonl_path = output_dir / "auto3d_representative_scores.jsonl"
+    columns = [
+        "id",
+        "parent_id",
+        "input_molecule_id",
+        "molname",
+        "canonical_smiles",
+        "isomeric_smiles",
+        "molecular_formula",
+        "formal_charge",
+        "explicit_proton_count",
+        "temperature_kelvin",
+        "plausibility_score_kcal_mol",
+        "auto3d_energy_kcal_mol",
+        "candidate_conformer_count",
+        "score_reasons",
+        "warnings",
+    ]
+    with csv_path.open("w", encoding="utf-8", newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=columns)
+        writer.writeheader()
+        for record in records:
+            representative = record.metadata.get("auto3d_representative", {})
+            svp_score = record.metadata.get("svp_score", {})
+            writer.writerow(
+                {
+                    "id": record.id,
+                    "parent_id": record.parent_id,
+                    "input_molecule_id": record.input_molecule_id,
+                    "molname": record.molname,
+                    "canonical_smiles": record.canonical_smiles,
+                    "isomeric_smiles": record.isomeric_smiles,
+                    "molecular_formula": record.molecular_formula,
+                    "formal_charge": record.formal_charge,
+                    "explicit_proton_count": record.explicit_proton_count,
+                    "temperature_kelvin": record.temperature_kelvin,
+                    "plausibility_score_kcal_mol": record.free_energy_kcal_mol,
+                    "auto3d_energy_kcal_mol": representative.get("auto3d_energy_kcal_mol"),
+                    "candidate_conformer_count": representative.get("candidate_conformer_count"),
+                    "score_reasons": " | ".join(svp_score.get("reasons", [])),
+                    "warnings": " | ".join(record.warnings),
+                }
+            )
+    with jsonl_path.open("w", encoding="utf-8") as handle:
+        for record in records:
+            handle.write(record.model_dump_json() + "\n")
 
 
 def _write_auto3d_entropy_outputs(output_dir: Path, records: list[ThermoRecord]) -> None:

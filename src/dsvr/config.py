@@ -128,7 +128,7 @@ class SeedingConfig(StrictModel):
     auto3d_patience: int | None = None
     auto3d_threshold: float | None = None
     auto3d_opt_steps: int | None = None
-    auto3d_use_gpu: bool = False
+    auto3d_use_gpu: bool = True
 
     @field_validator("rdkit_num_conformers", "auto3d_k", "auto3d_mpi_np")
     @classmethod

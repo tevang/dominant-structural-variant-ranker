@@ -24,18 +24,23 @@ molscrub protonation/protomer generation at target pH
 -> optional Psi4/PySCF final rescoring
 ```
 
-## Auto3D Entropy Protocol
+## Auto3D Representative Protocol
 
-The repository also includes an Auto3D-owned enumeration and ranking protocol:
+The repository also includes a practical Auto3D-owned enumeration protocol. It is
+intended for large compounds where exhaustive conformer searches are not a useful
+default:
 
 ```text
 molscrub protonation/protomer generation at target pH
 -> Auto3D tautomer enumeration
 -> Auto3D stereoisomer enumeration
--> Auto3D conformer generation
--> Auto3D geometry optimization ensemble reduction
--> Auto3D configurational entropy Delta G ranking
+-> Auto3D representative conformer generation
+-> DSVR SVPScore plausibility ranking of representative variants
 ```
+
+CREST/xTB ensemble reduction, configurational entropy ranking, CENSO, and
+Psi4/PySCF rescoring are intentionally not part of this default protocol. Run
+those as explicit follow-up protocols when the candidate set is small enough.
 
 Run it with:
 
@@ -55,7 +60,7 @@ dsvr run examples/test_molecules_minimal.smi \
 
 The corresponding Auto3D-native parameter template is
 `configs/auto3d_entropy.auto3d.yaml`. DSVR writes lineage and ranking outputs
-under `seeding/auto3d_protocol`, `auto3d_entropy`, and `ranking`.
+under `seeding/auto3d_protocol`, `auto3d_representatives`, and `ranking`.
 
 Default implementation notes:
 
@@ -138,6 +143,22 @@ make ci-log RUN=https://github.com/tevang/dominant-structural-variant-ranker/act
   modules.
 - Use `dsvr doctor` to verify the environment before running physics-heavy
   workflows.
+
+### xTB / CREST
+
+This repo installs the official xTB and CREST binaries into the shared `dsvr`
+conda prefix and adds a conda activation hook so they are available after
+`conda activate dsvr`. You should not need to export `PATH` manually.
+
+If you ever recreate the environment, verify that these files still exist:
+
+```bash
+/mnt/ssd_6.986tb/conda_envs/dsvr/etc/conda/activate.d/xtb_crest_activate.sh
+/mnt/ssd_6.986tb/conda_envs/dsvr/etc/conda/deactivate.d/xtb_crest_deactivate.sh
+```
+
+After activation, `xtb`, `crest`, `XTBHOME`, and `CRESTHOME` should be set
+automatically. `dsvr doctor` should report both executables as available.
 
 Optional Python tools:
 
