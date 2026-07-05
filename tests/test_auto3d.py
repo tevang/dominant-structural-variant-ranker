@@ -1,6 +1,7 @@
 import csv
 from pathlib import Path
 
+import pytest
 from rdkit import Chem
 from typer.testing import CliRunner
 
@@ -22,7 +23,7 @@ from dsvr.models import (
     make_stereo_id,
     make_tautomer_id,
 )
-from dsvr.runners.auto3d_runner import Auto3DUnavailableError
+from dsvr.runners.auto3d_runner import Auto3DExecutionError, Auto3DUnavailableError
 
 
 def test_generate_auto3d_seeds_from_mock_output_preserves_parent(
@@ -333,6 +334,13 @@ def test_generate_auto3d_protocol_seeds_from_protomers_falls_back_for_missing_ou
         input_path=tmp_path / "protomers.sdf",
         output_dir=tmp_path / "run",
     )
+    config = config.model_copy(
+        update={
+            "seeding": config.seeding.model_copy(
+                update={"auto3d_allow_rdkit_fallback": True}
+            )
+        }
+    )
 
     def fake_run_auto3d(
         input_path: Path,
@@ -362,6 +370,100 @@ def test_generate_auto3d_protocol_seeds_from_protomers_falls_back_for_missing_ou
         "falling back to a single RDKit ETKDG seed" in warning
         for warning in by_parent[protomer_b.id].warnings
     )
+
+
+def test_generate_auto3d_protocol_seeds_fails_when_batch_crashes_in_strict_mode(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    protomer = _protomer("ethylamine", "CCN")
+    config = RunConfig(
+        protocol="auto3d_entropy",
+        input_path=tmp_path / "protomers.sdf",
+        output_dir=tmp_path / "run",
+    )
+
+    def crashing_run_auto3d(
+        input_path: Path,
+        output_dir: Path,
+        **kwargs,
+    ) -> tuple[Path, list[str]]:
+        del input_path, kwargs
+        log_dir = output_dir / "logs" / "20260705T000000Z_auto3d"
+        log_dir.mkdir(parents=True)
+        (log_dir / "combined.log").write_text(
+            "Optimization finished: Dropped(Oscillating): 1\n"
+            "OSError: File error: Invalid input file output_out.sdf\n",
+            encoding="utf-8",
+        )
+        raise Auto3DExecutionError("Auto3D failed. Tried commands: mock")
+
+    monkeypatch.setattr(conformers_auto3d, "run_auto3d", crashing_run_auto3d)
+
+    with pytest.raises(Auto3DExecutionError) as excinfo:
+        generate_auto3d_seeds_from_protomers([protomer], config)
+
+    message = str(excinfo.value)
+    assert "auto3d_allow_rdkit_fallback is false" in message
+    assert "dropped all candidate structures as oscillating" in message
+
+
+def test_generate_auto3d_protocol_seeds_falls_back_when_batch_crashes(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    protomer = _protomer("ethylamine", "CCN")
+    config = RunConfig(
+        protocol="auto3d_entropy",
+        input_path=tmp_path / "protomers.sdf",
+        output_dir=tmp_path / "run",
+    )
+    config = config.model_copy(
+        update={
+            "seeding": config.seeding.model_copy(
+                update={"auto3d_allow_rdkit_fallback": True}
+            )
+        }
+    )
+
+    def crashing_run_auto3d(
+        input_path: Path,
+        output_dir: Path,
+        **kwargs,
+    ) -> tuple[Path, list[str]]:
+        del input_path, kwargs
+        log_dir = output_dir / "logs" / "20260705T000000Z_auto3d"
+        log_dir.mkdir(parents=True)
+        (log_dir / "combined.log").write_text(
+            "Optimization finished: Dropped(Oscillating): 1\n"
+            "OSError: File error: Invalid input file output_out.sdf\n",
+            encoding="utf-8",
+        )
+        raise Auto3DExecutionError("Auto3D failed. Tried commands: mock")
+
+    monkeypatch.setattr(conformers_auto3d, "run_auto3d", crashing_run_auto3d)
+
+    records = generate_auto3d_seeds_from_protomers([protomer], config)
+
+    assert len(records) == 1
+    record = records[0]
+    assert record.parent_id == protomer.id
+    assert record.source_software == "rdkit"
+    assert record.energy_kcal_mol is None
+    assert record.metadata["auto3d_fallback"]["reason"] == (
+        "Auto3D dropped all candidate structures as oscillating during optimization"
+    )
+    assert (
+        tmp_path
+        / "run"
+        / "seeding"
+        / "auto3d_protocol"
+        / "batch_001"
+        / "auto3d_batch_failure.txt"
+    ).exists()
+    assert (
+        tmp_path / "run" / "seeding" / "auto3d_protocol" / "auto3d_protocol_seeds.sdf"
+    ).exists()
 
 
 

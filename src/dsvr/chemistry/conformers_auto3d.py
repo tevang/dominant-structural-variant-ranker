@@ -127,31 +127,43 @@ def generate_auto3d_seeds_from_protomers(
         batch_input_smi = batch_dir / f"auto3d_protomer_input_batch_{batch.index:03d}.smi"
         _write_auto3d_protomer_input(batch_input_smi, batch.records)
         settings = batch.settings
-        output_sdf, command = run_auto3d(
-            batch_input_smi,
-            batch_dir,
-            k=config.seeding.auto3d_k,
-            model=config.seeding.auto3d_model,
-            internal_tautomer_stereo_enum=settings.internal_tautomer_stereo_enum,
-            mpi_np=settings.mpi_np,
-            cpu_workers=settings.cpu_workers,
-            memory_gb=settings.memory_gb,
-            capacity=settings.capacity,
-            max_confs=settings.max_confs,
-            patience=settings.patience,
-            threshold=settings.threshold,
-            opt_steps=settings.opt_steps,
-            use_gpu=settings.use_gpu,
-            stream_output=config.logging.tail_subprocess_logs,
-        )
-        batch_records = _records_from_auto3d_protomer_output(
-            output_sdf,
-            batch.records,
-            config=config,
-            command=command,
-            output_dir=output_dir,
-            settings=settings,
-        )
+        try:
+            output_sdf, command = run_auto3d(
+                batch_input_smi,
+                batch_dir,
+                k=config.seeding.auto3d_k,
+                model=config.seeding.auto3d_model,
+                internal_tautomer_stereo_enum=settings.internal_tautomer_stereo_enum,
+                mpi_np=settings.mpi_np,
+                cpu_workers=settings.cpu_workers,
+                memory_gb=settings.memory_gb,
+                capacity=settings.capacity,
+                max_confs=settings.max_confs,
+                patience=settings.patience,
+                threshold=settings.threshold,
+                opt_steps=settings.opt_steps,
+                use_gpu=settings.use_gpu,
+                stream_output=config.logging.tail_subprocess_logs,
+            )
+            batch_records = _records_from_auto3d_protomer_output(
+                output_sdf,
+                batch.records,
+                config=config,
+                command=command,
+                output_dir=output_dir,
+                settings=settings,
+            )
+        except Auto3DExecutionError as exc:
+            output_sdf = batch_dir / "auto3d_output.sdf"
+            command = ["auto3d", "failed", str(batch_input_smi)]
+            batch_records = []
+            failure_note = str(exc).splitlines()[0] if str(exc) else "Auto3D failed"
+            _write_auto3d_batch_failure(
+                batch_dir / "auto3d_batch_failure.txt",
+                batch=batch,
+                reason=failure_note,
+                fallback_allowed=config.seeding.auto3d_allow_rdkit_fallback,
+            )
         batch_records = _fill_missing_auto3d_protomer_outputs_with_rdkit(
             batch.records,
             batch_records,
@@ -508,6 +520,29 @@ def _large_auto3d_protocol_settings(
     )
 
 
+def _write_auto3d_batch_failure(
+    path: Path,
+    *,
+    batch: _Auto3DProtomerBatch,
+    reason: str,
+    fallback_allowed: bool,
+) -> None:
+    policy = (
+        "RDKit fallback is enabled for missing protomers."
+        if fallback_allowed
+        else "RDKit fallback is disabled; this Auto3D failure is fatal for the run."
+    )
+    path.write_text(
+        "Auto3D batch failed.\n"
+        f"fallback_policy={policy}\n"
+        f"batch_index={batch.index}\n"
+        f"large_molecule={batch.large_molecule}\n"
+        f"protomer_ids={','.join(record.id for record in batch.records)}\n"
+        f"reason={reason}\n",
+        encoding="utf-8",
+    )
+
+
 def _write_auto3d_adaptive_plan(path: Path, batches: list[_Auto3DProtomerBatch]) -> None:
     fieldnames = [
         "batch_index",
@@ -782,6 +817,15 @@ def _fill_missing_auto3d_protomer_outputs_with_rdkit(
     fallback_records: list[SeedConformerRecord] = []
     fallback_failures: list[str] = []
     fallback_reason = _auto3d_partial_failure_reason(output_sdf, output_dir)
+    if not config.seeding.auto3d_allow_rdkit_fallback:
+        missing_display = ", ".join(missing_ids)
+        raise Auto3DExecutionError(
+            "Auto3D failed to produce optimized seeds for "
+            f"{len(missing_ids)}/{len(protomer_records)} protomers: {missing_display}. "
+            f"Reason: {fallback_reason}. "
+            "This is fatal because seeding.auto3d_allow_rdkit_fallback is false. "
+            f"Inspect Auto3D artifacts under {output_dir}."
+        )
     for protomer_id in missing_ids:
         protomer = protomer_by_id[protomer_id]
         fallback = _rdkit_fallback_seed_for_missing_protomer(
@@ -899,15 +943,29 @@ def _auto3d_partial_failure_reason(output_sdf: Path, output_dir: Path) -> str:
         candidate_logs.extend(sorted(log_root.glob("*_auto3d/stdout.log"), reverse=True))
         candidate_logs.extend(sorted(log_root.glob("*_auto3d/combined.log"), reverse=True))
     for log_path in candidate_logs:
-        if not log_path.exists():
-            continue
-        try:
-            text = log_path.read_text(encoding="utf-8")
-        except OSError:
+        text = _read_log_tail(log_path)
+        if not text:
             continue
         if "Dropped(Oscillating)" in text:
             return "Auto3D dropped all candidate structures as oscillating during optimization"
+        if "Invalid input file" in text and "_out.sdf" in text:
+            return "Auto3D crashed after producing an empty optimized SDF"
+        if "Reaching maximum optimization step" in text:
+            return "Auto3D reached the maximum optimization step without a usable output SDF"
     return "Auto3D did not emit an optimized structure for this protomer"
+
+
+def _read_log_tail(path: Path, *, max_bytes: int = 65536) -> str:
+    if not path.exists():
+        return ""
+    try:
+        with path.open("rb") as handle:
+            handle.seek(0, os.SEEK_END)
+            size = handle.tell()
+            handle.seek(max(0, size - max_bytes))
+            return handle.read().decode("utf-8", errors="replace")
+    except OSError:
+        return ""
 
 
 def _write_auto3d_seed_sdf(path: Path, records: list[SeedConformerRecord]) -> None:

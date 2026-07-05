@@ -459,6 +459,7 @@ def run_workflow(config: RunConfig) -> WorkflowResult:
         stereo_reduction,
     )
     write_final_ranked_outputs(outdir, ranked, config)
+    _publish_top_level_run_outputs(outdir)
     write_summary_markdown(
         outdir / "summary.md",
         molecule_count=len(molecules),
@@ -514,6 +515,7 @@ def run_workflow(config: RunConfig) -> WorkflowResult:
     ]
     write_ranked_csv(outdir / "ranked.csv", legacy_records)
     write_json(outdir / "provenance.json", build_provenance(config.input_path, config, molecules))
+    _publish_top_level_run_outputs(outdir)
     progress.record("Final reporting", "completed", generated_count=len(ranked))
     return WorkflowResult(
         outdir=outdir,
@@ -681,6 +683,15 @@ def _run_auto3d_entropy_protocol(
     write_all_provenance_outputs(records, outdir)
     write_audit_tables(outdir, records, [], [], empty_stereo_reduction)
     write_final_ranked_outputs(outdir, ranked, config)
+    _write_auto3d_protocol_structure_summary(
+        outdir,
+        molecules=molecules,
+        protomers=protomers,
+        seeds=seeds,
+        score_records=score_records,
+        ranked=ranked,
+    )
+    _publish_top_level_run_outputs(outdir)
     write_summary_markdown(
         outdir / "summary.md",
         molecule_count=len(molecules),
@@ -734,12 +745,255 @@ def _run_auto3d_entropy_protocol(
     ]
     write_ranked_csv(outdir / "ranked.csv", legacy_records)
     write_json(outdir / "provenance.json", build_provenance(config.input_path, config, molecules))
+    _publish_top_level_run_outputs(outdir)
     progress.record("Final reporting", "completed", generated_count=len(ranked))
     return WorkflowResult(
         outdir=outdir,
         molecule_count=len(molecules),
         ranked_records=legacy_records,
     )
+
+
+def _write_auto3d_protocol_structure_summary(
+    outdir: Path,
+    *,
+    molecules: list[MoleculeInput],
+    protomers: list[ProtomerRecord],
+    seeds: list[SeedConformerRecord],
+    score_records: list[ThermoRecord],
+    ranked: list[RankedVariantRecord],
+) -> None:
+    seed_by_protomer: dict[str, list[SeedConformerRecord]] = {}
+    fallback_seeds = []
+    for seed in seeds:
+        if seed.parent_id:
+            seed_by_protomer.setdefault(seed.parent_id, []).append(seed)
+        if "auto3d_fallback" in seed.metadata:
+            fallback_seeds.append(seed)
+
+    missing_protomers = [protomer for protomer in protomers if protomer.id not in seed_by_protomer]
+    molecule_ids_with_seeds = {seed.input_molecule_id for seed in seeds}
+    molecules_without_structures = [
+        molecule for molecule in molecules if molecule.input_id not in molecule_ids_with_seeds
+    ]
+    failure_rows = _auto3d_structure_failure_rows(fallback_seeds, missing_protomers)
+
+    summary_rows = [
+        {
+            "stage": "Input validation",
+            "generated_structures": len(molecules),
+            "input_molecules": len(molecules),
+            "molecules_with_structures": len(molecules),
+            "failed_molecules": 0,
+            "fallback_structures": 0,
+            "output_sdf": "",
+            "output_csv": "input/inputs.csv",
+            "notes": "validated input records",
+        },
+        {
+            "stage": "Protomer generation",
+            "generated_structures": len(protomers),
+            "input_molecules": len(molecules),
+            "molecules_with_structures": len({item.input_molecule_id for item in protomers}),
+            "failed_molecules": len(molecules)
+            - len({item.input_molecule_id for item in protomers}),
+            "fallback_structures": 0,
+            "output_sdf": "enumeration/protomers/*_protomers.sdf",
+            "output_csv": "enumeration/protomers/*_protomers.csv",
+            "notes": (
+                "molscrub protomer candidates, or original molecule fallback "
+                "if molscrub unavailable"
+            ),
+        },
+        {
+            "stage": "Auto3D representative generation",
+            "generated_structures": len(seeds),
+            "input_molecules": len(molecules),
+            "molecules_with_structures": len(molecule_ids_with_seeds),
+            "failed_molecules": len(molecules_without_structures),
+            "fallback_structures": len(fallback_seeds),
+            "output_sdf": "auto3d_protocol_seeds.sdf",
+            "output_csv": "auto3d_protocol_seeds.csv",
+            "notes": (
+                f"{len(fallback_seeds)} protomer(s) used RDKit fallback after Auto3D failed; "
+                f"{len(missing_protomers)} protomer(s) have no generated structure"
+            ),
+        },
+        {
+            "stage": "Representative plausibility scoring",
+            "generated_structures": len(score_records),
+            "input_molecules": len(molecules),
+            "molecules_with_structures": len({item.input_molecule_id for item in score_records}),
+            "failed_molecules": len(molecules)
+            - len({item.input_molecule_id for item in score_records}),
+            "fallback_structures": 0,
+            "output_sdf": "",
+            "output_csv": "auto3d_representative_scores.csv",
+            "notes": "SVPScore-style representative scoring records",
+        },
+        {
+            "stage": "Ranking",
+            "generated_structures": len(ranked),
+            "input_molecules": len(molecules),
+            "molecules_with_structures": len({item.input_molecule_id for item in ranked}),
+            "failed_molecules": len(molecules) - len({item.input_molecule_id for item in ranked}),
+            "fallback_structures": 0,
+            "output_sdf": "ranked_variants.sdf",
+            "output_csv": "ranked_variants.csv",
+            "notes": "final ranked structural variants",
+        },
+    ]
+    _write_csv(outdir / "structure_generation_summary.csv", summary_rows)
+    _write_csv(outdir / "structure_failures.csv", failure_rows, empty_columns=[
+        "input_molecule_id",
+        "molname",
+        "protomer_id",
+        "stage",
+        "failure_kind",
+        "fallback_structure_generated",
+        "reason",
+    ])
+
+
+def _auto3d_structure_failure_rows(
+    fallback_seeds: list[SeedConformerRecord],
+    missing_protomers: list[ProtomerRecord],
+) -> list[dict[str, object]]:
+    rows: list[dict[str, object]] = []
+    for seed in fallback_seeds:
+        fallback = seed.metadata.get("auto3d_fallback", {})
+        rows.append(
+            {
+                "input_molecule_id": seed.input_molecule_id,
+                "molname": seed.molname,
+                "protomer_id": seed.parent_id,
+                "stage": "Auto3D representative generation",
+                "failure_kind": "auto3d_optimized_structure_failed",
+                "fallback_structure_generated": True,
+                "reason": fallback.get("reason") or "Auto3D produced no optimized representative",
+            }
+        )
+    for protomer in missing_protomers:
+        rows.append(
+            {
+                "input_molecule_id": protomer.input_molecule_id,
+                "molname": protomer.molname,
+                "protomer_id": protomer.id,
+                "stage": "Auto3D representative generation",
+                "failure_kind": "no_structure_generated",
+                "fallback_structure_generated": False,
+                "reason": "Neither Auto3D nor RDKit fallback produced a structure",
+            }
+        )
+    return rows
+
+
+def _publish_top_level_run_outputs(outdir: Path) -> None:
+    link_sources = [
+        outdir / "seeding" / "auto3d_protocol" / "auto3d_protocol_seeds.sdf",
+        outdir / "seeding" / "auto3d_protocol" / "auto3d_protocol_seeds.csv",
+        outdir / "seeding" / "auto3d_protocol" / "auto3d_adaptive_plan.csv",
+        outdir / "auto3d_representatives" / "auto3d_representative_scores.csv",
+        outdir / "ranking" / "ranking_summary.md",
+    ]
+    for source in link_sources:
+        _ensure_top_level_link(outdir, source)
+
+    inventory_targets = [
+        outdir / "stage_summary.csv",
+        outdir / "structure_generation_summary.csv",
+        outdir / "structure_failures.csv",
+        outdir / "ranked_variants.sdf",
+        outdir / "ranked_variants.csv",
+        outdir / "ranked_variants.json",
+        outdir / "auto3d_protocol_seeds.sdf",
+        outdir / "auto3d_protocol_seeds.csv",
+        outdir / "auto3d_adaptive_plan.csv",
+        outdir / "auto3d_representative_scores.csv",
+        outdir / "ranking_summary.md",
+        outdir / "summary.md",
+        outdir / "report.md",
+        outdir / "manifest.json",
+    ]
+    rows = []
+    for target in inventory_targets:
+        rows.append(
+            {
+                "artifact": target.name,
+                "path": str(target.relative_to(outdir)),
+                "kind": _artifact_kind(target),
+                "exists": target.exists(),
+                "size_bytes": target.stat().st_size if target.exists() else 0,
+                "record_count": _artifact_record_count(target),
+                "target": str(target.resolve().relative_to(outdir.resolve()))
+                if target.exists() and target.is_symlink()
+                else "",
+            }
+        )
+    _write_csv(outdir / "run_outputs.csv", rows)
+
+
+def _ensure_top_level_link(outdir: Path, source: Path) -> None:
+    if not source.exists() or source.parent == outdir:
+        return
+    destination = outdir / source.name
+    if destination.exists() or destination.is_symlink():
+        if destination.is_dir() and not destination.is_symlink():
+            return
+        destination.unlink()
+    try:
+        destination.symlink_to(source.relative_to(outdir))
+    except OSError:
+        shutil.copy2(source, destination)
+
+
+def _artifact_kind(path: Path) -> str:
+    suffix = path.suffix.lower()
+    if suffix == ".sdf":
+        return "structure_sdf"
+    if suffix == ".csv":
+        return "table_csv"
+    if suffix == ".json":
+        return "metadata_json"
+    if suffix == ".md":
+        return "report_markdown"
+    return "artifact"
+
+
+def _artifact_record_count(path: Path) -> int | str:
+    if not path.exists():
+        return 0
+    if path.suffix.lower() == ".csv":
+        try:
+            with path.open(encoding="utf-8") as handle:
+                return max(0, sum(1 for _ in handle) - 1)
+        except OSError:
+            return "unknown"
+    if path.suffix.lower() == ".sdf":
+        return _count_sdf_records(path)
+    return ""
+
+
+def _count_sdf_records(path: Path) -> int | str:
+    try:
+        supplier = Chem.SDMolSupplier(str(path), sanitize=False, removeHs=False)
+        return sum(1 for molecule in supplier if molecule is not None)
+    except (OSError, RuntimeError):
+        return "unknown"
+
+
+def _write_csv(
+    path: Path,
+    rows: list[dict[str, object]],
+    *,
+    empty_columns: list[str] | None = None,
+) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    columns = list(rows[0].keys()) if rows else empty_columns or []
+    with path.open("w", encoding="utf-8", newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=columns)
+        writer.writeheader()
+        writer.writerows(rows)
 
 
 def _run_step_list(
