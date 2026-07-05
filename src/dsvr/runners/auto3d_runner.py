@@ -2,8 +2,8 @@ from __future__ import annotations
 
 import importlib.util
 import shutil
-import uuid
 import sys
+import uuid
 from pathlib import Path
 
 from dsvr.runners.subprocess_utils import run_command
@@ -88,10 +88,13 @@ def run_auto3d(
             check=False,
         )
         if completed.returncode != 0:
+            failure_text = _completed_output_tail(completed)
             failures.append(
                 f"{' '.join(command)} exited {completed.returncode}: "
-                f"{completed.stdout.strip()}"
+                f"{failure_text}"
             )
+            if _is_terminal_auto3d_selection_failure(failure_text):
+                break
             continue
         if output_sdf.exists():
             return output_sdf, command
@@ -103,6 +106,27 @@ def run_auto3d(
         )
 
     raise Auto3DExecutionError("Auto3D failed. Tried commands:\n" + "\n".join(failures))
+
+
+def _completed_output_tail(
+    completed: object,
+    *,
+    max_chars: int = 4000,
+) -> str:
+    stdout = getattr(completed, "stdout", "") or ""
+    stderr = getattr(completed, "stderr", "") or ""
+    text = (str(stdout) + "\n" + str(stderr)).strip()
+    if len(text) <= max_chars:
+        return text
+    return text[-max_chars:]
+
+
+def _is_terminal_auto3d_selection_failure(text: str) -> bool:
+    """Return True when retrying a legacy Auto3D invocation is unlikely to help."""
+
+    if "Dropped(Oscillating)" in text and "Converged: 0" in text:
+        return True
+    return "reorder_sdf" in text and "Invalid input file" in text and "_out.sdf" in text
 
 
 def _find_executable() -> str | None:

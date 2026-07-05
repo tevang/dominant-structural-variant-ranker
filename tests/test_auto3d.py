@@ -205,7 +205,7 @@ def test_generate_auto3d_protocol_seeds_from_protomers(tmp_path: Path, monkeypat
         assert threshold == 0.3
         assert opt_steps == 2000
         assert use_gpu is True
-        assert stream_output is True
+        assert stream_output is False
         output_sdf = output_dir / "mock_auto3d_protocol.sdf"
         _write_auto3d_output(output_sdf, "CCO", protomer.id, energy="-1.0", prop="E_kcal_mol")
         return output_sdf, ["auto3d", "run", str(input_path), "--enumerate-tautomer"]

@@ -95,7 +95,7 @@ def generate_auto3d_seeds(
         threshold=config.seeding.auto3d_threshold,
         opt_steps=config.seeding.auto3d_opt_steps,
         use_gpu=config.seeding.auto3d_use_gpu,
-        stream_output=config.logging.tail_subprocess_logs,
+        stream_output=False,
     )
     records = _records_from_auto3d_output(
         output_sdf,
@@ -144,7 +144,7 @@ def generate_auto3d_seeds_from_protomers(
                 threshold=settings.threshold,
                 opt_steps=settings.opt_steps,
                 use_gpu=settings.use_gpu,
-                stream_output=config.logging.tail_subprocess_logs,
+                stream_output=False,
             )
             batch_records = _records_from_auto3d_protomer_output(
                 output_sdf,
