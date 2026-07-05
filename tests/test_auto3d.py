@@ -1,3 +1,4 @@
+import csv
 from pathlib import Path
 
 from rdkit import Chem
@@ -220,6 +221,148 @@ def test_generate_auto3d_protocol_seeds_from_protomers(tmp_path: Path, monkeypat
         "protomer_to_auto3d_internal_tautomer_stereo_enum"
     )
     assert (tmp_path / "run" / "seeding" / "auto3d_protocol" / "auto3d_protocol_seeds.sdf").exists()
+
+
+def test_generate_auto3d_protocol_adapts_large_protomer_settings(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    small = _protomer("ethanol", "CCO")
+    large = _protomer("flexible_large", "C" * 50)
+    config = RunConfig(
+        protocol="auto3d_entropy",
+        input_path=tmp_path / "protomers.sdf",
+        output_dir=tmp_path / "run",
+        seeding={
+            "method": "auto3d",
+            "auto3d_mpi_np": 28,
+            "auto3d_cpu_workers": 28,
+            "auto3d_memory_gb": 1,
+            "auto3d_capacity": 8,
+            "auto3d_max_confs": 8,
+            "auto3d_patience": 80,
+            "auto3d_opt_steps": 1000,
+            "auto3d_use_gpu": True,
+        },
+    )
+    calls = []
+
+    def fake_run_auto3d(
+        input_path: Path,
+        output_dir: Path,
+        *,
+        k: int,
+        model: str,
+        internal_tautomer_stereo_enum: bool,
+        mpi_np: int | None,
+        cpu_workers: int | None,
+        memory_gb: int | None,
+        capacity: int | None,
+        max_confs: int | None,
+        patience: int | None,
+        threshold: float | None,
+        opt_steps: int | None,
+        use_gpu: bool,
+        stream_output: bool,
+    ) -> tuple[Path, list[str]]:
+        del k, model, threshold, use_gpu, stream_output
+        ids_and_smiles = [line.split(maxsplit=1) for line in input_path.read_text().splitlines()]
+        calls.append(
+            {
+                "ids": [parts[1] for parts in ids_and_smiles],
+                "internal_enum": internal_tautomer_stereo_enum,
+                "mpi_np": mpi_np,
+                "cpu_workers": cpu_workers,
+                "memory_gb": memory_gb,
+                "capacity": capacity,
+                "max_confs": max_confs,
+                "patience": patience,
+                "opt_steps": opt_steps,
+            }
+        )
+        output_sdf = output_dir / "mock_auto3d_protocol.sdf"
+        writer = Chem.SDWriter(str(output_sdf))
+        for smiles, protomer_id in ids_and_smiles:
+            mol = Chem.AddHs(Chem.MolFromSmiles(smiles))
+            mol.SetProp("_Name", protomer_id)
+            mol.SetProp("E_kcal_mol", "-1.0")
+            writer.write(mol)
+        writer.close()
+        return output_sdf, ["auto3d", "run", str(input_path)]
+
+    monkeypatch.setattr(conformers_auto3d, "run_auto3d", fake_run_auto3d)
+
+    records = generate_auto3d_seeds_from_protomers([small, large], config)
+
+    assert len(records) == 2
+    small_call = next(call for call in calls if small.id in call["ids"])
+    large_call = next(call for call in calls if large.id in call["ids"])
+    assert small_call["internal_enum"] is True
+    assert large_call["internal_enum"] is False
+    assert large_call["max_confs"] == 1
+    assert large_call["capacity"] == 1
+    assert large_call["memory_gb"] == 2
+    assert large_call["patience"] == 30
+    assert large_call["opt_steps"] == 250
+    assert large_call["mpi_np"] < 28
+    assert large_call["cpu_workers"] < 28
+    by_parent = {record.parent_id: record for record in records}
+    assert by_parent[large.id].metadata["auto3d"]["internal_tautomer_stereo_enum"] is False
+    assert by_parent[large.id].metadata["auto3d"]["max_confs"] == 1
+    assert any(
+        "excessive conformer expansion" in warning
+        for warning in by_parent[large.id].warnings
+    )
+
+    plan_path = tmp_path / "run" / "seeding" / "auto3d_protocol" / "auto3d_adaptive_plan.csv"
+    plan_rows = list(csv.DictReader(plan_path.open()))
+    large_plan = next(row for row in plan_rows if row["protomer_id"] == large.id)
+    assert large_plan["large_molecule"] == "True"
+    assert large_plan["internal_tautomer_stereo_enum"] == "False"
+    assert large_plan["max_confs"] == "1"
+
+
+def test_generate_auto3d_protocol_seeds_from_protomers_falls_back_for_missing_outputs(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    protomer_a = _protomer("ethanol", "CCO")
+    protomer_b = _protomer("ethylamine", "CCN")
+    config = RunConfig(
+        protocol="auto3d_entropy",
+        input_path=tmp_path / "protomers.sdf",
+        output_dir=tmp_path / "run",
+    )
+
+    def fake_run_auto3d(
+        input_path: Path,
+        output_dir: Path,
+        *,
+        k: int,
+        model: str,
+        internal_tautomer_stereo_enum: bool,
+        **kwargs,
+    ) -> tuple[Path, list[str]]:
+        output_sdf = output_dir / "mock_auto3d_protocol_partial.sdf"
+        _write_auto3d_output(output_sdf, "CCO", protomer_a.id, energy="-1.0", prop="E_kcal_mol")
+        return output_sdf, ["auto3d", "run", str(input_path)]
+
+    monkeypatch.setattr(conformers_auto3d, "run_auto3d", fake_run_auto3d)
+
+    records = generate_auto3d_seeds_from_protomers([protomer_a, protomer_b], config)
+
+    assert len(records) == 2
+    by_parent = {record.parent_id: record for record in records}
+    assert by_parent[protomer_a.id].energy_kcal_mol == -1.0
+    assert by_parent[protomer_b.id].source_software == "rdkit"
+    assert by_parent[protomer_b.id].energy_kcal_mol is None
+    assert by_parent[protomer_b.id].embedding_status == "success"
+    assert "auto3d_fallback" in by_parent[protomer_b.id].metadata
+    assert any(
+        "falling back to a single RDKit ETKDG seed" in warning
+        for warning in by_parent[protomer_b.id].warnings
+    )
+
 
 
 def test_reduce_auto3d_entropy_ensemble_includes_configurational_entropy(

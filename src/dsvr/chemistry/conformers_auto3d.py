@@ -2,12 +2,14 @@ from __future__ import annotations
 
 import csv
 import math
-from dataclasses import asdict
+import os
+from dataclasses import asdict, dataclass
 from pathlib import Path
 
 from rdkit import Chem
 from rdkit.Chem import rdMolDescriptors
 
+from dsvr.chemistry.conformers_rdkit import generate_rdkit_seeds
 from dsvr.config import RunConfig
 from dsvr.filtering.variant_score import score_variant
 from dsvr.models import (
@@ -18,8 +20,45 @@ from dsvr.models import (
     make_seed_id,
 )
 from dsvr.ranking.boltzmann import R_KCAL_MOL_K
-from dsvr.runners.auto3d_runner import inspect_auto3d, run_auto3d
+from dsvr.runners.auto3d_runner import Auto3DExecutionError, inspect_auto3d, run_auto3d
 from dsvr.utils.units import hartree_to_kcal_mol
+
+
+@dataclass(frozen=True)
+class _Auto3DProtomerFeatures:
+    protomer_id: str
+    input_molecule_id: str
+    molname: str
+    heavy_atoms: int
+    rotatable_bonds: int
+    stereo_centers: int
+    hetero_atoms: int
+    formal_charge: int
+    estimated_enum_pressure: int
+
+
+@dataclass(frozen=True)
+class _Auto3DBatchSettings:
+    internal_tautomer_stereo_enum: bool
+    mpi_np: int | None
+    cpu_workers: int | None
+    memory_gb: int | None
+    capacity: int | None
+    max_confs: int | None
+    patience: int | None
+    threshold: float | None
+    opt_steps: int | None
+    use_gpu: bool
+    reason: str
+
+
+@dataclass(frozen=True)
+class _Auto3DProtomerBatch:
+    index: int
+    records: list[ProtomerRecord]
+    settings: _Auto3DBatchSettings
+    large_molecule: bool
+    features: list[_Auto3DProtomerFeatures]
 
 
 def auto3d_available() -> bool:
@@ -77,30 +116,53 @@ def generate_auto3d_seeds_from_protomers(
     output_dir.mkdir(parents=True, exist_ok=True)
     input_smi = output_dir / "auto3d_protomer_input.smi"
     _write_auto3d_protomer_input(input_smi, protomer_records)
-    output_sdf, command = run_auto3d(
-        input_smi,
-        output_dir,
-        k=config.seeding.auto3d_k,
-        model=config.seeding.auto3d_model,
-        internal_tautomer_stereo_enum=True,
-        mpi_np=config.seeding.auto3d_mpi_np,
-        cpu_workers=config.seeding.auto3d_cpu_workers,
-        memory_gb=config.seeding.auto3d_memory_gb,
-        capacity=config.seeding.auto3d_capacity,
-        max_confs=config.seeding.auto3d_max_confs,
-        patience=config.seeding.auto3d_patience,
-        threshold=config.seeding.auto3d_threshold,
-        opt_steps=config.seeding.auto3d_opt_steps,
-        use_gpu=config.seeding.auto3d_use_gpu,
-        stream_output=config.logging.tail_subprocess_logs,
-    )
-    records = _records_from_auto3d_protomer_output(
-        output_sdf,
-        protomer_records,
-        config=config,
-        command=command,
-        output_dir=output_dir,
-    )
+
+    batches = _plan_auto3d_protomer_batches(protomer_records, config)
+    _write_auto3d_adaptive_plan(output_dir / "auto3d_adaptive_plan.csv", batches)
+
+    records: list[SeedConformerRecord] = []
+    for batch in batches:
+        batch_dir = output_dir / f"batch_{batch.index:03d}"
+        batch_dir.mkdir(parents=True, exist_ok=True)
+        batch_input_smi = batch_dir / f"auto3d_protomer_input_batch_{batch.index:03d}.smi"
+        _write_auto3d_protomer_input(batch_input_smi, batch.records)
+        settings = batch.settings
+        output_sdf, command = run_auto3d(
+            batch_input_smi,
+            batch_dir,
+            k=config.seeding.auto3d_k,
+            model=config.seeding.auto3d_model,
+            internal_tautomer_stereo_enum=settings.internal_tautomer_stereo_enum,
+            mpi_np=settings.mpi_np,
+            cpu_workers=settings.cpu_workers,
+            memory_gb=settings.memory_gb,
+            capacity=settings.capacity,
+            max_confs=settings.max_confs,
+            patience=settings.patience,
+            threshold=settings.threshold,
+            opt_steps=settings.opt_steps,
+            use_gpu=settings.use_gpu,
+            stream_output=config.logging.tail_subprocess_logs,
+        )
+        batch_records = _records_from_auto3d_protomer_output(
+            output_sdf,
+            batch.records,
+            config=config,
+            command=command,
+            output_dir=output_dir,
+            settings=settings,
+        )
+        batch_records = _fill_missing_auto3d_protomer_outputs_with_rdkit(
+            batch.records,
+            batch_records,
+            config=config,
+            command=command,
+            output_sdf=output_sdf,
+            output_dir=batch_dir,
+            final_output_dir=output_dir,
+        )
+        records.extend(batch_records)
+
     _write_auto3d_seed_sdf(output_dir / "auto3d_protocol_seeds.sdf", records)
     _write_auto3d_seed_csv(output_dir / "auto3d_protocol_seeds.csv", records)
     return records
@@ -302,6 +364,209 @@ def _write_auto3d_protomer_input(path: Path, protomer_records: list[ProtomerReco
             handle.write(f"{smiles} {record.id}\n")
 
 
+def _plan_auto3d_protomer_batches(
+    protomer_records: list[ProtomerRecord],
+    config: RunConfig,
+) -> list[_Auto3DProtomerBatch]:
+    if not protomer_records:
+        return []
+
+    small_records: list[ProtomerRecord] = []
+    small_features: list[_Auto3DProtomerFeatures] = []
+    large_batches: list[tuple[ProtomerRecord, _Auto3DProtomerFeatures]] = []
+    for record in protomer_records:
+        features = _auto3d_protomer_features(record)
+        if _is_large_auto3d_protomer(features):
+            large_batches.append((record, features))
+        else:
+            small_records.append(record)
+            small_features.append(features)
+
+    batches: list[_Auto3DProtomerBatch] = []
+    batch_index = 1
+    if small_records:
+        batches.append(
+            _Auto3DProtomerBatch(
+                index=batch_index,
+                records=small_records,
+                settings=_default_auto3d_protocol_settings(config),
+                large_molecule=False,
+                features=small_features,
+            )
+        )
+        batch_index += 1
+
+    for record, features in large_batches:
+        batches.append(
+            _Auto3DProtomerBatch(
+                index=batch_index,
+                records=[record],
+                settings=_large_auto3d_protocol_settings(features, config),
+                large_molecule=True,
+                features=[features],
+            )
+        )
+        batch_index += 1
+    return batches
+
+
+def _auto3d_protomer_features(record: ProtomerRecord) -> _Auto3DProtomerFeatures:
+    molecule = Chem.Mol(record.rdkit_mol)
+    heavy_atoms = molecule.GetNumHeavyAtoms()
+    rotatable_bonds = rdMolDescriptors.CalcNumRotatableBonds(molecule)
+    stereo_centers = len(Chem.FindMolChiralCenters(molecule, includeUnassigned=True))
+    hetero_atoms = sum(1 for atom in molecule.GetAtoms() if atom.GetAtomicNum() not in (1, 6))
+    formal_charge = Chem.GetFormalCharge(molecule)
+    estimated_enum_pressure = (
+        max(1, hetero_atoms)
+        * max(1, stereo_centers + 1)
+        * max(1, rotatable_bonds // 2)
+    )
+    return _Auto3DProtomerFeatures(
+        protomer_id=record.id,
+        input_molecule_id=record.input_molecule_id,
+        molname=record.molname,
+        heavy_atoms=heavy_atoms,
+        rotatable_bonds=rotatable_bonds,
+        stereo_centers=stereo_centers,
+        hetero_atoms=hetero_atoms,
+        formal_charge=formal_charge,
+        estimated_enum_pressure=estimated_enum_pressure,
+    )
+
+
+def _is_large_auto3d_protomer(features: _Auto3DProtomerFeatures) -> bool:
+    return (
+        features.heavy_atoms >= 45
+        or features.rotatable_bonds >= 12
+        or features.estimated_enum_pressure >= 120
+    )
+
+
+def _default_auto3d_protocol_settings(config: RunConfig) -> _Auto3DBatchSettings:
+    return _Auto3DBatchSettings(
+        internal_tautomer_stereo_enum=True,
+        mpi_np=config.seeding.auto3d_mpi_np,
+        cpu_workers=config.seeding.auto3d_cpu_workers,
+        memory_gb=config.seeding.auto3d_memory_gb,
+        capacity=config.seeding.auto3d_capacity,
+        max_confs=config.seeding.auto3d_max_confs,
+        patience=config.seeding.auto3d_patience,
+        threshold=config.seeding.auto3d_threshold,
+        opt_steps=config.seeding.auto3d_opt_steps,
+        use_gpu=config.seeding.auto3d_use_gpu,
+        reason="configured Auto3D protocol settings",
+    )
+
+
+def _large_auto3d_protocol_settings(
+    features: _Auto3DProtomerFeatures,
+    config: RunConfig,
+) -> _Auto3DBatchSettings:
+    available_cpus = os.cpu_count() or config.seeding.auto3d_mpi_np
+    configured_mpi = config.seeding.auto3d_mpi_np or available_cpus
+    active_workers = max(
+        2,
+        min(configured_mpi, available_cpus, max(4, features.rotatable_bonds // 2)),
+    )
+    target_threads_per_worker = 4 if config.seeding.auto3d_use_gpu else 2
+    cpu_workers = max(2, math.ceil(active_workers / target_threads_per_worker))
+    cpu_workers = min(cpu_workers, active_workers)
+    if config.seeding.auto3d_cpu_workers is not None:
+        cpu_workers = max(1, min(cpu_workers, config.seeding.auto3d_cpu_workers))
+
+    max_confs = config.seeding.auto3d_max_confs
+    if max_confs is None or max_confs > 1:
+        max_confs = 1
+    capacity = config.seeding.auto3d_capacity
+    if capacity is None or capacity > max_confs:
+        capacity = max_confs
+    opt_steps = config.seeding.auto3d_opt_steps
+    opt_steps = 250 if opt_steps is None else min(opt_steps, 250)
+    patience = config.seeding.auto3d_patience
+    patience = 30 if patience is None else min(patience, 30)
+    memory_gb = config.seeding.auto3d_memory_gb
+    memory_gb = 2 if memory_gb is None else max(memory_gb, 2)
+
+    reason = (
+        "large/high-enumeration protomer: disabled Auto3D internal tautomer/stereo "
+        "enumeration, capped conformers, and sized MPI/thread groups to expected "
+        "active conformer work rather than total CPU count"
+    )
+    return _Auto3DBatchSettings(
+        internal_tautomer_stereo_enum=False,
+        mpi_np=active_workers,
+        cpu_workers=cpu_workers,
+        memory_gb=memory_gb,
+        capacity=capacity,
+        max_confs=max_confs,
+        patience=patience,
+        threshold=config.seeding.auto3d_threshold,
+        opt_steps=opt_steps,
+        use_gpu=config.seeding.auto3d_use_gpu,
+        reason=reason,
+    )
+
+
+def _write_auto3d_adaptive_plan(path: Path, batches: list[_Auto3DProtomerBatch]) -> None:
+    fieldnames = [
+        "batch_index",
+        "protomer_id",
+        "input_molecule_id",
+        "molname",
+        "large_molecule",
+        "heavy_atoms",
+        "rotatable_bonds",
+        "stereo_centers",
+        "hetero_atoms",
+        "formal_charge",
+        "estimated_enum_pressure",
+        "internal_tautomer_stereo_enum",
+        "mpi_np",
+        "cpu_workers",
+        "memory_gb",
+        "capacity",
+        "max_confs",
+        "patience",
+        "threshold",
+        "opt_steps",
+        "use_gpu",
+        "reason",
+    ]
+    with path.open("w", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(handle, fieldnames=fieldnames)
+        writer.writeheader()
+        for batch in batches:
+            settings = batch.settings
+            for features in batch.features:
+                writer.writerow(
+                    {
+                        "batch_index": batch.index,
+                        "protomer_id": features.protomer_id,
+                        "input_molecule_id": features.input_molecule_id,
+                        "molname": features.molname,
+                        "large_molecule": batch.large_molecule,
+                        "heavy_atoms": features.heavy_atoms,
+                        "rotatable_bonds": features.rotatable_bonds,
+                        "stereo_centers": features.stereo_centers,
+                        "hetero_atoms": features.hetero_atoms,
+                        "formal_charge": features.formal_charge,
+                        "estimated_enum_pressure": features.estimated_enum_pressure,
+                        "internal_tautomer_stereo_enum": settings.internal_tautomer_stereo_enum,
+                        "mpi_np": settings.mpi_np,
+                        "cpu_workers": settings.cpu_workers,
+                        "memory_gb": settings.memory_gb,
+                        "capacity": settings.capacity,
+                        "max_confs": settings.max_confs,
+                        "patience": settings.patience,
+                        "threshold": settings.threshold,
+                        "opt_steps": settings.opt_steps,
+                        "use_gpu": settings.use_gpu,
+                        "reason": settings.reason,
+                    }
+                )
+
+
 def _records_from_auto3d_output(
     output_sdf: Path,
     stereo_records: list[StereoRecord],
@@ -399,6 +664,7 @@ def _records_from_auto3d_protomer_output(
     config: RunConfig,
     command: list[str],
     output_dir: Path,
+    settings: _Auto3DBatchSettings | None = None,
 ) -> list[SeedConformerRecord]:
     protomer_by_id = {record.id: record for record in protomer_records}
     fallback_protomer = protomer_records[0] if len(protomer_records) == 1 else None
@@ -423,26 +689,44 @@ def _records_from_auto3d_protomer_output(
         if key in seen:
             continue
         seen.add(key)
+        batch_settings = settings or _default_auto3d_protocol_settings(config)
+        lineage_mode = (
+            "protomer_to_auto3d_internal_tautomer_stereo_enum"
+            if batch_settings.internal_tautomer_stereo_enum
+            else "protomer_direct_auto3d_large_molecule_constrained"
+        )
         metadata = {
             "auto3d": {
                 "k": config.seeding.auto3d_k,
                 "model": config.seeding.auto3d_model,
-                "lineage_mode": "protomer_to_auto3d_internal_tautomer_stereo_enum",
-                "internal_tautomer_stereo_enum": True,
+                "lineage_mode": lineage_mode,
+                "internal_tautomer_stereo_enum": batch_settings.internal_tautomer_stereo_enum,
                 "source_protomer_id": protomer_id,
                 "energy_property": energy_prop,
                 "energy_units": energy_units,
-                "max_confs": config.seeding.auto3d_max_confs,
-                "mpi_np": config.seeding.auto3d_mpi_np,
-                "cpu_workers": config.seeding.auto3d_cpu_workers,
-                "memory_gb": config.seeding.auto3d_memory_gb,
-                "capacity": config.seeding.auto3d_capacity,
-                "patience": config.seeding.auto3d_patience,
-                "threshold": config.seeding.auto3d_threshold,
-                "opt_steps": config.seeding.auto3d_opt_steps,
-                "use_gpu": config.seeding.auto3d_use_gpu,
+                "max_confs": batch_settings.max_confs,
+                "mpi_np": batch_settings.mpi_np,
+                "cpu_workers": batch_settings.cpu_workers,
+                "memory_gb": batch_settings.memory_gb,
+                "capacity": batch_settings.capacity,
+                "patience": batch_settings.patience,
+                "threshold": batch_settings.threshold,
+                "opt_steps": batch_settings.opt_steps,
+                "use_gpu": batch_settings.use_gpu,
+                "adaptive_reason": batch_settings.reason,
             }
         }
+        if batch_settings.internal_tautomer_stereo_enum:
+            warnings = [
+                "Auto3D internally enumerated tautomers/stereoisomers after molscrub "
+                "protomer generation; lineage is anchored at the protomer."
+            ]
+        else:
+            warnings = [
+                "Auto3D internal tautomer/stereo enumeration was disabled for this "
+                "large/high-enumeration protomer to avoid excessive conformer expansion; "
+                "lineage remains anchored at the molscrub protomer."
+            ]
         records.append(
             SeedConformerRecord(
                 id=make_seed_id(parent.id, index, canonical_smiles, isomeric_smiles, metadata),
@@ -464,10 +748,7 @@ def _records_from_auto3d_protomer_output(
                     output_dir / "auto3d_protocol_seeds.sdf",
                     output_dir / "auto3d_protocol_seeds.csv",
                 ],
-                warnings=[
-                    "Auto3D internally enumerated tautomers/stereoisomers after molscrub "
-                    "protomer generation; lineage is anchored at the protomer."
-                ],
+                warnings=warnings,
                 metadata=metadata,
                 conformer_index=index,
                 energy_kcal_mol=energy,
@@ -480,6 +761,153 @@ def _records_from_auto3d_protomer_output(
             )
         )
     return records
+
+
+def _fill_missing_auto3d_protomer_outputs_with_rdkit(
+    protomer_records: list[ProtomerRecord],
+    records: list[SeedConformerRecord],
+    *,
+    config: RunConfig,
+    command: list[str],
+    output_sdf: Path,
+    output_dir: Path,
+    final_output_dir: Path | None = None,
+) -> list[SeedConformerRecord]:
+    protomer_by_id = {record.id: record for record in protomer_records}
+    observed_ids = {record.parent_id for record in records if record.parent_id}
+    missing_ids = sorted(protomer_by_id.keys() - observed_ids)
+    if not missing_ids:
+        return records
+
+    fallback_records: list[SeedConformerRecord] = []
+    fallback_failures: list[str] = []
+    fallback_reason = _auto3d_partial_failure_reason(output_sdf, output_dir)
+    for protomer_id in missing_ids:
+        protomer = protomer_by_id[protomer_id]
+        fallback = _rdkit_fallback_seed_for_missing_protomer(
+            protomer,
+            config=config,
+            command=command,
+            output_sdf=output_sdf,
+            output_dir=final_output_dir or output_dir,
+            reason=fallback_reason,
+        )
+        if fallback is None:
+            fallback_failures.append(protomer_id)
+            continue
+        fallback_records.append(fallback)
+
+    if fallback_failures:
+        missing_display = ", ".join(sorted(fallback_failures))
+        raise Auto3DExecutionError(
+            "Auto3D returned optimized seeds for "
+            f"{len(observed_ids)}/{len(protomer_records)} protomers; "
+            f"missing outputs for: {missing_display}. "
+            f"RDKit fallback also failed. Inspect Auto3D artifacts under {output_dir} "
+            "(notably Auto3D.log and job*/smi_taut_3d.sdf)."
+        )
+
+    return records + fallback_records
+
+
+def _rdkit_fallback_seed_for_missing_protomer(
+    protomer: ProtomerRecord,
+    *,
+    config: RunConfig,
+    command: list[str],
+    output_sdf: Path,
+    output_dir: Path,
+    reason: str,
+) -> SeedConformerRecord | None:
+    fallback_config = config.model_copy(
+        update={
+            "seeding": config.seeding.model_copy(
+                update={
+                    "method": "etkdg",
+                    "rdkit_num_conformers": 1,
+                }
+            )
+        }
+    )
+    stereo = StereoRecord(
+        id=protomer.id,
+        parent_id=protomer.parent_id,
+        input_molecule_id=protomer.input_molecule_id,
+        molname=protomer.molname,
+        canonical_smiles=protomer.canonical_smiles,
+        isomeric_smiles=protomer.isomeric_smiles,
+        molecular_formula=protomer.molecular_formula,
+        formal_charge=protomer.formal_charge,
+        explicit_proton_count=protomer.explicit_proton_count,
+        source_software=protomer.source_software,
+        source_command=protomer.source_command,
+        source_python_function=(
+            "dsvr.chemistry.conformers_auto3d._rdkit_fallback_seed_for_missing_protomer"
+        ),
+        warnings=list(protomer.warnings),
+        metadata=dict(protomer.metadata),
+        stereo_index=1,
+        rdkit_mol=Chem.Mol(protomer.rdkit_mol),
+    )
+    rdkit_records = generate_rdkit_seeds(stereo, fallback_config)
+    successful = [
+        record
+        for record in rdkit_records
+        if record.embedding_status != "failed" and record.rdkit_mol is not None
+    ]
+    if not successful:
+        return None
+    record = successful[0]
+    warning = (
+        "Auto3D produced no optimized representative for this protomer; "
+        "falling back to a single RDKit ETKDG seed. "
+        f"Reason: {reason}"
+    )
+    metadata = dict(record.metadata)
+    metadata["auto3d_fallback"] = {
+        "auto3d_command": " ".join(command),
+        "auto3d_output_sdf": str(output_sdf),
+        "auto3d_job_dir": str(output_sdf.parent),
+        "missing_protomer_id": protomer.id,
+        "reason": reason,
+        "cheap_3d_energy_omitted": True,
+    }
+    output_paths = list(record.output_paths)
+    for extra_path in (
+        output_sdf,
+        output_dir / "auto3d_protocol_seeds.sdf",
+        output_dir / "auto3d_protocol_seeds.csv",
+    ):
+        if extra_path not in output_paths:
+            output_paths.append(extra_path)
+    warnings = list(record.warnings)
+    warnings.append(warning)
+    return record.model_copy(
+        update={
+            "warnings": warnings,
+            "metadata": metadata,
+            "output_paths": output_paths,
+            "energy_kcal_mol": None,
+        }
+    )
+
+
+def _auto3d_partial_failure_reason(output_sdf: Path, output_dir: Path) -> str:
+    candidate_logs = [output_sdf.parent / "Auto3D.log"]
+    log_root = output_dir / "logs"
+    if log_root.exists():
+        candidate_logs.extend(sorted(log_root.glob("*_auto3d/stdout.log"), reverse=True))
+        candidate_logs.extend(sorted(log_root.glob("*_auto3d/combined.log"), reverse=True))
+    for log_path in candidate_logs:
+        if not log_path.exists():
+            continue
+        try:
+            text = log_path.read_text(encoding="utf-8")
+        except OSError:
+            continue
+        if "Dropped(Oscillating)" in text:
+            return "Auto3D dropped all candidate structures as oscillating during optimization"
+    return "Auto3D did not emit an optimized structure for this protomer"
 
 
 def _write_auto3d_seed_sdf(path: Path, records: list[SeedConformerRecord]) -> None:
