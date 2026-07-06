@@ -1013,6 +1013,241 @@ def summarize_command(
         console.print(f"Wrote HTML report to [bold]{html_path}[/bold]")
 
 
+def _warn_if_exhaustive(config: RunConfig, config_path: Path | None) -> None:
+    if config.variant_filtering.mode == "exhaustive" or (
+        config_path is not None and "exhaustive_debug" in config_path.name
+    ):
+        console.print(
+            "[red]WARNING: exhaustive mode may generate extremely large numbers of "
+            "variants and XYZ files. Use only for small molecules or debugging.[/red]"
+        )
+
+
+def _candidate_explosion_rows(config: RunConfig) -> list[tuple[str, str, int]]:
+    protomers = config.protonation.max_protomers_per_molecule
+    rdkit_tautomers = config.tautomer_filtering.max_rdkit_tautomers_before_auto3d
+    selected_tautomers = config.tautomer_filtering.tauto_k
+    stereoisomers = config.stereoisomer_filtering.max_stereoisomers_per_tautomer
+    selected_stereoisomers = min(
+        stereoisomers,
+        config.stereoisomer_filtering.keep_top_n_diastereomers,
+    )
+    final_conformers = config.final_3d.k
+    optional_validation = config.optional_validation.max_variants_per_molecule
+    return [
+        ("protomers", f"{protomers}", protomers),
+        (
+            "pre-Auto3D tautomer candidates",
+            f"{protomers} protomers x {rdkit_tautomers} RDKit tautomers",
+            protomers * rdkit_tautomers,
+        ),
+        (
+            "selected tautomer states",
+            f"{protomers} protomers x {selected_tautomers} tauto-k",
+            protomers * selected_tautomers,
+        ),
+        (
+            "stereoisomer candidates",
+            f"{protomers * selected_tautomers} selected tautomers x {stereoisomers} stereo cap",
+            protomers * selected_tautomers * stereoisomers,
+        ),
+        (
+            "selected stereoisomer states",
+            (
+                f"{protomers * selected_tautomers} selected tautomers x "
+                f"{selected_stereoisomers} stereo pruning cap"
+            ),
+            protomers * selected_tautomers * selected_stereoisomers,
+        ),
+        (
+            "final Auto3D conformer jobs",
+            (
+                f"{protomers * selected_tautomers * selected_stereoisomers} variants x "
+                f"{final_conformers} final k"
+            ),
+            protomers * selected_tautomers * selected_stereoisomers * final_conformers,
+        ),
+        (
+            "optional CREST/xTB validation",
+            f"enabled={config.optional_validation.crest_xtb_enabled}, cap={optional_validation}",
+            optional_validation if config.optional_validation.crest_xtb_enabled else 0,
+        ),
+    ]
+
+
+def _print_dry_run_summary(config: RunConfig, outdir: Path) -> None:
+    console.print(f"Wrote dry-run plan to [bold]{outdir / 'dry_run_plan.json'}[/bold]")
+    for step in planned_steps(config):
+        tools = f" tools={','.join(step.external_tools)}" if step.external_tools else ""
+        console.print(f"- {step.name}: {step.output_dir}{tools}")
+
+    rows = _candidate_explosion_rows(config)
+    console.print("Maximum candidate estimates per input molecule:")
+    for label, formula, maximum in rows:
+        console.print(f"- {label}: {formula} = {maximum}")
+
+    table = Table(title="Maximum candidate estimates per input molecule")
+    table.add_column("Stage cap")
+    table.add_column("Formula")
+    table.add_column("Maximum", justify="right")
+    for label, formula, maximum in rows:
+        table.add_row(label, formula, str(maximum))
+    console.print(table)
+
+
+def _execute_workflow_command(
+    ctx: typer.Context,
+    *,
+    input_path: Path,
+    config_path: Path | None,
+    output_dir: Path | None,
+    dry_run: bool,
+    ph: float | None,
+    solvent: str | None,
+    max_protomers: int | None = None,
+    tauto_k: int | None = None,
+    tauto_window: float | None = None,
+    max_stereoisomers: int | None = None,
+    seeding_method: SeederMethod | None = None,
+    censo_enabled: bool | None = None,
+    crest_xtb_enabled: bool | None = None,
+    agent_enabled: bool | None = None,
+    overwrite: bool | None = None,
+    resume: bool | None = None,
+    force_ligprep_like: bool = False,
+) -> None:
+    globals_ = _global_options(ctx)
+    effective_config_path = config_path or globals_.get("config_path")
+    effective_dry_run = dry_run or bool(globals_.get("dry_run"))
+    config = load_config(effective_config_path) if effective_config_path else RunConfig()
+    config = merge_cli_overrides(
+        config,
+        input_path=input_path,
+        output_dir=output_dir,
+        workflow_mode="ligprep_like" if force_ligprep_like else None,
+        ph=ph,
+        solvent=solvent,
+        max_protomers=max_protomers,
+        tauto_k=tauto_k,
+        tauto_window=tauto_window,
+        max_stereoisomers=max_stereoisomers,
+        seeding_method=seeding_method,
+        censo_enabled=censo_enabled,
+        crest_xtb_enabled=crest_xtb_enabled,
+        agent_enabled=agent_enabled,
+    )
+    config = _apply_runtime_options(
+        config,
+        globals_=globals_,
+        dry_run=effective_dry_run,
+        overwrite=overwrite,
+        resume=resume,
+    )
+    _warn_if_exhaustive(config, effective_config_path)
+    result = run_workflow(config=config)
+    if config.dry_run:
+        _print_dry_run_summary(config, result.outdir)
+    else:
+        console.print(f"Wrote workflow outputs to [bold]{result.outdir}[/bold]")
+    console.print(f"Molecules: {result.molecule_count}")
+
+
+@app.command(name="prepare-ligands")
+def prepare_ligands(
+    ctx: typer.Context,
+    input_path: Annotated[Path, typer.Argument(exists=True, dir_okay=False)],
+    config_path: Annotated[
+        Path | None,
+        typer.Option(
+            "--config",
+            "-c",
+            exists=True,
+            dir_okay=False,
+            help="YAML ligand-prep config.",
+        ),
+    ] = None,
+    output_dir: Annotated[
+        Path | None,
+        typer.Option("--out", "--outdir", "-o", help="Run output directory."),
+    ] = None,
+    dry_run: Annotated[
+        bool,
+        typer.Option(
+            "--dry-run",
+            help="Show planned ligand-prep stages and maximum candidate counts.",
+        ),
+    ] = False,
+    ph: Annotated[
+        float | None,
+        typer.Option("--ph", help="Override ligand-preparation pH."),
+    ] = None,
+    solvent: Annotated[
+        str | None,
+        typer.Option("--solvent", help="Override solvent name passed to configured tools."),
+    ] = None,
+    max_protomers: Annotated[
+        int | None,
+        typer.Option("--max-protomers", help="Cap plausible protomers per input molecule."),
+    ] = None,
+    tauto_k: Annotated[
+        int | None,
+        typer.Option("--tauto-k", help="Keep top K Auto3D-ranked tautomers per protomer."),
+    ] = None,
+    tauto_window: Annotated[
+        float | None,
+        typer.Option(
+            "--tauto-window",
+            help="Keep tautomers within this Auto3D energy window in kcal/mol.",
+        ),
+    ] = None,
+    max_stereoisomers: Annotated[
+        int | None,
+        typer.Option("--max-stereoisomers", help="Cap stereoisomers per selected tautomer."),
+    ] = None,
+    enable_crest_validation: Annotated[
+        bool,
+        typer.Option(
+            "--enable-crest-validation",
+            help="Run optional CREST/xTB validation on selected final variants.",
+        ),
+    ] = False,
+    agent: Annotated[
+        bool,
+        typer.Option(
+            "--agent",
+            help="Enable experimental local agent diagnostics only on failures.",
+        ),
+    ] = False,
+    overwrite: Annotated[
+        bool | None,
+        typer.Option("--overwrite/--no-overwrite", help="Override workflow overwrite policy."),
+    ] = None,
+    resume: Annotated[
+        bool | None,
+        typer.Option("--resume/--no-resume", help="Override workflow resume policy."),
+    ] = None,
+) -> None:
+    """Prepare ligand structural variants with the default LigPrep-like workflow."""
+    _execute_workflow_command(
+        ctx,
+        input_path=input_path,
+        config_path=config_path,
+        output_dir=output_dir,
+        dry_run=dry_run,
+        ph=ph,
+        solvent=solvent,
+        max_protomers=max_protomers,
+        tauto_k=tauto_k,
+        tauto_window=tauto_window,
+        max_stereoisomers=max_stereoisomers,
+        crest_xtb_enabled=True if enable_crest_validation else None,
+        agent_enabled=True if agent else None,
+        overwrite=overwrite,
+        resume=resume,
+        force_ligprep_like=True,
+    )
+
+
 @app.command()
 def run(
     ctx: typer.Context,
@@ -1037,6 +1272,25 @@ def run(
         str | None,
         typer.Option("--solvent", help="Override solvent name passed to configured tools."),
     ] = None,
+    max_protomers: Annotated[
+        int | None,
+        typer.Option("--max-protomers", help="Cap plausible protomers per input molecule."),
+    ] = None,
+    tauto_k: Annotated[
+        int | None,
+        typer.Option("--tauto-k", help="Keep top K Auto3D-ranked tautomers per protomer."),
+    ] = None,
+    tauto_window: Annotated[
+        float | None,
+        typer.Option(
+            "--tauto-window",
+            help="Keep tautomers within this Auto3D energy window in kcal/mol.",
+        ),
+    ] = None,
+    max_stereoisomers: Annotated[
+        int | None,
+        typer.Option("--max-stereoisomers", help="Cap stereoisomers per selected tautomer."),
+    ] = None,
     seeding_method: Annotated[
         SeederMethod | None,
         typer.Option("--seeding-method", help="Override seeding method."),
@@ -1052,6 +1306,13 @@ def run(
             help="Run optional CREST/xTB validation on selected final variants.",
         ),
     ] = None,
+    agent: Annotated[
+        bool,
+        typer.Option(
+            "--agent",
+            help="Enable experimental local agent diagnostics only on failures.",
+        ),
+    ] = False,
     overwrite: Annotated[
         bool | None,
         typer.Option("--overwrite/--no-overwrite", help="Override workflow overwrite policy."),
@@ -1061,45 +1322,26 @@ def run(
         typer.Option("--resume/--no-resume", help="Override workflow resume policy."),
     ] = None,
 ) -> None:
-    """Run the full DSVR orchestration workflow."""
-    globals_ = _global_options(ctx)
-    effective_config_path = config_path or globals_.get("config_path")
-    effective_dry_run = dry_run or bool(globals_.get("dry_run"))
-    config = load_config(effective_config_path) if effective_config_path else RunConfig()
-    config = merge_cli_overrides(
-        config,
+    """Run the full DSVR orchestration workflow; prefer prepare-ligands for ligand prep."""
+    _execute_workflow_command(
+        ctx,
         input_path=input_path,
+        config_path=config_path,
         output_dir=output_dir,
+        dry_run=dry_run,
         ph=ph,
         solvent=solvent,
+        max_protomers=max_protomers,
+        tauto_k=tauto_k,
+        tauto_window=tauto_window,
+        max_stereoisomers=max_stereoisomers,
         seeding_method=seeding_method,
         censo_enabled=censo_enabled,
         crest_xtb_enabled=crest_xtb_enabled,
-    )
-    config = _apply_runtime_options(
-        config,
-        globals_=globals_,
-        dry_run=effective_dry_run,
+        agent_enabled=True if agent else None,
         overwrite=overwrite,
         resume=resume,
     )
-    if (
-        config.variant_filtering.mode == "exhaustive"
-        or (effective_config_path is not None and "exhaustive_debug" in effective_config_path.name)
-    ):
-        console.print(
-            "[red]WARNING: exhaustive mode may generate extremely large numbers of "
-            "variants and XYZ files. Use only for small molecules or debugging.[/red]"
-        )
-    result = run_workflow(config=config)
-    if config.dry_run:
-        console.print(f"Wrote dry-run plan to [bold]{result.outdir / 'dry_run_plan.json'}[/bold]")
-        for step in planned_steps(config):
-            tools = f" tools={','.join(step.external_tools)}" if step.external_tools else ""
-            console.print(f"- {step.name}: {step.output_dir}{tools}")
-    else:
-        console.print(f"Wrote workflow outputs to [bold]{result.outdir}[/bold]")
-    console.print(f"Molecules: {result.molecule_count}")
 
 
 def _load_ranked_variants(run_dir: Path) -> list[RankedVariantRecord]:

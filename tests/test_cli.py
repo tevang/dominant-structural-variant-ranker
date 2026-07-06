@@ -3,6 +3,7 @@ from __future__ import annotations
 import re
 from pathlib import Path
 
+import yaml
 from typer.testing import CliRunner
 
 from dsvr.cli import app
@@ -24,6 +25,7 @@ def test_cli_commands_have_help() -> None:
         "thermo",
         "rank",
         "run",
+        "prepare-ligands",
         "summarize",
     ]
 
@@ -33,11 +35,22 @@ def test_cli_commands_have_help() -> None:
     assert "Usage:" in help_output
     assert "doctor" in help_output
     assert "run" in help_output
+    assert "prepare-ligands" in help_output
 
     for command in commands:
         result = runner.invoke(app, [command, "--help"])
         assert result.exit_code == 0, result.output
         assert "Usage:" in result.output
+
+    prepare_help = ANSI_ESCAPE_RE.sub("", runner.invoke(app, ["prepare-ligands", "--help"]).output)
+    assert "--ph" in prepare_help
+    assert "--solvent" in prepare_help
+    assert "--max-protomers" in prepare_help
+    assert "--tauto-k" in prepare_help
+    assert "--tauto-window" in prepare_help
+    assert "--max-stereoisomers" in prepare_help
+    assert "--enable-crest-valid" in prepare_help
+    assert "--agent" in prepare_help
 
 
 def test_cli_summarize_missing_manifest_fails_actionably(tmp_path: Path) -> None:
@@ -104,3 +117,67 @@ def test_cli_run_fast_smoke_writes_expected_outputs(tmp_path: Path) -> None:
         "report.md",
     ]:
         assert (outdir / name).exists(), name
+
+
+def test_prepare_ligands_dry_run_reports_candidate_caps_and_overrides(tmp_path: Path) -> None:
+    input_path = tmp_path / "mols.smi"
+    input_path.write_text("CCO ethanol\n", encoding="utf-8")
+    outdir = tmp_path / "ligprep"
+
+    result = CliRunner().invoke(
+        app,
+        [
+            "prepare-ligands",
+            str(input_path),
+            "--config",
+            "configs/ligprep_like_default.yaml",
+            "--out",
+            str(outdir),
+            "--dry-run",
+            "--ph",
+            "8.2",
+            "--solvent",
+            "methanol",
+            "--max-protomers",
+            "2",
+            "--tauto-k",
+            "3",
+            "--tauto-window",
+            "4.5",
+            "--max-stereoisomers",
+            "5",
+            "--enable-crest-validation",
+            "--agent",
+            "--overwrite",
+            "--no-resume",
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    output = ANSI_ESCAPE_RE.sub("", result.output)
+    assert "Wrote dry-run plan" in output
+    assert "Maximum candidate estimates per input molecule:" in output
+    assert "pre-Auto3D tautomer candidates" in output
+    assert "2 protomers x 64 RDKit tautomers" in output
+    assert "128" in output
+    assert "selected tautomer states" in output
+    assert "2 protomers x 3 tauto-k" in output
+    assert "6" in output
+    assert "stereoisomer candidates" in output
+    assert "6 selected tautomers x 5 stereo cap" in output
+    assert "30" in output
+    assert "optional CREST/xTB validation" in output
+
+    resolved = yaml.safe_load((outdir / "resolved_config.yaml").read_text(encoding="utf-8"))
+    assert resolved["workflow_mode"] == "ligprep_like"
+    assert resolved["chemistry"]["ph"] == 8.2
+    assert resolved["chemistry"]["ph_low"] == 8.2
+    assert resolved["chemistry"]["ph_high"] == 8.2
+    assert resolved["chemistry"]["solvent"] == "methanol"
+    assert resolved["protonation"]["max_protomers_per_molecule"] == 2
+    assert resolved["tautomer_filtering"]["tauto_k"] == 3
+    assert resolved["tautomer_filtering"]["tauto_window_kcal_mol"] == 4.5
+    assert resolved["stereoisomer_filtering"]["max_stereoisomers_per_tautomer"] == 5
+    assert resolved["optional_validation"]["crest_xtb_enabled"] is True
+    assert resolved["agent"]["enabled"] is True
+    assert (outdir / "dry_run_plan.json").exists()

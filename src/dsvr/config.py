@@ -682,11 +682,38 @@ def merge_cli_overrides(config: RunConfig, **overrides: Any) -> RunConfig:
     data = config.model_dump(mode="python")
     _set_if_present(data, "input_path", overrides.get("input_path"))
     _set_if_present(data, "output_dir", overrides.get("output_dir"))
+    _set_if_present(data, "workflow_mode", overrides.get("workflow_mode"))
     _set_if_present(data["chemistry"], "ph", overrides.get("ph"))
     if overrides.get("ph") is not None:
         data["chemistry"]["ph_low"] = None
         data["chemistry"]["ph_high"] = None
     _set_if_present(data["chemistry"], "solvent", overrides.get("solvent"))
+    _set_if_present(
+        data["protonation"],
+        "max_protomers_per_molecule",
+        overrides.get("max_protomers"),
+    )
+    _set_if_present(
+        data["enumeration"],
+        "max_protomers_per_molecule",
+        overrides.get("max_protomers"),
+    )
+    _set_if_present(data["tautomer_filtering"], "tauto_k", overrides.get("tauto_k"))
+    _set_if_present(
+        data["tautomer_filtering"],
+        "tauto_window_kcal_mol",
+        overrides.get("tauto_window"),
+    )
+    _set_if_present(
+        data["stereoisomer_filtering"],
+        "max_stereoisomers_per_tautomer",
+        overrides.get("max_stereoisomers"),
+    )
+    _set_if_present(
+        data["enumeration"],
+        "max_stereoisomers_per_tautomer",
+        overrides.get("max_stereoisomers"),
+    )
     _set_if_present(data["seeding"], "method", overrides.get("seeding_method"))
     _set_if_present(data["refinement"], "censo_enabled", overrides.get("censo_enabled"))
     _set_if_present(
@@ -694,6 +721,7 @@ def merge_cli_overrides(config: RunConfig, **overrides: Any) -> RunConfig:
         "crest_xtb_enabled",
         overrides.get("crest_xtb_enabled"),
     )
+    _set_if_present(data["agent"], "enabled", overrides.get("agent_enabled"))
     return RunConfig.model_validate(data)
 
 

@@ -91,8 +91,14 @@ def test_cli_override_merge_updates_nested_fields(tmp_path: Path) -> None:
         output_dir=tmp_path / "out",
         ph=8.1,
         solvent="methanol",
+        max_protomers=2,
+        tauto_k=3,
+        tauto_window=4.5,
+        max_stereoisomers=5,
         seeding_method="auto3d",
         censo_enabled=True,
+        crest_xtb_enabled=True,
+        agent_enabled=True,
     )
 
     assert config.input_path == tmp_path / "input.sdf"
@@ -101,8 +107,16 @@ def test_cli_override_merge_updates_nested_fields(tmp_path: Path) -> None:
     assert config.chemistry.ph_low == 8.1
     assert config.chemistry.ph_high == 8.1
     assert config.chemistry.solvent == "methanol"
+    assert config.protonation.max_protomers_per_molecule == 2
+    assert config.enumeration.max_protomers_per_molecule == 2
+    assert config.tautomer_filtering.tauto_k == 3
+    assert config.tautomer_filtering.tauto_window_kcal_mol == 4.5
+    assert config.stereoisomer_filtering.max_stereoisomers_per_tautomer == 5
+    assert config.enumeration.max_stereoisomers_per_tautomer == 5
     assert config.seeding.method == "auto3d"
     assert config.refinement.censo_enabled is True
+    assert config.optional_validation.crest_xtb_enabled is True
+    assert config.agent.enabled is True
 
 
 def test_write_resolved_config(tmp_path: Path) -> None:
