@@ -18,6 +18,7 @@ from dsvr.chemistry.conformers_auto3d import (
 from dsvr.chemistry.conformers_rdkit import generate_rdkit_seeds, read_stereo_sdf
 from dsvr.chemistry.protonation import generate_protomer_candidates
 from dsvr.chemistry.stereochemistry import enumerate_stereoisomers, read_tautomers_sdf
+from dsvr.chemistry.tautomer_auto3d_filter import filter_tautomers_with_auto3d
 from dsvr.chemistry.tautomers import enumerate_tautomers, read_protomers_sdf
 from dsvr.config import RunConfig, write_resolved_config
 from dsvr.filtering.progress import decision_counts
@@ -200,17 +201,34 @@ def run_workflow(config: RunConfig) -> WorkflowResult:
         )
 
     progress.record("Tautomer enumeration", "started", generated_count=len(protomers))
-    tautomers = _run_step_list(
-        "tautomers",
-        protomers,
-        config,
-        states,
-        lambda item: enumerate_tautomers(item, config),
-        resume_loader=lambda: _load_tautomers(outdir),
-        existing_loader=lambda item: _load_existing_tautomer_outputs(item, outdir, config),
-        progress=progress,
-        progress_stage="Tautomer enumeration",
-    )
+    tautomer_input_hash = records_hash(protomers)
+    if should_skip_step(steps["tautomers"], tautomer_input_hash, config):
+        states.append(skipped_state(steps["tautomers"], tautomer_input_hash, config))
+        tautomers = _load_tautomers(outdir)
+        progress.record("Tautomer enumeration", "skipped", generated_count=len(tautomers))
+    else:
+        tautomers = []
+        missing_protomers: list[ProtomerRecord] = []
+        for protomer in protomers:
+            existing = _load_existing_tautomer_outputs(protomer, outdir, config)
+            if existing:
+                tautomers.extend(existing)
+            else:
+                missing_protomers.append(protomer)
+        if missing_protomers:
+            if config.workflow_mode == "ligprep_like" and config.tautomer_filtering.enabled:
+                tautomers.extend(filter_tautomers_with_auto3d(missing_protomers, config))
+            else:
+                for protomer in missing_protomers:
+                    tautomers.extend(enumerate_tautomers(protomer, config))
+        states.append(
+            mark_done(
+                steps["tautomers"],
+                tautomer_input_hash,
+                config,
+                details={"count": len(tautomers)},
+            )
+        )
     records.extend(tautomers)
     _write_stage_summary_sdf(outdir / "all_tautomers.sdf", tautomers)
     progress.record("Tautomer enumeration", "completed", generated_count=len(tautomers))

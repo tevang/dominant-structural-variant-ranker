@@ -2,8 +2,8 @@ from pathlib import Path
 
 from rdkit import Chem
 
-from dsvr.chemistry import tautomers as tautomer_module
-from dsvr.chemistry.tautomers import TautomerEnumerationTimeout
+from dsvr.chemistry import tautomer_auto3d_filter as tautomer_filter
+from dsvr.chemistry.tautomer_auto3d_filter import RdkitTautomerFilteringTimeout
 from dsvr.config import RunConfig
 from dsvr.workflow import engine as engine_module
 from dsvr.workflow.engine import run_smoke_workflow, run_workflow
@@ -140,9 +140,9 @@ def test_workflow_tautomer_timeout_does_not_crash(tmp_path: Path, monkeypatch) -
     outdir = tmp_path / "timeout"
 
     def timeout_worker(*args, **kwargs):
-        raise TautomerEnumerationTimeout("mock timeout")
+        raise RdkitTautomerFilteringTimeout("mock timeout")
 
-    monkeypatch.setattr(tautomer_module, "_enumerate_molblocks_with_timeout", timeout_worker)
+    monkeypatch.setattr(tautomer_filter, "_enumerate_molblocks_with_timeout", timeout_worker)
 
     result = run_workflow(
         RunConfig(
