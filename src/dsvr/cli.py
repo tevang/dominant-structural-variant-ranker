@@ -379,54 +379,45 @@ def status_command(
     run_dir: Annotated[Path, typer.Argument(exists=True, file_okay=False)],
 ) -> None:
     """Show current or last known workflow status for a run directory."""
-    status = run_status(run_dir)
-    table = Table(title=f"DSVR status: {run_dir}")
-    table.add_column("Field")
-    table.add_column("Value")
-    current = _format_current_molecule(status)
-    for key, value in (
-        ("last_completed_stage", status.get("last_completed_stage")),
-        ("active_stage", status.get("active_stage")),
-        ("last_stage", status.get("last_stage")),
-        ("last_status", status.get("last_status")),
-        ("current_molecule", current),
-        ("active_command", status.get("active_command")),
-        ("disk_usage_mb", f"{float(status.get('disk_usage_mb', 0.0)):.2f}"),
-        ("xyz_file_count", status.get("xyz_file_count")),
-        ("resume_possible", status.get("resume_possible")),
-    ):
-        table.add_row(key, "" if value is None else str(value))
-    console.print(table)
+    if not (run_dir / "progress.json").exists():
+        console.print(f"No progress.json found in {run_dir}. The run may not have started yet.")
+        return
 
-    rows = list(status.get("counts_by_stage", []))
-    if rows:
-        counts = Table(title="Counts by stage")
-        columns = [
-            "stage",
-            "status",
-            "generated_count",
-            "selected_count",
-            "rejected_count",
-            "timeout_count",
-        ]
-        for column in columns:
-            counts.add_column(column)
-        for row in rows:
-            counts.add_row(*(str(row.get(column, "")) for column in columns))
-        console.print(counts)
-    else:
-        console.print("Stage counts:")
-        for stage, count in dict(status.get("stage_counts", {})).items():
-            console.print(f"- {stage}: {count}")
+    status = run_status(run_dir)
+    console.print(f"Run: {run_dir}")
+    console.print(f"Stage: {status.get('last_stage') or ''}")
+    total = status.get("total")
+    completed = status.get("completed")
+    if total is not None and completed is not None:
+        console.print(f"Progress: {completed} / {total} completed")
+    console.print(f"Succeeded: {_status_count(status, 'succeeded')}")
+    console.print(f"Failed: {_status_count(status, 'failed')}")
+    console.print(f"Skipped: {_status_count(status, 'skipped')}")
+    console.print(f"Running: {_status_count(status, 'running')}")
+    console.print(f"Waiting: {_status_count(status, 'waiting')}")
+    console.print(f"Current molecule: {status.get('current_molecule') or ''}")
+    elapsed = status.get("elapsed_seconds")
+    if elapsed is not None:
+        console.print(f"Elapsed: {_format_elapsed_colon(float(elapsed))}")
+    if status.get("active_command"):
+        console.print(f"Active tool: {status.get('active_command')}")
+    if status.get("last_update"):
+        console.print(f"Last update: {status.get('last_update')}")
 
     _print_diagnostics("Latest warnings", status.get("latest_warnings", []))
     _print_diagnostics("Latest failures", status.get("latest_failures", []))
     _print_diagnostics("Latest recovery failures", status.get("latest_recovery_failures", []))
-    if status.get("molecule_state_count"):
-        console.print(f"Molecule state files: {status.get('molecule_state_count')}")
-    if status.get("latest_log_tail"):
-        console.print("Latest log tail:")
-        console.print(str(status["latest_log_tail"]))
+
+def _status_count(status: dict[str, Any], key: str) -> Any:
+    value = status.get(key)
+    return value if value is not None else 0
+
+
+def _format_elapsed_colon(seconds: float) -> str:
+    total = int(seconds)
+    hours, remainder = divmod(total, 3600)
+    minutes, secs = divmod(remainder, 60)
+    return f"{hours:02d}:{minutes:02d}:{secs:02d}"
 
 
 def _format_current_molecule(status: dict[str, Any]) -> str:
@@ -1114,6 +1105,8 @@ def _execute_workflow_command(
     agent_enabled: bool | None = None,
     overwrite: bool | None = None,
     resume: bool | None = None,
+    progress: bool | None = None,
+    progress_interval: float | None = None,
     force_ligprep_like: bool = False,
 ) -> None:
     globals_ = _global_options(ctx)
@@ -1143,6 +1136,13 @@ def _execute_workflow_command(
         overwrite=overwrite,
         resume=resume,
     )
+    if progress is not None or progress_interval is not None:
+        data = config.model_dump(mode="python")
+        if progress is not None:
+            data["logging"]["progress"] = progress
+        if progress_interval is not None:
+            data["logging"]["progress_interval_seconds"] = progress_interval
+        config = RunConfig.model_validate(data)
     _warn_if_exhaustive(config, effective_config_path)
     result = run_workflow(config=config)
     if config.dry_run:
@@ -1321,6 +1321,17 @@ def run(
         bool | None,
         typer.Option("--resume/--no-resume", help="Override workflow resume policy."),
     ] = None,
+    progress: Annotated[
+        bool,
+        typer.Option("--progress/--no-progress", help="Show compact real-time progress."),
+    ] = True,
+    progress_interval: Annotated[
+        float,
+        typer.Option(
+            "--progress-interval",
+            help="Minimum seconds between terminal progress updates.",
+        ),
+    ] = 2.0,
 ) -> None:
     """Run the full DSVR orchestration workflow; prefer prepare-ligands for ligand prep."""
     _execute_workflow_command(
@@ -1341,6 +1352,8 @@ def run(
         agent_enabled=True if agent else None,
         overwrite=overwrite,
         resume=resume,
+        progress=progress,
+        progress_interval=progress_interval,
     )
 
 

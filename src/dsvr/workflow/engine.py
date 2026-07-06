@@ -98,8 +98,9 @@ def run_workflow(config: RunConfig) -> WorkflowResult:
     write_resolved_config(config, outdir)
     progress = ProgressRecorder(
         outdir,
-        terminal=config.logging.level.upper() != "ERROR",
+        terminal=config.logging.progress and config.logging.level.upper() != "ERROR",
         planned_stages=_progress_stage_names(config),
+        progress_interval=config.logging.progress_interval_seconds,
     )
     recovery = WorkflowRecoveryRecorder(outdir)
     progress.record("Input validation", "started")

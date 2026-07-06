@@ -495,6 +495,15 @@ class LoggingConfig(StrictModel):
     level: LogLevel = "INFO"
     save_subprocess_logs: bool = True
     tail_subprocess_logs: bool = True
+    progress: bool = True
+    progress_interval_seconds: float = 2.0
+
+    @field_validator("progress_interval_seconds")
+    @classmethod
+    def positive_progress_interval(cls, value: float) -> float:
+        if value <= 0:
+            raise ValueError("logging.progress_interval_seconds must be positive")
+        return value
 
 
 class VariantFilteringConfig(StrictModel):

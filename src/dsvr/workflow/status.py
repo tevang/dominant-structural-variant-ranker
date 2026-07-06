@@ -14,9 +14,27 @@ DONE_STATUSES = {"completed", "skipped"}
 def run_status(run_dir: Path, *, log_tail_lines: int = 20) -> dict[str, Any]:
     progress = _read_json(run_dir / "progress.json")
     last_event = progress.get("last_event", {}) if isinstance(progress, dict) else {}
+    legacy_last_event = progress.get("legacy_last_event", {}) if isinstance(progress, dict) else {}
+    stage_name = (
+        progress.get("stage_name")
+        or last_event.get("stage_name")
+        or legacy_last_event.get("stage")
+        or last_event.get("stage")
+    )
+    last_status = (
+        legacy_last_event.get("status")
+        or last_event.get("status")
+        or last_event.get("event")
+        or progress.get("status")
+    )
     stage_rows = _stage_rows_from_csv(run_dir / "stage_summary.csv")
     stage_counts = progress.get("stage_counts", {}) if isinstance(progress, dict) else {}
-    active_stage = last_event.get("stage") if last_event.get("status") in ACTIVE_STATUSES else None
+    active_stage = (
+        stage_name
+        if last_status in ACTIVE_STATUSES
+        or last_status in {"start_stage", "start_item", "update_message"}
+        else None
+    )
     last_completed_stage = _last_completed_stage(stage_rows)
     warnings = read_jsonl_tail(run_dir / "warnings.jsonl", limit=5)
     failures = read_jsonl_tail(run_dir / "failures.jsonl", limit=5)
@@ -25,15 +43,37 @@ def run_status(run_dir: Path, *, log_tail_lines: int = 20) -> dict[str, Any]:
 
     return {
         "run_dir": str(run_dir),
-        "last_stage": last_event.get("stage"),
-        "last_status": last_event.get("status"),
+        "last_stage": stage_name,
+        "last_status": last_status,
         "last_completed_stage": last_completed_stage,
         "active_stage": active_stage,
-        "current_molecule": last_event.get("molecule_name"),
+        "current_molecule": (
+            progress.get("current_item_name")
+            or progress.get("current_item")
+            or last_event.get("molecule_name")
+        ),
         "current_molecule_index": last_event.get("molecule_index"),
-        "current_molecule_total": last_event.get("molecule_total"),
-        "last_completed_molecule": last_event.get("molecule_name"),
-        "active_command": last_event.get("active_command"),
+        "current_molecule_total": progress.get("total") or last_event.get("molecule_total"),
+        "last_completed_molecule": (
+            progress.get("current_item_name")
+            or progress.get("current_item")
+            or last_event.get("molecule_name")
+        ),
+        "active_command": (
+            progress.get("active_tool")
+            or last_event.get("active_tool")
+            or last_event.get("active_command")
+        ),
+        "completed": progress.get("completed"),
+        "succeeded": progress.get("succeeded"),
+        "failed": progress.get("failed"),
+        "skipped": progress.get("skipped"),
+        "running": progress.get("running"),
+        "waiting": progress.get("waiting"),
+        "total": progress.get("total"),
+        "elapsed_seconds": progress.get("elapsed_seconds"),
+        "last_update": progress.get("last_update") or last_event.get("timestamp"),
+        "progress_available": bool(progress),
         "disk_usage_mb": _directory_size_mb(run_dir),
         "xyz_file_count": _xyz_file_count(run_dir),
         "stage_counts": stage_counts or {row["stage"]: 1 for row in stage_rows if row.get("stage")},
