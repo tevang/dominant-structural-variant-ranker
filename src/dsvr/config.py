@@ -579,6 +579,17 @@ class DiskConfig(StrictModel):
         return value
 
 
+class ErrorHandlingConfig(StrictModel):
+    fail_fast: bool = False
+    keep_fallback_parent_state: bool = True
+    skip_failed_molecule: bool = True
+    skip_failed_variant: bool = True
+    retry_auto3d_cpu_on_gpu_failure: bool = True
+    retry_auto3d_smaller_batch_on_batch_failure: bool = True
+    reduce_tautomer_cap_on_timeout: bool = True
+    reduce_stereo_cap_on_timeout: bool = True
+
+
 class RunConfig(StrictModel):
     description: str | None = None
     workflow_mode: WorkflowMode = "ligprep_like"
@@ -610,6 +621,7 @@ class RunConfig(StrictModel):
     stereo_filtering: StereoFilteringConfig = Field(default_factory=StereoFilteringConfig)
     timeouts: TimeoutConfig = Field(default_factory=TimeoutConfig)
     disk: DiskConfig = Field(default_factory=DiskConfig)
+    error_handling: ErrorHandlingConfig = Field(default_factory=ErrorHandlingConfig)
 
     @field_validator("max_workers")
     @classmethod

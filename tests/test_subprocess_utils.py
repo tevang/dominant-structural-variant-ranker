@@ -36,6 +36,10 @@ def test_run_command_streams_logs_and_writes_metadata(
     metadata = json.loads((run_dirs[0] / "command.json").read_text(encoding="utf-8"))
     assert metadata["command"] == ["mock-tool", "--flag"]
     assert metadata["returncode"] == 0
+    assert metadata["return_code"] == 0
+    assert metadata["elapsed_time_seconds"] >= 0
+    assert metadata["stdout_log"].endswith("stdout.log")
+    assert metadata["stderr_log"].endswith("stderr.log")
     assert metadata["ended_at"] is not None
 
 

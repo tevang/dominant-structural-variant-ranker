@@ -71,6 +71,13 @@ from dsvr.runners.pyscf_runner import rescore_top_ranked_with_pyscf
 from dsvr.runners.xtb_runner import run_xtb_thermo
 from dsvr.utils.logging import configure_logging
 from dsvr.workflow.provenance import build_provenance, write_all_provenance_outputs
+from dsvr.workflow.recovery import (
+    FailureKind,
+    WorkflowRecoveryRecorder,
+    classify_failure,
+    safe_action_for_failure,
+    should_skip_item_state,
+)
 from dsvr.workflow.steps import (
     StepState,
     file_hash,
@@ -94,6 +101,7 @@ def run_workflow(config: RunConfig) -> WorkflowResult:
         terminal=config.logging.level.upper() != "ERROR",
         planned_stages=_progress_stage_names(config),
     )
+    recovery = WorkflowRecoveryRecorder(outdir)
     progress.record("Input validation", "started")
 
     if config.dry_run:
@@ -128,6 +136,13 @@ def run_workflow(config: RunConfig) -> WorkflowResult:
     )
     _ensure_invalid_inputs_csv(outdir / "invalid_inputs.csv")
     _write_input_table(outdir / "input" / "inputs.csv", molecules)
+    for molecule in molecules:
+        recovery.molecule(
+            item_id=molecule.input_id,
+            item_name=molecule.molname,
+            stage="Input validation",
+            status="completed",
+        )
     states.append(mark_done(steps["input"], input_hash, config, details={"count": len(molecules)}))
 
     if should_skip_step(steps["standardize"], records_hash(molecules), config):
@@ -157,20 +172,61 @@ def run_workflow(config: RunConfig) -> WorkflowResult:
         progress.record("Protomer generation", "skipped", generated_count=len(protomers))
     else:
         for index, molecule in enumerate(molecules, start=1):
-            existing = _load_existing_protomer_outputs(molecule, outdir, config)
-            if existing:
-                protomers.extend(existing)
-            elif not config.protonation.enabled:
-                warning = "protonation.enabled=false; retained input state only"
-                warnings.append(warning)
-                protomers.extend(_fallback_protomer(molecule, config, warning=warning))
-            else:
-                try:
+            if should_skip_item_state(
+                recovery,
+                molecule.input_id,
+                resume=config.resume,
+                stage="Protomer generation",
+            ):
+                progress.record(
+                    "Protomer generation",
+                    "running",
+                    molecule_index=index,
+                    molecule_total=len(molecules),
+                    molecule_name=molecule.molname,
+                    generated_count=len(protomers),
+                    skipped_count=1,
+                    message="Skipped previously checkpointed molecule.",
+                )
+                continue
+            try:
+                existing = _load_existing_protomer_outputs(molecule, outdir, config)
+                if existing:
+                    protomers.extend(existing)
+                elif not config.protonation.enabled:
+                    warning = "protonation.enabled=false; retained input state only"
+                    warnings.append(warning)
+                    protomers.extend(_fallback_protomer(molecule, config, warning=warning))
+                else:
                     protomers.extend(generate_protomer_candidates(molecule, config))
-                except MolscrubUnavailableError as exc:
-                    raise MolscrubUnavailableError(
-                        f"{exc} Set protonation.enabled=false to retain input states without molscrub."
-                    ) from exc
+                recovery.molecule(
+                    item_id=molecule.input_id,
+                    item_name=molecule.molname,
+                    stage="Protomer generation",
+                    status="completed",
+                )
+            except MolscrubUnavailableError as exc:
+                _record_item_failure(
+                    recovery,
+                    progress,
+                    config,
+                    stage="Protomer generation",
+                    item_id=molecule.input_id,
+                    item_name=molecule.molname,
+                    exc=exc,
+                )
+                if config.error_handling.keep_fallback_parent_state:
+                    warning = f"Protomer generation failed; retained input state fallback: {exc}"
+                    warnings.append(warning)
+                    protomers.extend(_fallback_protomer(molecule, config, warning=warning))
+                else:
+                    recovery.molecule(
+                        item_id=molecule.input_id,
+                        item_name=molecule.molname,
+                        stage="Protomer generation",
+                        status="skipped",
+                        message=str(exc),
+                    )
             progress.record(
                 "Protomer generation",
                 "running",
@@ -219,10 +275,115 @@ def run_workflow(config: RunConfig) -> WorkflowResult:
                 missing_protomers.append(protomer)
         if missing_protomers:
             if config.workflow_mode == "ligprep_like" and config.tautomer_filtering.enabled:
-                tautomers.extend(filter_tautomers_with_auto3d(missing_protomers, config))
+                try:
+                    tautomers.extend(filter_tautomers_with_auto3d(missing_protomers, config))
+                    for protomer in missing_protomers:
+                        recovery.molecule(
+                            item_id=protomer.id,
+                            item_name=protomer.molname,
+                            stage="Tautomer enumeration",
+                            status="completed",
+                        )
+                except Exception as exc:
+                    _record_item_failure(
+                        recovery,
+                        progress,
+                        config,
+                        stage="Tautomer enumeration",
+                        item_id=None,
+                        item_name=None,
+                        exc=exc,
+                    )
+                    for protomer in missing_protomers:
+                        if should_skip_item_state(
+                            recovery,
+                            protomer.id,
+                            resume=config.resume,
+                            stage="Tautomer enumeration",
+                        ):
+                            continue
+                        try:
+                            tautomers.extend(enumerate_tautomers(protomer, config))
+                            recovery.molecule(
+                                item_id=protomer.id,
+                                item_name=protomer.molname,
+                                stage="Tautomer enumeration",
+                                status="completed",
+                            )
+                        except Exception as item_exc:
+                            kind = classify_failure(item_exc, stage="Tautomer enumeration")
+                            retry_config = _retry_reduced_enumeration_config(config, kind)
+                            try:
+                                tautomers.extend(enumerate_tautomers(protomer, retry_config))
+                                recovery.molecule(
+                                    item_id=protomer.id,
+                                    item_name=protomer.molname,
+                                    stage="Tautomer enumeration",
+                                    status="completed",
+                                    action=safe_action_for_failure(
+                                        kind,
+                                        stage="Tautomer enumeration",
+                                    ),
+                                    message=(
+                                        f"Recovered after {kind.value} with "
+                                        "reduced caps/timeouts."
+                                    ),
+                                )
+                            except Exception as retry_exc:
+                                _record_item_failure(
+                                    recovery,
+                                    progress,
+                                    config,
+                                    stage="Tautomer enumeration",
+                                    item_id=protomer.id,
+                                    item_name=protomer.molname,
+                                    exc=retry_exc,
+                                )
             else:
                 for protomer in missing_protomers:
-                    tautomers.extend(enumerate_tautomers(protomer, config))
+                    if should_skip_item_state(
+                        recovery,
+                        protomer.id,
+                        resume=config.resume,
+                        stage="Tautomer enumeration",
+                    ):
+                        continue
+                    try:
+                        tautomers.extend(enumerate_tautomers(protomer, config))
+                        recovery.molecule(
+                            item_id=protomer.id,
+                            item_name=protomer.molname,
+                            stage="Tautomer enumeration",
+                            status="completed",
+                        )
+                    except Exception as exc:
+                        kind = classify_failure(exc, stage="Tautomer enumeration")
+                        retry_config = _retry_reduced_enumeration_config(config, kind)
+                        try:
+                            tautomers.extend(enumerate_tautomers(protomer, retry_config))
+                            recovery.molecule(
+                                item_id=protomer.id,
+                                item_name=protomer.molname,
+                                stage="Tautomer enumeration",
+                                status="completed",
+                                action=safe_action_for_failure(
+                                    kind,
+                                    stage="Tautomer enumeration",
+                                ),
+                                message=(
+                                    f"Recovered after {kind.value} with reduced caps/timeouts."
+                                ),
+                            )
+                        except Exception as retry_exc:
+                            _record_item_failure(
+                                recovery,
+                                progress,
+                                config,
+                                stage="Tautomer enumeration",
+                                item_id=protomer.id,
+                                item_name=protomer.molname,
+                                exc=retry_exc,
+                            )
         states.append(
             mark_done(
                 steps["tautomers"],
@@ -243,6 +404,7 @@ def run_workflow(config: RunConfig) -> WorkflowResult:
         states,
         lambda item: enumerate_stereoisomers(item, config),
         resume_loader=lambda: _load_stereos(outdir),
+        retry_fn=lambda item, retry_config: enumerate_stereoisomers(item, retry_config),
         existing_loader=lambda item: _load_existing_stereo_outputs(item, outdir, config),
         progress=progress,
         progress_stage="Stereoisomer enumeration",
@@ -322,7 +484,13 @@ def run_workflow(config: RunConfig) -> WorkflowResult:
                     message="Running Auto3D batch seeding.",
                     active_command="Auto3D",
                 )
-                seeds.extend(generate_auto3d_seeds(stereos_for_seeding, seed_config))
+                seeds.extend(
+                    _generate_auto3d_seeds_with_retries(
+                        stereos_for_seeding,
+                        seed_config,
+                        progress,
+                    )
+                )
             except (Auto3DExecutionError, Auto3DUnavailableError) as exc:
                 warnings.append(str(exc))
                 if config.seeding.method == "auto3d":
@@ -597,6 +765,63 @@ def _record_progress_warnings(
         seen.add(warning)
         progress.warning(stage, warning)
 
+
+
+def _record_item_failure(
+    recovery: WorkflowRecoveryRecorder,
+    progress: ProgressRecorder | None,
+    config: RunConfig,
+    *,
+    stage: str,
+    item_id: str | None,
+    item_name: str | None,
+    exc: BaseException,
+) -> None:
+    kind = classify_failure(exc, stage=stage)
+    action = safe_action_for_failure(kind, stage=stage)
+    recovery.failure(stage=stage, item_id=item_id, item_name=item_name, exc=exc, action=action)
+    if progress is not None:
+        progress.failure(stage, f"{kind.value}: {exc}")
+    if config.error_handling.fail_fast:
+        raise exc
+    molecule_failure = kind in {
+        FailureKind.INPUT_ERROR,
+        FailureKind.PROTOMER_GENERATION_ERROR,
+        FailureKind.DISK_LIMIT,
+    }
+    if molecule_failure and not config.error_handling.skip_failed_molecule:
+        raise exc
+    if not molecule_failure and not config.error_handling.skip_failed_variant:
+        raise exc
+
+
+def _retry_reduced_enumeration_config(config: RunConfig, kind: FailureKind) -> RunConfig:
+    data = config.model_dump(mode="python")
+    if (
+        kind == FailureKind.TAUTOMER_TIMEOUT
+        and config.error_handling.reduce_tautomer_cap_on_timeout
+    ):
+        data["enumeration"]["max_tautomers_per_protomer"] = max(
+            1,
+            config.enumeration.max_tautomers_per_protomer // 2,
+        )
+        data["enumeration"]["tautomer_timeout_seconds"] = max(
+            1,
+            config.enumeration.tautomer_timeout_seconds // 2,
+        )
+    if (
+        kind == FailureKind.STEREO_TIMEOUT
+        and config.error_handling.reduce_stereo_cap_on_timeout
+    ):
+        data["enumeration"]["max_stereoisomers_per_tautomer"] = max(
+            1,
+            config.enumeration.max_stereoisomers_per_tautomer // 2,
+        )
+        data["stereoisomer_filtering"]["timeout_seconds_per_tautomer"] = max(
+            1,
+            config.stereoisomer_filtering.timeout_seconds_per_tautomer // 2,
+        )
+    return RunConfig.model_validate(data)
 
 
 def run_smoke_workflow(config: RunConfig) -> WorkflowResult:
@@ -1342,13 +1567,17 @@ def _run_step_list(
     fn,
     resume_loader=None,
     existing_loader: Callable[[Any], list[Any]] | None = None,
+    retry_fn: Callable[[Any, RunConfig], list[Any]] | None = None,
     progress: ProgressRecorder | None = None,
     progress_stage: str | None = None,
 ) -> list[Any]:
     step = {item.name: item for item in planned_steps(config)}[step_name]
+    stage = progress_stage or step.description
+    recovery = WorkflowRecoveryRecorder(config.output_dir)
     input_hash = records_hash(inputs)
     if should_skip_step(step, input_hash, config):
         states.append(skipped_state(step, input_hash, config))
+        recovery.stage(stage, "skipped")
         if resume_loader is not None:
             loaded = resume_loader()
             if progress is not None and progress_stage is not None:
@@ -1359,22 +1588,157 @@ def _run_step_list(
         return []
     outputs = []
     for index, item in enumerate(inputs, start=1):
-        existing = existing_loader(item) if existing_loader is not None else []
-        if existing:
-            outputs.extend(existing)
-        else:
-            outputs.extend(fn(item))
+        item_id = getattr(item, "id", None) or getattr(item, "input_id", None) or str(index)
+        item_name = getattr(item, "molname", None) or str(item_id)
+        if should_skip_item_state(recovery, str(item_id), resume=config.resume, stage=stage):
+            if progress is not None and progress_stage is not None:
+                progress.record(
+                    progress_stage,
+                    "running",
+                    molecule_index=index,
+                    molecule_total=len(inputs),
+                    molecule_name=item_name,
+                    generated_count=len(outputs),
+                    skipped_count=1,
+                    message="Skipped previously checkpointed item.",
+                )
+            continue
+        try:
+            existing = existing_loader(item) if existing_loader is not None else []
+            if existing:
+                outputs.extend(existing)
+            else:
+                outputs.extend(fn(item))
+            recovery.molecule(
+                item_id=str(item_id),
+                item_name=item_name,
+                stage=stage,
+                status="completed",
+            )
+        except Exception as exc:
+            kind = classify_failure(exc, stage=stage)
+            if (
+                kind in {FailureKind.TAUTOMER_TIMEOUT, FailureKind.STEREO_TIMEOUT}
+                and retry_fn is not None
+            ):
+                try:
+                    outputs.extend(
+                        retry_fn(item, _retry_reduced_enumeration_config(config, kind))
+                    )
+                    recovery.molecule(
+                        item_id=str(item_id),
+                        item_name=item_name,
+                        stage=stage,
+                        status="completed",
+                        action=safe_action_for_failure(kind, stage=stage),
+                        message=f"Recovered after {kind.value} with reduced caps/timeouts.",
+                    )
+                except Exception as retry_exc:
+                    _record_item_failure(
+                        recovery,
+                        progress,
+                        config,
+                        stage=stage,
+                        item_id=str(item_id),
+                        item_name=item_name,
+                        exc=retry_exc,
+                    )
+            else:
+                _record_item_failure(
+                    recovery,
+                    progress,
+                    config,
+                    stage=stage,
+                    item_id=str(item_id),
+                    item_name=item_name,
+                    exc=exc,
+                )
         if progress is not None and progress_stage is not None:
             progress.record(
                 progress_stage,
                 "running",
                 molecule_index=index,
                 molecule_total=len(inputs),
-                molecule_name=getattr(item, "molname", None),
+                molecule_name=item_name,
                 generated_count=len(outputs),
             )
     states.append(mark_done(step, input_hash, config, details={"count": len(outputs)}))
     return outputs
+
+
+def _generate_auto3d_seeds_with_retries(
+    stereos: list[AnyLineageRecord],
+    config: RunConfig,
+    progress: ProgressRecorder | None = None,
+) -> list[SeedConformerRecord]:
+    recovery = WorkflowRecoveryRecorder(config.output_dir)
+    try:
+        seeds = generate_auto3d_seeds(stereos, config)
+        for stereo in stereos:
+            recovery.molecule(
+                item_id=stereo.id,
+                item_name=stereo.molname,
+                stage="3D seeding",
+                status="completed",
+            )
+        return seeds
+    except (Auto3DExecutionError, Auto3DUnavailableError) as exc:
+        if config.seeding.auto3d_use_gpu and config.error_handling.retry_auto3d_cpu_on_gpu_failure:
+            retry_data = config.model_dump(mode="python")
+            retry_data["seeding"]["auto3d_use_gpu"] = False
+            retry_config = RunConfig.model_validate(retry_data)
+            try:
+                seeds = generate_auto3d_seeds(stereos, retry_config)
+                for stereo in stereos:
+                    recovery.molecule(
+                        item_id=stereo.id,
+                        item_name=stereo.molname,
+                        stage="3D seeding",
+                        status="completed",
+                        action="retry_auto3d_cpu_after_gpu_failure",
+                        message=str(exc),
+                    )
+                return seeds
+            except (Auto3DExecutionError, Auto3DUnavailableError) as cpu_exc:
+                exc = cpu_exc
+        if (
+            config.error_handling.retry_auto3d_smaller_batch_on_batch_failure
+            and len(stereos) > 1
+        ):
+            recovered: list[SeedConformerRecord] = []
+            for index, stereo in enumerate(stereos, start=1):
+                try:
+                    recovered.extend(generate_auto3d_seeds([stereo], config))
+                    recovery.molecule(
+                        item_id=stereo.id,
+                        item_name=stereo.molname,
+                        stage="3D seeding",
+                        status="completed",
+                        action="retry_auto3d_smaller_batch_after_batch_failure",
+                    )
+                except (Auto3DExecutionError, Auto3DUnavailableError) as item_exc:
+                    _record_item_failure(
+                        recovery,
+                        progress,
+                        config,
+                        stage="3D seeding",
+                        item_id=stereo.id,
+                        item_name=stereo.molname,
+                        exc=item_exc,
+                    )
+                if progress is not None:
+                    progress.record(
+                        "3D seeding",
+                        "running",
+                        molecule_index=index,
+                        molecule_total=len(stereos),
+                        molecule_name=stereo.molname,
+                        generated_count=len(recovered),
+                        active_command="Auto3D",
+                    )
+            if recovered:
+                return recovered
+        raise exc
 
 
 def _config_for_seed_budget(config: RunConfig) -> RunConfig:

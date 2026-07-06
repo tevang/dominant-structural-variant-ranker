@@ -20,6 +20,8 @@ def run_status(run_dir: Path, *, log_tail_lines: int = 20) -> dict[str, Any]:
     last_completed_stage = _last_completed_stage(stage_rows)
     warnings = read_jsonl_tail(run_dir / "warnings.jsonl", limit=5)
     failures = read_jsonl_tail(run_dir / "failures.jsonl", limit=5)
+    recovery_failures = read_jsonl_tail(run_dir / "checkpoints" / "failures.jsonl", limit=5)
+    molecule_states = _molecule_state_rows(run_dir / "checkpoints" / "molecules")
 
     return {
         "run_dir": str(run_dir),
@@ -38,8 +40,19 @@ def run_status(run_dir: Path, *, log_tail_lines: int = 20) -> dict[str, Any]:
         "counts_by_stage": stage_rows,
         "latest_warnings": warnings,
         "latest_failures": failures,
-        "warning_count": progress.get("warning_count", len(warnings)) if isinstance(progress, dict) else len(warnings),
-        "failure_count": progress.get("failure_count", len(failures)) if isinstance(progress, dict) else len(failures),
+        "latest_recovery_failures": recovery_failures,
+        "molecule_state_count": len(molecule_states),
+        "molecule_states": molecule_states[-10:],
+        "warning_count": (
+            progress.get("warning_count", len(warnings))
+            if isinstance(progress, dict)
+            else len(warnings)
+        ),
+        "failure_count": (
+            progress.get("failure_count", len(failures))
+            if isinstance(progress, dict)
+            else len(failures)
+        ),
         "resume_possible": _resume_possible(run_dir, last_event),
         "latest_log_tail": _latest_log_tail(run_dir, log_tail_lines),
     }
@@ -72,6 +85,18 @@ def _resume_possible(run_dir: Path, last_event: dict[str, Any]) -> bool:
     if last_event.get("stage") == "Report writing" and last_event.get("status") == "completed":
         return False
     return (run_dir / "resolved_config.yaml").exists() or any(run_dir.glob("**/done.json"))
+
+
+def _molecule_state_rows(path: Path) -> list[dict[str, Any]]:
+    if not path.exists():
+        return []
+    rows: list[dict[str, Any]] = []
+    for item in sorted(path.glob("*.json")):
+        try:
+            rows.append(json.loads(item.read_text(encoding="utf-8")))
+        except json.JSONDecodeError:
+            continue
+    return rows
 
 
 def _latest_log_tail(run_dir: Path, lines: int) -> str:

@@ -9,6 +9,8 @@ from typing import Any
 
 from rich.console import Console
 
+from dsvr.workflow.recovery import WorkflowRecoveryRecorder
+
 
 @dataclass(frozen=True)
 class ProgressEvent:
@@ -56,6 +58,7 @@ class ProgressRecorder:
         self.warnings_jsonl = run_dir / "warnings.jsonl"
         self.failures_jsonl = run_dir / "failures.jsonl"
         self.terminal = terminal
+        self.recovery = WorkflowRecoveryRecorder(run_dir)
         self.console = Console(stderr=True)
         self.planned_stages = planned_stages or []
         self._header_printed = False
@@ -98,6 +101,8 @@ class ProgressRecorder:
             xyz_file_count=_xyz_file_count(self.run_dir),
         )
         self.events.append(event)
+        if status in {"started", "completed", "failed", "skipped"}:
+            self.recovery.stage(stage, status, message=message, details=asdict(event))
         self._write(event)
         if self.terminal:
             self._print_terminal_event(event)

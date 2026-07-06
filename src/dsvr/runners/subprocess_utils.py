@@ -108,8 +108,12 @@ def run_command(
             {
                 "ended_at": ended.isoformat(),
                 "duration_seconds": time.monotonic() - started_monotonic,
+                "elapsed_time_seconds": time.monotonic() - started_monotonic,
                 "launch_error": f"{type(exc).__name__}: {exc}",
                 "returncode": None,
+                "return_code": None,
+                "stdout_log": str(stdout_path),
+                "stderr_log": str(stderr_path),
             }
         )
         _write_metadata(metadata_path, metadata)
@@ -179,9 +183,13 @@ def run_command(
         {
             "ended_at": ended.isoformat(),
             "duration_seconds": duration,
+            "elapsed_time_seconds": duration,
             "returncode": returncode,
+            "return_code": returncode,
             "timed_out": timed_out,
             "failure_markers": summary.failure_markers,
+            "stdout_log": str(stdout_path),
+            "stderr_log": str(stderr_path),
         }
     )
     _write_metadata(metadata_path, metadata)

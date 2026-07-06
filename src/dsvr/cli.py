@@ -289,6 +289,9 @@ def status_command(
 
     _print_diagnostics("Latest warnings", status.get("latest_warnings", []))
     _print_diagnostics("Latest failures", status.get("latest_failures", []))
+    _print_diagnostics("Latest recovery failures", status.get("latest_recovery_failures", []))
+    if status.get("molecule_state_count"):
+        console.print(f"Molecule state files: {status.get('molecule_state_count')}")
     if status.get("latest_log_tail"):
         console.print("Latest log tail:")
         console.print(str(status["latest_log_tail"]))
@@ -311,6 +314,28 @@ def _print_diagnostics(title: str, rows: list[dict[str, Any]]) -> None:
         stage = row.get("stage", "")
         message = row.get("message", "")
         console.print(f"- {stage}: {message}" if stage else f"- {message}")
+
+
+@app.command(name="resume")
+def resume_command(
+    run_dir: Annotated[Path, typer.Argument(exists=True, file_okay=False)],
+) -> None:
+    """Resume a deterministic DSVR workflow run from its run directory."""
+    resolved_config = run_dir / "resolved_config.yaml"
+    if not resolved_config.exists():
+        raise typer.BadParameter(
+            f"{run_dir} does not contain resolved_config.yaml. Cannot resume deterministically."
+        )
+    config = load_config(resolved_config)
+    data = config.model_dump(mode="python")
+    data["output_dir"] = run_dir
+    data["resume"] = True
+    data["overwrite"] = False
+    data["dry_run"] = False
+    config = RunConfig.model_validate(data)
+    result = run_workflow(config=config)
+    console.print(f"Resumed workflow outputs in [bold]{result.outdir}[/bold]")
+    console.print(f"Molecules: {result.molecule_count}")
 
 
 @app.command(name="validate-input")
