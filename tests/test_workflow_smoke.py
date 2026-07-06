@@ -31,6 +31,12 @@ def test_workflow_smoke_writes_outputs(tmp_path: Path) -> None:
     assert (outdir / "filtering" / "accepted_variants.csv").exists()
     assert (outdir / "filtering" / "rejected_variants.csv").exists()
     assert (outdir / "filtering" / "penalty_breakdown.jsonl").exists()
+    assert (outdir / "progress.jsonl").exists()
+    assert (outdir / "stage_summary.csv").exists()
+    assert (outdir / "variant_counts.csv").exists()
+    assert (outdir / "warnings.jsonl").exists()
+    assert (outdir / "failures.jsonl").exists()
+    assert "Stage Progress Summary" in (outdir / "report.md").read_text(encoding="utf-8")
     assert not (outdir / "seeding" / "rdkit" / "xyz").exists()
 
 

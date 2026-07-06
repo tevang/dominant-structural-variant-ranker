@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import csv
 import html
 from collections import Counter
 from pathlib import Path
@@ -92,6 +93,7 @@ def _report_text(
     stereo_energy = manifest.get("filtering", {}).get("stereo_energy_filtering", {})
     stereo_reduction = manifest.get("filtering", {}).get("stereo_reduction", {})
     xtb_prefilter = manifest.get("filtering", {}).get("xtb_prefilter", {})
+    stage_summary_rows = _stage_summary_rows(config.output_dir / "stage_summary.csv")
     lines = [
         "# DSVR Run Report",
         "",
@@ -183,6 +185,12 @@ def _report_text(
         ),
         *[f"- {warning}" for warning in warnings],
         "",
+        "## Stage Progress Summary",
+        "",
+        "| Stage | Status | Generated | Selected | Rejected | Timeouts | Elapsed s |",
+        "| --- | --- | ---: | ---: | ---: | ---: | ---: |",
+        *(stage_summary_rows or ["| none | none | 0 | 0 | 0 | 0 | 0 |"]),
+        "",
         "## Tautomer Timeout Counts",
         "",
         "| Input ID | Molecule | Timeout fallback count |",
@@ -231,6 +239,34 @@ def _report_text(
         "",
     ]
     return "\n".join(lines)
+
+
+def _stage_summary_rows(path: Path) -> list[str]:
+    if not path.exists():
+        return []
+    rows = []
+    with path.open(encoding="utf-8", newline="") as handle:
+        for row in csv.DictReader(handle):
+            rows.append(
+                "| {stage} | {status} | {generated} | {selected} | {rejected} | "
+                "{timeouts} | {elapsed} |".format(
+                    stage=row.get("stage", ""),
+                    status=row.get("status", ""),
+                    generated=row.get("generated_count", "0") or "0",
+                    selected=row.get("selected_count") or row.get("accepted_count") or "0",
+                    rejected=row.get("rejected_count", "0") or "0",
+                    timeouts=row.get("timeout_count", "0") or "0",
+                    elapsed=_format_report_seconds(row.get("elapsed_seconds", "0")),
+                )
+            )
+    return rows
+
+
+def _format_report_seconds(value: str) -> str:
+    try:
+        return f"{float(value):.1f}"
+    except (TypeError, ValueError):
+        return "0.0"
 
 
 def _tautomer_timeout_rows(records: list[AnyLineageRecord]) -> list[str]:

@@ -251,22 +251,66 @@ def status_command(
     table = Table(title=f"DSVR status: {run_dir}")
     table.add_column("Field")
     table.add_column("Value")
-    for key in (
-        "last_stage",
-        "last_status",
-        "last_completed_molecule",
-        "active_command",
-        "disk_usage_mb",
-        "xyz_file_count",
+    current = _format_current_molecule(status)
+    for key, value in (
+        ("last_completed_stage", status.get("last_completed_stage")),
+        ("active_stage", status.get("active_stage")),
+        ("last_stage", status.get("last_stage")),
+        ("last_status", status.get("last_status")),
+        ("current_molecule", current),
+        ("active_command", status.get("active_command")),
+        ("disk_usage_mb", f"{float(status.get('disk_usage_mb', 0.0)):.2f}"),
+        ("xyz_file_count", status.get("xyz_file_count")),
+        ("resume_possible", status.get("resume_possible")),
     ):
-        table.add_row(key, str(status.get(key, "")))
+        table.add_row(key, "" if value is None else str(value))
     console.print(table)
-    console.print("Stage counts:")
-    for stage, count in dict(status.get("stage_counts", {})).items():
-        console.print(f"- {stage}: {count}")
+
+    rows = list(status.get("counts_by_stage", []))
+    if rows:
+        counts = Table(title="Counts by stage")
+        columns = [
+            "stage",
+            "status",
+            "generated_count",
+            "selected_count",
+            "rejected_count",
+            "timeout_count",
+        ]
+        for column in columns:
+            counts.add_column(column)
+        for row in rows:
+            counts.add_row(*(str(row.get(column, "")) for column in columns))
+        console.print(counts)
+    else:
+        console.print("Stage counts:")
+        for stage, count in dict(status.get("stage_counts", {})).items():
+            console.print(f"- {stage}: {count}")
+
+    _print_diagnostics("Latest warnings", status.get("latest_warnings", []))
+    _print_diagnostics("Latest failures", status.get("latest_failures", []))
     if status.get("latest_log_tail"):
         console.print("Latest log tail:")
         console.print(str(status["latest_log_tail"]))
+
+
+def _format_current_molecule(status: dict[str, Any]) -> str:
+    name = status.get("current_molecule") or ""
+    index = status.get("current_molecule_index")
+    total = status.get("current_molecule_total")
+    if index is not None and total is not None:
+        return f"{index}/{total} {name}".strip()
+    return str(name)
+
+
+def _print_diagnostics(title: str, rows: list[dict[str, Any]]) -> None:
+    if not rows:
+        return
+    console.print(f"{title}:")
+    for row in rows:
+        stage = row.get("stage", "")
+        message = row.get("message", "")
+        console.print(f"- {stage}: {message}" if stage else f"- {message}")
 
 
 @app.command(name="validate-input")

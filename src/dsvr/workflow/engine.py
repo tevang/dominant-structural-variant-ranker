@@ -320,6 +320,7 @@ def run_workflow(config: RunConfig) -> WorkflowResult:
                     "running",
                     generated_count=len(stereos_for_seeding),
                     message="Running Auto3D batch seeding.",
+                    active_command="Auto3D",
                 )
                 seeds.extend(generate_auto3d_seeds(stereos_for_seeding, seed_config))
             except (Auto3DExecutionError, Auto3DUnavailableError) as exc:
@@ -500,7 +501,7 @@ def run_workflow(config: RunConfig) -> WorkflowResult:
     )
     progress.record("QM rescoring", "completed", generated_count=len(qm_records))
 
-    progress.record("Final reporting", "started", generated_count=len(ranked))
+    progress.record("Report writing", "started", generated_count=len(ranked))
     write_all_provenance_outputs(records, outdir)
     write_audit_tables(
         outdir,
@@ -575,12 +576,27 @@ def run_workflow(config: RunConfig) -> WorkflowResult:
     write_ranked_csv(outdir / "ranked.csv", legacy_records)
     write_json(outdir / "provenance.json", build_provenance(config.input_path, config, molecules))
     _publish_top_level_run_outputs(outdir)
-    progress.record("Final reporting", "completed", generated_count=len(ranked))
+    _record_progress_warnings(progress, warnings, "Report writing")
+    progress.record("Report writing", "completed", generated_count=len(ranked))
     return WorkflowResult(
         outdir=outdir,
         molecule_count=len(molecules),
         ranked_records=legacy_records,
     )
+
+
+def _record_progress_warnings(
+    progress: ProgressRecorder,
+    warnings: list[str],
+    stage: str,
+) -> None:
+    seen: set[str] = set()
+    for warning in warnings:
+        if warning in seen:
+            continue
+        seen.add(warning)
+        progress.warning(stage, warning)
+
 
 
 def run_smoke_workflow(config: RunConfig) -> WorkflowResult:
@@ -611,7 +627,7 @@ def _run_final_auto3d_default_path(
     outdir = config.output_dir
     steps = {step.name: step for step in planned_steps(config)}
 
-    progress.record("Final 3D generation", "started", generated_count=len(stereos_for_seeding))
+    progress.record("Final Auto3D 3D generation", "started", generated_count=len(stereos_for_seeding))
     final_result = generate_final_3d_variants(stereos_for_seeding, config)
     warnings.extend(final_result.warnings)
     final_records = final_result.records
@@ -631,7 +647,7 @@ def _run_final_auto3d_default_path(
     records.extend(final_records)
     _write_stage_summary_sdf(outdir / "all_3d_conformers.sdf", final_records)
     progress.record(
-        "Final 3D generation",
+        "Final Auto3D 3D generation",
         "completed",
         generated_count=len(final_records),
         accepted_count=len(final_records),
@@ -717,7 +733,7 @@ def _run_final_auto3d_default_path(
         )
     )
 
-    progress.record("Final reporting", "started", generated_count=len(ranked))
+    progress.record("Report writing", "started", generated_count=len(ranked))
     write_all_provenance_outputs(records, outdir)
     write_audit_tables(
         outdir,
@@ -808,7 +824,8 @@ def _run_final_auto3d_default_path(
     write_ranked_csv(outdir / "ranked.csv", legacy_records)
     write_json(outdir / "provenance.json", build_provenance(config.input_path, config, molecules))
     _publish_top_level_run_outputs(outdir)
-    progress.record("Final reporting", "completed", generated_count=len(ranked))
+    _record_progress_warnings(progress, warnings, "Report writing")
+    progress.record("Report writing", "completed", generated_count=len(ranked))
     return WorkflowResult(
         outdir=outdir,
         molecule_count=len(molecules),
@@ -825,7 +842,7 @@ def _progress_stage_names(config: RunConfig) -> list[str]:
             "Auto3D representative generation",
             "Representative plausibility scoring",
             "Ranking",
-            "Final reporting",
+            "Report writing",
         ]
     if _use_final_auto3d_default_path(config):
         stages = [
@@ -835,12 +852,12 @@ def _progress_stage_names(config: RunConfig) -> list[str]:
             "Tautomer enumeration",
             "Stereoisomer enumeration",
             "Cheap variant scoring",
-            "Final 3D generation",
+            "Final Auto3D 3D generation",
             "Ranking",
         ]
         if config.optional_validation.crest_xtb_enabled or config.optional_validation.xtb_thermo_enabled:
             stages.append("Optional validation")
-        stages.append("Final reporting")
+        stages.append("Report writing")
         return stages
     return [
         "Input validation",
@@ -857,7 +874,7 @@ def _progress_stage_names(config: RunConfig) -> list[str]:
         "Ranking",
         "CENSO",
         "QM rescoring",
-        "Final reporting",
+        "Report writing",
     ]
 
 
@@ -986,7 +1003,7 @@ def _run_auto3d_entropy_protocol(
         )
     )
 
-    progress.record("Final reporting", "started", generated_count=len(ranked))
+    progress.record("Report writing", "started", generated_count=len(ranked))
     write_all_provenance_outputs(records, outdir)
     write_audit_tables(outdir, records, [], [], empty_stereo_reduction)
     write_final_ranked_outputs(outdir, ranked, config)
@@ -1053,7 +1070,8 @@ def _run_auto3d_entropy_protocol(
     write_ranked_csv(outdir / "ranked.csv", legacy_records)
     write_json(outdir / "provenance.json", build_provenance(config.input_path, config, molecules))
     _publish_top_level_run_outputs(outdir)
-    progress.record("Final reporting", "completed", generated_count=len(ranked))
+    _record_progress_warnings(progress, warnings, "Report writing")
+    progress.record("Report writing", "completed", generated_count=len(ranked))
     return WorkflowResult(
         outdir=outdir,
         molecule_count=len(molecules),
@@ -1503,6 +1521,7 @@ def _run_optional_crest_validation(
                 molecule_total=len(selected),
                 molecule_name=record.molname,
                 generated_count=len(crest_records),
+                active_command="crest/xtb",
             )
     elif selected:
         message = "Optional CREST/xTB validation requested but CREST/xTB is unavailable."
@@ -1792,6 +1811,7 @@ def _run_crest_or_seed_ranking(
                     molecule_total=len(seeds),
                     molecule_name=seed.molname,
                     generated_count=len(records),
+                    active_command="crest/xtb",
                 )
     else:
         if config.crest.enabled:
