@@ -44,11 +44,21 @@ def generate_molscrub_candidates(
     *,
     ph_low: float,
     ph_high: float,
+    skip_gen3d: bool = True,
+    timeout_seconds: int = 60,
 ) -> tuple[list[Chem.Mol], str, str]:
     try:
-        return generate_molscrub_candidates_python(molecule, ph_low=ph_low, ph_high=ph_high)
+        return generate_molscrub_candidates_python(
+            molecule, ph_low=ph_low, ph_high=ph_high, skip_gen3d=skip_gen3d
+        )
     except MolscrubUnavailableError:
-        return generate_molscrub_candidates_cli(molecule, ph_low=ph_low, ph_high=ph_high)
+        return generate_molscrub_candidates_cli(
+            molecule,
+            ph_low=ph_low,
+            ph_high=ph_high,
+            skip_gen3d=skip_gen3d,
+            timeout_seconds=timeout_seconds,
+        )
 
 
 def generate_molscrub_candidates_python(
@@ -56,6 +66,7 @@ def generate_molscrub_candidates_python(
     *,
     ph_low: float,
     ph_high: float,
+    skip_gen3d: bool = True,
 ) -> tuple[list[Chem.Mol], str, str]:
     try:
         from molscrub import Scrub  # type: ignore[import-not-found]
@@ -65,9 +76,9 @@ def generate_molscrub_candidates_python(
     kwargs: dict[str, Any] = {"ph_low": ph_low, "ph_high": ph_high}
     signature = inspect.signature(Scrub)
     if "skip_gen3d" in signature.parameters:
-        kwargs["skip_gen3d"] = True
+        kwargs["skip_gen3d"] = skip_gen3d
     if "skip_gen3d" not in signature.parameters and "gen3d" in signature.parameters:
-        kwargs["gen3d"] = False
+        kwargs["gen3d"] = not skip_gen3d
 
     try:
         scrubber = Scrub(**kwargs)
@@ -83,6 +94,8 @@ def generate_molscrub_candidates_cli(
     *,
     ph_low: float,
     ph_high: float,
+    skip_gen3d: bool = True,
+    timeout_seconds: int = 60,
 ) -> tuple[list[Chem.Mol], str, str]:
     executable = shutil.which("scrub.py") or shutil.which("molscrub")
     if executable is None:
@@ -104,11 +117,11 @@ def generate_molscrub_candidates_cli(
             "--ph",
             str(ph_low if ph_low == ph_high else (ph_low + ph_high) / 2.0),
         ]
-        if _cli_help_mentions(executable, "--skip_gen3d"):
+        if skip_gen3d and _cli_help_mentions(executable, "--skip_gen3d"):
             command.append("--skip_gen3d")
         completed = run_command(
             command,
-            timeout_s=300,
+            timeout_s=timeout_seconds,
             command_name="molscrub",
             check=False,
         )

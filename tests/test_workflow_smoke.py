@@ -15,7 +15,7 @@ def test_workflow_smoke_writes_outputs(tmp_path: Path) -> None:
     input_path.write_text("CCO ethanol\n", encoding="utf-8")
     outdir = tmp_path / "run"
 
-    result = run_smoke_workflow(config=RunConfig(input_path=input_path, output_dir=outdir))
+    result = run_smoke_workflow(config=RunConfig(input_path=input_path, output_dir=outdir, protonation={"enabled": False}))
 
     assert result.molecule_count == 1
     assert (outdir / "ranked.csv").exists()
@@ -102,6 +102,7 @@ def test_workflow_auto3d_entropy_protocol_with_mocked_auto3d(
             protocol="auto3d_entropy",
             input_path=input_path,
             output_dir=outdir,
+            protonation={"enabled": False},
             enumeration={"max_protomers_per_molecule": 1},
             seeding={"method": "auto3d", "auto3d_k": 2, "auto3d_model": "ANI2xt"},
             crest={"enabled": False},
@@ -147,6 +148,7 @@ def test_workflow_tautomer_timeout_does_not_crash(tmp_path: Path, monkeypatch) -
         RunConfig(
             input_path=input_path,
             output_dir=outdir,
+            protonation={"enabled": False},
             enumeration={"max_protomers_per_molecule": 1},
             seeding={"rdkit_num_conformers": 1},
             crest={"enabled": False},
@@ -167,6 +169,7 @@ def test_workflow_resume_skips_done_step_with_matching_hash(tmp_path: Path) -> N
     config = RunConfig(
         input_path=input_path,
         output_dir=outdir,
+        protonation={"enabled": False},
         overwrite=False,
         resume=True,
         enumeration={
@@ -197,6 +200,7 @@ def test_workflow_resume_reuses_partial_tautomer_outputs(
     config = RunConfig(
         input_path=input_path,
         output_dir=outdir,
+        protonation={"enabled": False},
         overwrite=False,
         resume=True,
         enumeration={

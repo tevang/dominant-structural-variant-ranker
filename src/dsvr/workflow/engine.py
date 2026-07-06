@@ -157,12 +157,17 @@ def run_workflow(config: RunConfig) -> WorkflowResult:
             existing = _load_existing_protomer_outputs(molecule, outdir, config)
             if existing:
                 protomers.extend(existing)
+            elif not config.protonation.enabled:
+                warning = "protonation.enabled=false; retained input state only"
+                warnings.append(warning)
+                protomers.extend(_fallback_protomer(molecule, config, warning=warning))
             else:
                 try:
                     protomers.extend(generate_protomer_candidates(molecule, config))
                 except MolscrubUnavailableError as exc:
-                    warnings.append(str(exc))
-                    protomers.extend(_fallback_protomer(molecule, config))
+                    raise MolscrubUnavailableError(
+                        f"{exc} Set protonation.enabled=false to retain input states without molscrub."
+                    ) from exc
             progress.record(
                 "Protomer generation",
                 "running",
@@ -1104,7 +1109,12 @@ def _standardize_molecules(
     return standardized
 
 
-def _fallback_protomer(molecule: MoleculeInput, config: RunConfig) -> list[ProtomerRecord]:
+def _fallback_protomer(
+    molecule: MoleculeInput,
+    config: RunConfig,
+    *,
+    warning: str = "molscrub unavailable; input protomer fallback retained",
+) -> list[ProtomerRecord]:
     output_dir = config.output_dir / "enumeration" / "protomers"
     output_dir.mkdir(parents=True, exist_ok=True)
     mol = Chem.Mol(molecule.rdkit_mol)
