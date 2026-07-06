@@ -1,4 +1,5 @@
 description: LigPrep-like plausible-variant ligand-preparation workflow.
+workflow_mode: physics_validation
 run_name: physics-validation-optional
 input_path: examples/test_molecules.smi
 input_format: auto
@@ -14,7 +15,6 @@ chemistry:
   ph_high: 7.0
   solvent: water
   temperature_kelvin: 298.15
-  workflow_mode: ligprep_like
 
 protonation:
   enabled: true
@@ -72,3 +72,19 @@ optional_validation:
 
 # Expensive optional validation path for selected small candidate sets only.
 # CREST/xTB, xTB thermo, CREST entropy, CENSO, Psi4, and PySCF are not default ligand-preparation steps.
+
+agent:
+  enabled: false
+  backend: ollama_codex_cli
+  command: "codex --oss -m qwen3.6:35b"
+  max_context_chars: 12000
+  allowed_tasks:
+    - classify_failure
+    - suggest_retry_from_menu
+    - summarize_logs
+  require_user_approval_for:
+    - code_patch
+    - science_threshold_change
+    - delete_outputs
+    - rerun_large_job
+  max_attempts_per_failure: 1

@@ -12,7 +12,7 @@ SolventModel = Literal["alpb", "gbsa", "none"]
 SeederMethod = Literal["etkdg", "auto3d", "both"]
 RdkitForcefield = Literal["uff", "mmff", "none"]
 Auto3dModel = Literal["AIMNET", "AIMNet2", "ANI2x", "ANI2xt", "auto"]
-WorkflowMode = Literal["ligprep_like", "physics_heavy"]
+WorkflowMode = Literal["ligprep_like", "physics_validation", "exhaustive_debug"]
 WorkflowProtocol = Literal["default", "auto3d_entropy"]
 PopulationScope = Literal["same_formula", "same_charge", "all_approximate"]
 EnergyUnit = Literal["kcal/mol"]
@@ -53,7 +53,6 @@ class ChemistryConfig(StrictModel):
     standardize: bool = True
     keep_salts: bool = False
     largest_fragment_only: bool = True
-    workflow_mode: WorkflowMode | None = None
 
     @model_validator(mode="after")
     def validate_ph_window_and_solvent(self) -> ChemistryConfig:
@@ -231,6 +230,36 @@ class OptionalValidationConfig(StrictModel):
     crest_xtb_enabled: bool = False
     censo_enabled: bool = False
     xtb_thermo_enabled: bool = False
+
+
+class AgentConfig(StrictModel):
+    enabled: bool = False
+    backend: str = "ollama_codex_cli"
+    command: str = "codex --oss -m qwen3.6:35b"
+    max_context_chars: int = 12000
+    allowed_tasks: list[str] = Field(
+        default_factory=lambda: [
+            "classify_failure",
+            "suggest_retry_from_menu",
+            "summarize_logs",
+        ]
+    )
+    require_user_approval_for: list[str] = Field(
+        default_factory=lambda: [
+            "code_patch",
+            "science_threshold_change",
+            "delete_outputs",
+            "rerun_large_job",
+        ]
+    )
+    max_attempts_per_failure: int = 1
+
+    @field_validator("max_context_chars", "max_attempts_per_failure")
+    @classmethod
+    def positive_agent_limit(cls, value: int) -> int:
+        if value <= 0:
+            raise ValueError("agent limits must be positive")
+        return value
 
 
 class SeedingConfig(StrictModel):
@@ -534,6 +563,7 @@ class DiskConfig(StrictModel):
 
 class RunConfig(StrictModel):
     description: str | None = None
+    workflow_mode: WorkflowMode = "ligprep_like"
     protocol: WorkflowProtocol = "default"
     run_name: str = "dsvr-run"
     input_path: Path = Path("examples/test_molecules_minimal.smi")
@@ -550,6 +580,7 @@ class RunConfig(StrictModel):
     stereoisomer_filtering: StereoisomerFilteringConfig = Field(default_factory=StereoisomerFilteringConfig)
     final_3d: Final3dConfig = Field(default_factory=Final3dConfig)
     optional_validation: OptionalValidationConfig = Field(default_factory=OptionalValidationConfig)
+    agent: AgentConfig = Field(default_factory=AgentConfig)
     seeding: SeedingConfig = Field(default_factory=SeedingConfig)
     crest: CrestConfig = Field(default_factory=CrestConfig)
     xtb_prefilter: XtbPrefilterConfig = Field(default_factory=XtbPrefilterConfig)
@@ -568,6 +599,34 @@ class RunConfig(StrictModel):
         if value <= 0:
             raise ValueError("max_workers must be positive")
         return value
+
+    @model_validator(mode="before")
+    @classmethod
+    def migrate_legacy_workflow_mode(cls, data: Any) -> Any:
+        if not isinstance(data, dict):
+            return data
+        chemistry = data.get("chemistry")
+        if isinstance(chemistry, dict) and "workflow_mode" in chemistry:
+            data = dict(data)
+            chemistry = dict(chemistry)
+            legacy_mode = chemistry.pop("workflow_mode")
+            data["chemistry"] = chemistry
+            if "workflow_mode" not in data:
+                data["workflow_mode"] = legacy_mode
+        return data
+
+    @model_validator(mode="after")
+    def validate_ligprep_like_settings(self) -> RunConfig:
+        if self.workflow_mode == "ligprep_like":
+            if not self.final_3d.one_conformer_per_variant:
+                raise ValueError(
+                    "ligprep_like mode requires final_3d.one_conformer_per_variant=true"
+                )
+            if self.tautomer_filtering.timeout_seconds_per_protomer <= 0:
+                raise ValueError("tautomer enumeration timeout must be finite and positive")
+            if self.stereoisomer_filtering.timeout_seconds_per_tautomer <= 0:
+                raise ValueError("stereoisomer enumeration timeout must be finite and positive")
+        return self
 
 
 def load_config(path: Path) -> RunConfig:

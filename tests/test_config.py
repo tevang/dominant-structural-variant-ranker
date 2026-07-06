@@ -179,7 +179,7 @@ def test_rejects_nonpositive_enumeration_caps() -> None:
 def test_ligprep_like_default_config_loads() -> None:
     config = load_config(Path("configs/ligprep_like_default.yaml"))
 
-    assert config.chemistry.workflow_mode == "ligprep_like"
+    assert config.workflow_mode == "ligprep_like"
     assert config.chemistry.ph == 7.0
     assert config.chemistry.ph_low == 7.0
     assert config.protonation.max_protomers_per_molecule == 4
@@ -192,3 +192,46 @@ def test_ligprep_like_default_config_loads() -> None:
     assert config.optional_validation.crest_xtb_enabled is False
     assert config.optional_validation.censo_enabled is False
     assert config.optional_validation.xtb_thermo_enabled is False
+
+
+def test_ligprep_like_variant_configs_load() -> None:
+    conservative = load_config(Path("configs/ligprep_like_conservative.yaml"))
+    aggressive = load_config(Path("configs/ligprep_like_aggressive.yaml"))
+
+    assert conservative.workflow_mode == "ligprep_like"
+    assert conservative.protonation.max_protomers_per_molecule == 3
+    assert aggressive.workflow_mode == "ligprep_like"
+    assert aggressive.protonation.max_protomers_per_molecule == 8
+
+
+def test_physics_validation_optional_config_loads() -> None:
+    config = load_config(Path("configs/physics_validation_optional.yaml"))
+
+    assert config.workflow_mode == "physics_validation"
+    assert config.optional_validation.crest_xtb_enabled is True
+    assert config.optional_validation.xtb_thermo_enabled is True
+
+
+def test_agent_disabled_by_default() -> None:
+    config = RunConfig()
+
+    assert config.agent.enabled is False
+    assert config.agent.backend == "ollama_codex_cli"
+    assert config.agent.command == "codex --oss -m qwen3.6:35b"
+    assert "classify_failure" in config.agent.allowed_tasks
+
+
+def test_rejects_invalid_ligprep_caps_and_timeouts() -> None:
+    with pytest.raises(ValidationError, match="protonation limits"):
+        RunConfig(protonation={"max_protomers_per_molecule": -1})
+    with pytest.raises(ValidationError, match="tautomer filtering limits"):
+        RunConfig(tautomer_filtering={"timeout_seconds_per_protomer": -1})
+    with pytest.raises(ValidationError, match="stereoisomer filtering limits"):
+        RunConfig(stereoisomer_filtering={"max_stereoisomers_per_tautomer": -1})
+    with pytest.raises(ValidationError, match="final_3d limits"):
+        RunConfig(final_3d={"k": 0})
+
+
+def test_ligprep_requires_one_final_conformer_per_variant() -> None:
+    with pytest.raises(ValidationError, match="one_conformer_per_variant"):
+        RunConfig(workflow_mode="ligprep_like", final_3d={"one_conformer_per_variant": False})
