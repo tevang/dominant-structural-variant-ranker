@@ -23,6 +23,7 @@ def test_fast_smoke_runs_rdkit_enumeration_and_etkdg_without_external_tools(
     assert (config.output_dir / "enumeration" / "tautomers" / "done.json").exists()
     assert (config.output_dir / "enumeration" / "stereoisomers" / "done.json").exists()
     assert (config.output_dir / "seeding" / "done.json").exists()
-    assert list((config.output_dir / "seeding" / "rdkit").glob("*_seeds.sdf"))
+    assert (config.output_dir / "final_variants.sdf").exists()
+    assert (config.output_dir / "final_variants.csv").exists()
     ranked = pd.read_csv(config.output_dir / "ranked_variants.csv")
     assert not ranked.empty

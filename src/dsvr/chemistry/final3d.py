@@ -66,6 +66,40 @@ def _run_final_auto3d(
     output_dir: Path,
     config: RunConfig,
 ) -> tuple[Path, list[str]]:
+    errors: list[str] = []
+    for use_gpu in _final_auto3d_gpu_attempts(config):
+        try:
+            return _run_final_auto3d_with_model_fallback(
+                input_sdf,
+                output_dir,
+                config,
+                use_gpu=use_gpu,
+            )
+        except (Auto3DExecutionError, Auto3DUnavailableError) as exc:
+            mode = "gpu" if use_gpu else "cpu"
+            errors.append(f"{mode}: {exc}")
+    if _sdf_record_count(input_sdf) > 1:
+        try:
+            return _run_final_auto3d_smaller_batches(
+                input_sdf,
+                output_dir,
+                config,
+            )
+        except (Auto3DExecutionError, Auto3DUnavailableError) as exc:
+            errors.append(f"smaller_batches: {exc}")
+    raise Auto3DExecutionError(
+        "Auto3D final 3D generation failed after GPU/CPU and smaller-batch retries:\n"
+        + "\n".join(errors)
+    )
+
+
+def _run_final_auto3d_with_model_fallback(
+    input_sdf: Path,
+    output_dir: Path,
+    config: RunConfig,
+    *,
+    use_gpu: bool,
+) -> tuple[Path, list[str]]:
     try:
         return run_auto3d(
             input_sdf,
@@ -75,7 +109,7 @@ def _run_final_auto3d(
             internal_tautomer_stereo_enum=False,
             max_confs=config.final_3d.max_confs,
             patience=config.final_3d.patience,
-            use_gpu=config.final_3d.use_gpu,
+            use_gpu=use_gpu,
             stream_output=False,
             timeout_s=config.final_3d.timeout_seconds_per_batch,
         )
@@ -91,10 +125,78 @@ def _run_final_auto3d(
             internal_tautomer_stereo_enum=False,
             max_confs=config.final_3d.max_confs,
             patience=config.final_3d.patience,
-            use_gpu=config.final_3d.use_gpu,
+            use_gpu=use_gpu,
             stream_output=False,
             timeout_s=config.final_3d.timeout_seconds_per_batch,
         )
+
+
+def _run_final_auto3d_smaller_batches(
+    input_sdf: Path,
+    output_dir: Path,
+    config: RunConfig,
+) -> tuple[Path, list[str]]:
+    molecules = [
+        mol
+        for mol in Chem.SDMolSupplier(str(input_sdf), sanitize=True, removeHs=False)
+        if mol is not None
+    ]
+    if len(molecules) <= 1:
+        raise Auto3DExecutionError("smaller-batch retry requires at least two input variants")
+    split_dir = output_dir / "smaller_batches"
+    split_dir.mkdir(parents=True, exist_ok=True)
+    combined_sdf = split_dir / "auto3d_smaller_batches_combined.sdf"
+    combined_writer = Chem.SDWriter(str(combined_sdf))
+    commands: list[str] = ["auto3d", "smaller-batch-retry"]
+    errors: list[str] = []
+    written = 0
+    for index, molecule in enumerate(molecules, start=1):
+        batch_dir = split_dir / f"batch_{index:03d}"
+        batch_dir.mkdir(parents=True, exist_ok=True)
+        batch_input = batch_dir / "final_3d_input.sdf"
+        writer = Chem.SDWriter(str(batch_input))
+        writer.write(molecule)
+        writer.close()
+        try:
+            output_sdf, command = _run_final_auto3d_with_model_fallback(
+                batch_input,
+                batch_dir,
+                config,
+                use_gpu=False,
+            )
+            commands.extend(str(part) for part in command)
+            for output_mol in Chem.SDMolSupplier(str(output_sdf), sanitize=True, removeHs=False):
+                if output_mol is None:
+                    continue
+                combined_writer.write(output_mol)
+                written += 1
+        except (Auto3DExecutionError, Auto3DUnavailableError) as exc:
+            errors.append(f"batch_{index:03d}: {exc}")
+    combined_writer.close()
+    if written == 0:
+        raise Auto3DExecutionError(
+            "Auto3D smaller-batch retry produced no conformers:\n" + "\n".join(errors)
+        )
+    if errors:
+        (split_dir / "auto3d_smaller_batch_warnings.txt").write_text(
+            "\n".join(errors) + "\n",
+            encoding="utf-8",
+        )
+    return combined_sdf, commands
+
+
+def _final_auto3d_gpu_attempts(config: RunConfig) -> list[bool]:
+    if config.final_3d.use_gpu and config.error_handling.retry_auto3d_cpu_on_gpu_failure:
+        return [True, False]
+    return [config.final_3d.use_gpu]
+
+
+def _sdf_record_count(path: Path) -> int:
+    return sum(
+        1
+        for mol in Chem.SDMolSupplier(str(path), sanitize=True, removeHs=False)
+        if mol is not None
+    )
 
 
 def _write_final_auto3d_input(path: Path, records: list[StereoRecord]) -> None:
