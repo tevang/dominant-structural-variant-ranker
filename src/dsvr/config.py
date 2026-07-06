@@ -21,6 +21,7 @@ QmBackend = Literal["psi4", "pyscf", "none"]
 FilteringMode = Literal["conservative", "balanced", "aggressive", "exhaustive"]
 CleanupPolicy = Literal["compact", "keep_selected", "debug_all"]
 TautomerStrategy = Literal["safe", "normal", "exhaustive"]
+TautomerTimeoutFallback = Literal["keep_input_and_canonical"]
 
 KNOWN_SOLVENTS = {
     "acetone",
@@ -140,6 +141,8 @@ class TautomerFilteringConfig(StrictModel):
     use_gpu: bool = True
     max_rdkit_tautomers_before_auto3d: int = 64
     rdkit_tautomer_timeout_seconds: int = 30
+    max_rdkit_transforms: int = 256
+    fallback_if_timeout: TautomerTimeoutFallback = "keep_input_and_canonical"
     auto3d_max_confs_per_tautomer: int = 3
     auto3d_patience: int = 100
     tauto_k: int = 3
@@ -150,6 +153,7 @@ class TautomerFilteringConfig(StrictModel):
     @field_validator(
         "max_rdkit_tautomers_before_auto3d",
         "rdkit_tautomer_timeout_seconds",
+        "max_rdkit_transforms",
         "auto3d_max_confs_per_tautomer",
         "auto3d_patience",
         "tauto_k",

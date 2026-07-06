@@ -25,6 +25,15 @@ class RdkitTautomerFilteringTimeout(RuntimeError):
     """Raised when RDKit tautomer candidate enumeration times out."""
 
 
+TAUTOMER_TIMEOUT_FALLBACK = "TAUTOMER_TIMEOUT_FALLBACK"
+
+
+@dataclass(frozen=True)
+class _EnumerationResult:
+    molblocks: list[str]
+    warning: str | None = None
+
+
 @dataclass(frozen=True)
 class _Candidate:
     index: int
@@ -91,41 +100,66 @@ def _enumerate_candidates(
 ) -> tuple[list[_Candidate], str | None]:
     warning: str | None = None
     input_mol = Chem.Mol(protomer.rdkit_mol)
+    max_tautomers = config.tautomer_filtering.max_rdkit_tautomers_before_auto3d
+    max_transforms = config.tautomer_filtering.max_rdkit_transforms
     params = rdMolStandardize.CleanupParameters()
-    params.maxTautomers = config.tautomer_filtering.max_rdkit_tautomers_before_auto3d
-    params.maxTransforms = config.enumeration.max_tautomer_transforms
+    params.maxTautomers = max_tautomers
+    params.maxTransforms = max_transforms
     params.tautomerRemoveBondStereo = config.enumeration.tautomer_remove_bond_stereo
     params.tautomerRemoveSp3Stereo = config.enumeration.tautomer_remove_sp3_stereo
     params.tautomerReassignStereo = config.enumeration.tautomer_reassign_stereo
     enumerator = rdMolStandardize.TautomerEnumerator(params)
+    canonical_reference: Chem.Mol | None = None
     try:
-        molblocks = _enumerate_molblocks_with_timeout(
+        result = _enumerate_molblocks_with_timeout(
             input_mol,
             timeout_seconds=config.tautomer_filtering.rdkit_tautomer_timeout_seconds,
-            max_tautomers=config.tautomer_filtering.max_rdkit_tautomers_before_auto3d,
-            max_transforms=config.enumeration.max_tautomer_transforms,
+            max_tautomers=max_tautomers,
+            max_transforms=max_transforms,
             remove_bond_stereo=config.enumeration.tautomer_remove_bond_stereo,
             remove_sp3_stereo=config.enumeration.tautomer_remove_sp3_stereo,
             reassign_stereo=config.enumeration.tautomer_reassign_stereo,
         )
+        warning = result.warning
         molecules = [
             molecule
-            for molecule in (Chem.MolFromMolBlock(block, sanitize=True, removeHs=False) for block in molblocks)
+            for molecule in (
+                Chem.MolFromMolBlock(block, sanitize=True, removeHs=False)
+                for block in result.molblocks
+            )
             if molecule is not None
         ]
     except RdkitTautomerFilteringTimeout:
         molecules = [input_mol]
-        warning = "RDKit tautomer enumeration timeout; retained input tautomer only"
+        canonical_reference = _canonical_tautomer_or_none(input_mol, config)
+        if canonical_reference is not None:
+            molecules.append(canonical_reference)
+        warning = (
+            f"{TAUTOMER_TIMEOUT_FALLBACK}: RDKit tautomer enumeration timeout; "
+            "retained input tautomer and attempted canonical tautomer"
+        )
     except RuntimeError as exc:
         molecules = [input_mol]
         warning = f"RDKit tautomer enumeration failed; retained input tautomer only: {exc}"
 
     if config.tautomer_filtering.keep_input_tautomer:
         molecules.append(input_mol)
-    canonical_mol = enumerator.Canonicalize(input_mol)
-    if canonical_mol is not None:
-        molecules.append(canonical_mol)
-    return _dedupe_candidates(protomer, molecules, enumerator), warning
+    if canonical_reference is None:
+        try:
+            canonical_reference = enumerator.Canonicalize(input_mol)
+        except RuntimeError:
+            canonical_reference = None
+    if canonical_reference is not None:
+        molecules.append(canonical_reference)
+    return (
+        _dedupe_candidates(
+            protomer,
+            molecules,
+            enumerator,
+            canonical_reference=canonical_reference,
+        ),
+        warning,
+    )
 
 
 def _enumerate_molblocks_with_timeout(
@@ -137,7 +171,7 @@ def _enumerate_molblocks_with_timeout(
     remove_bond_stereo: bool,
     remove_sp3_stereo: bool,
     reassign_stereo: bool,
-) -> list[str]:
+) -> _EnumerationResult:
     output_queue: mp.Queue = mp.Queue(maxsize=1)
     process = mp.Process(
         target=_tautomer_worker,
@@ -151,22 +185,38 @@ def _enumerate_molblocks_with_timeout(
             output_queue,
         ),
     )
-    process.start()
-    process.join(timeout_seconds)
-    if process.is_alive():
-        process.terminate()
-        process.join(2)
-        if process.is_alive():
-            process.kill()
-            process.join(2)
-        raise RdkitTautomerFilteringTimeout("RDKit tautomer enumeration timed out")
     try:
-        payload = output_queue.get_nowait()
-    except queue.Empty as exc:
-        raise RuntimeError("RDKit tautomer worker produced no output") from exc
-    if payload.get("status") != "ok":
-        raise RuntimeError(str(payload.get("error", "unknown tautomer worker error")))
-    return list(payload.get("molblocks", []))
+        process.start()
+        process.join(timeout_seconds)
+        if process.is_alive():
+            process.terminate()
+            process.join(2)
+            if process.is_alive():
+                process.kill()
+                process.join(2)
+            raise RdkitTautomerFilteringTimeout("RDKit tautomer enumeration timed out")
+        try:
+            payload = output_queue.get_nowait()
+        except queue.Empty as exc:
+            raise RuntimeError("RDKit tautomer worker produced no output") from exc
+        if payload.get("status") != "ok":
+            raise RuntimeError(str(payload.get("error", "unknown tautomer worker error")))
+        return _EnumerationResult(
+            molblocks=list(payload.get("molblocks", [])),
+            warning=payload.get("warning"),
+        )
+    finally:
+        if process.is_alive():
+            process.terminate()
+            process.join(2)
+            if process.is_alive():
+                process.kill()
+                process.join(2)
+        output_queue.close()
+        output_queue.join_thread()
+        close = getattr(process, "close", None)
+        if close is not None:
+            close()
 
 
 def _tautomer_worker(
@@ -189,8 +239,121 @@ def _tautomer_worker(
         params.tautomerRemoveSp3Stereo = remove_sp3_stereo
         params.tautomerReassignStereo = reassign_stereo
         enumerator = rdMolStandardize.TautomerEnumerator(params)
-        tautomers = list(enumerator.Enumerate(molecule))[:max_tautomers]
-        output_queue.put({"status": "ok", "molblocks": [Chem.MolToMolBlock(item) for item in tautomers]})
+        tautomers = list(enumerator.Enumerate(molecule))
+        warning = None
+        if len(tautomers) >= max_tautomers:
+            warning = (
+                "RDKit tautomer cap reached; ranked generated subset only "
+                f"(maxTautomers={max_tautomers}, maxTransforms={max_transforms})"
+            )
+        output_queue.put(
+            {
+                "status": "ok",
+                "molblocks": [Chem.MolToMolBlock(item) for item in tautomers[:max_tautomers]],
+                "warning": warning,
+            }
+        )
+    except Exception as exc:  # pragma: no cover - exercised through parent process.
+        output_queue.put({"status": "error", "error": str(exc)})
+
+
+def _canonical_tautomer_or_none(molecule: Chem.Mol, config: RunConfig) -> Chem.Mol | None:
+    try:
+        molblock = _canonical_molblock_with_timeout(
+            molecule,
+            timeout_seconds=max(
+                1,
+                min(2, config.tautomer_filtering.rdkit_tautomer_timeout_seconds),
+            ),
+            max_tautomers=1,
+            max_transforms=max(1, min(16, config.tautomer_filtering.max_rdkit_transforms)),
+            remove_bond_stereo=config.enumeration.tautomer_remove_bond_stereo,
+            remove_sp3_stereo=config.enumeration.tautomer_remove_sp3_stereo,
+            reassign_stereo=config.enumeration.tautomer_reassign_stereo,
+        )
+    except (RuntimeError, RdkitTautomerFilteringTimeout):
+        return None
+    return Chem.MolFromMolBlock(molblock, sanitize=True, removeHs=False)
+
+
+def _canonical_molblock_with_timeout(
+    molecule: Chem.Mol,
+    *,
+    timeout_seconds: int,
+    max_tautomers: int,
+    max_transforms: int,
+    remove_bond_stereo: bool,
+    remove_sp3_stereo: bool,
+    reassign_stereo: bool,
+) -> str:
+    output_queue: mp.Queue = mp.Queue(maxsize=1)
+    process = mp.Process(
+        target=_canonical_worker,
+        args=(
+            Chem.MolToMolBlock(molecule),
+            max_tautomers,
+            max_transforms,
+            remove_bond_stereo,
+            remove_sp3_stereo,
+            reassign_stereo,
+            output_queue,
+        ),
+    )
+    try:
+        process.start()
+        process.join(timeout_seconds)
+        if process.is_alive():
+            process.terminate()
+            process.join(2)
+            if process.is_alive():
+                process.kill()
+                process.join(2)
+            raise RdkitTautomerFilteringTimeout("RDKit canonical tautomer generation timed out")
+        try:
+            payload = output_queue.get_nowait()
+        except queue.Empty as exc:
+            raise RuntimeError("RDKit canonical tautomer worker produced no output") from exc
+        if payload.get("status") != "ok":
+            raise RuntimeError(str(payload.get("error", "unknown canonical tautomer worker error")))
+        return str(payload["molblock"])
+    finally:
+        if process.is_alive():
+            process.terminate()
+            process.join(2)
+            if process.is_alive():
+                process.kill()
+                process.join(2)
+        output_queue.close()
+        output_queue.join_thread()
+        close = getattr(process, "close", None)
+        if close is not None:
+            close()
+
+
+def _canonical_worker(
+    molblock: str,
+    max_tautomers: int,
+    max_transforms: int,
+    remove_bond_stereo: bool,
+    remove_sp3_stereo: bool,
+    reassign_stereo: bool,
+    output_queue: mp.Queue,
+) -> None:
+    try:
+        molecule = Chem.MolFromMolBlock(molblock, sanitize=True, removeHs=False)
+        if molecule is None:
+            raise ValueError("could not parse canonical tautomer worker molecule")
+        params = rdMolStandardize.CleanupParameters()
+        params.maxTautomers = max_tautomers
+        params.maxTransforms = max_transforms
+        params.tautomerRemoveBondStereo = remove_bond_stereo
+        params.tautomerRemoveSp3Stereo = remove_sp3_stereo
+        params.tautomerReassignStereo = reassign_stereo
+        enumerator = rdMolStandardize.TautomerEnumerator(params)
+        canonical = enumerator.Canonicalize(molecule)
+        if canonical is None:
+            raise ValueError("RDKit did not produce a canonical tautomer")
+        output_queue.put({"status": "ok", "molblock": Chem.MolToMolBlock(canonical)})
     except Exception as exc:  # pragma: no cover - exercised through parent process.
         output_queue.put({"status": "error", "error": str(exc)})
 
@@ -199,9 +362,16 @@ def _dedupe_candidates(
     protomer: ProtomerRecord,
     molecules: list[Chem.Mol],
     enumerator: rdMolStandardize.TautomerEnumerator,
+    *,
+    canonical_reference: Chem.Mol | None = None,
 ) -> list[_Candidate]:
     input_isomeric = Chem.MolToSmiles(protomer.rdkit_mol, canonical=True, isomericSmiles=True)
-    canonical_mol = enumerator.Canonicalize(Chem.Mol(protomer.rdkit_mol))
+    canonical_mol = canonical_reference
+    if canonical_mol is None:
+        try:
+            canonical_mol = enumerator.Canonicalize(Chem.Mol(protomer.rdkit_mol))
+        except RuntimeError:
+            canonical_mol = None
     canonical_isomeric = (
         Chem.MolToSmiles(canonical_mol, canonical=True, isomericSmiles=True)
         if canonical_mol is not None
@@ -247,7 +417,13 @@ def _rank_or_fallback(
     if not config.tautomer_filtering.enabled:
         return _fallback_rank(candidates, "tautomer_filtering.enabled=false", config)
     try:
-        return _rank_with_auto3d(protomer, candidates, config, output_dir)
+        return _rank_with_auto3d(
+            protomer,
+            candidates,
+            config,
+            output_dir,
+            candidate_warning,
+        )
     except (Auto3DExecutionError, Auto3DUnavailableError, Auto3DTautomerFilteringError) as exc:
         reason = f"Auto3D tautomer filtering failed; RDKit fallback used: {exc}"
         if candidate_warning:
@@ -260,6 +436,7 @@ def _rank_with_auto3d(
     candidates: list[_Candidate],
     config: RunConfig,
     output_dir: Path,
+    candidate_warning: str | None = None,
 ) -> list[_RankedCandidate]:
     with TemporaryDirectory(prefix=f"{protomer.id}_auto3d_tautomers_", dir=output_dir) as temp:
         workdir = Path(temp)
@@ -283,6 +460,11 @@ def _rank_with_auto3d(
     selected_ids = _rescue_input_tautomer(selected_ids, ranked, candidates, config)
     rank_by_id = {candidate.tautomer_id: rank for rank, (_energy, _smiles, candidate) in enumerate(ranked, start=1)}
     command_text = " ".join(str(part) for part in command)
+    warning_items = tuple(
+        item
+        for item in (candidate_warning, f"Auto3D command: {command_text}")
+        if item
+    )
     results: list[_RankedCandidate] = []
     for candidate in candidates:
         energy = energies.get(candidate.tautomer_id)
@@ -303,7 +485,7 @@ def _rank_with_auto3d(
                 selected=selected,
                 reason=reason,
                 source="auto3d",
-                warnings=(f"Auto3D command: {command_text}",),
+                warnings=warning_items,
             )
         )
     return results

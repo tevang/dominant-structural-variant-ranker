@@ -186,6 +186,8 @@ def test_ligprep_like_default_config_loads() -> None:
     assert config.tautomer_filtering.tool == "auto3d"
     assert config.tautomer_filtering.tauto_engine == "rdkit"
     assert config.tautomer_filtering.optimizing_engine == "ANI2xt"
+    assert config.tautomer_filtering.max_rdkit_transforms == 256
+    assert config.tautomer_filtering.fallback_if_timeout == "keep_input_and_canonical"
     assert config.stereoisomer_filtering.max_stereoisomers_per_tautomer == 16
     assert config.final_3d.k == 1
     assert config.final_3d.one_conformer_per_variant is True

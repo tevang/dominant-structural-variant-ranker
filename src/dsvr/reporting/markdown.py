@@ -110,6 +110,16 @@ def _report_text(
         f"- CENSO max candidates: {config.refinement.max_candidates_for_refinement}",
         f"- QM enabled: {config.qm.enabled}",
         f"- QM max candidates: {config.qm.max_candidates}",
+        (
+            "- RDKit tautomer timeout seconds: "
+            f"{config.tautomer_filtering.rdkit_tautomer_timeout_seconds}"
+        ),
+        (
+            "- RDKit tautomer max candidates before Auto3D: "
+            f"{config.tautomer_filtering.max_rdkit_tautomers_before_auto3d}"
+        ),
+        f"- RDKit tautomer max transforms: {config.tautomer_filtering.max_rdkit_transforms}",
+        f"- RDKit tautomer timeout fallback: {config.tautomer_filtering.fallback_if_timeout}",
         "",
         "## Tool Versions",
         "",
@@ -191,7 +201,11 @@ def _tautomer_timeout_rows(records: list[AnyLineageRecord]) -> list[str]:
     for record in records:
         if record.stage_name != "tautomer":
             continue
-        if any("tautomer enumeration timeout" in warning.lower() for warning in record.warnings):
+        if any(
+            "tautomer enumeration timeout" in warning.lower()
+            or "TAUTOMER_TIMEOUT_FALLBACK" in warning
+            for warning in record.warnings
+        ):
             counts[(record.input_molecule_id, record.molname)] += 1
     return [
         f"| {input_id} | {molname} | {count} |"

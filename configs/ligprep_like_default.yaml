@@ -35,6 +35,8 @@ tautomer_filtering:
   use_gpu: true
   max_rdkit_tautomers_before_auto3d: 64
   rdkit_tautomer_timeout_seconds: 30
+  max_rdkit_transforms: 256
+  fallback_if_timeout: keep_input_and_canonical
   auto3d_max_confs_per_tautomer: 3
   auto3d_patience: 100
   tauto_k: 3
