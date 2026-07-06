@@ -1,97 +1,36 @@
 # Dominant Structural Variant Ranker
 
-`dominant-structural-variant-ranker` (`dsvr`) is a Python orchestration package
-for ranking pH- and solvent-dependent structural variants of small molecules
-using maintained open-source tools.
+`dominant-structural-variant-ranker` (`dsvr`) is a Python orchestration package for preparing and ranking pH- and solvent-dependent small-molecule structural variants with maintained open-source tools.
 
-This repository is a wrapper/orchestrator. It does **not** vendor, mirror, or
-clone third-party repositories. RDKit, molscrub, Auto3D, xTB, CREST, CENSO,
-Psi4, and PySCF remain external tools installed through conda-forge, pip,
-official binary distributions, or user-managed software modules.
+This repository is a wrapper/orchestrator. It does **not** vendor, mirror, or clone third-party repositories. RDKit, molscrub, Auto3D, xTB, CREST, CENSO, Psi4, and PySCF remain external tools installed through conda-forge, pip, official binary distributions, or user-managed software modules.
 
-## Default Physics-Heavy Workflow
+## Default LigPrep-like Workflow
 
-The package implements this default workflow:
+The recommended default is a bounded plausible-variant ligand-preparation workflow for docking, ligand-based modeling, and batch-library preparation:
 
 ```text
-molscrub protonation/protomer generation at target pH
--> RDKit tautomer enumeration
--> RDKit stereoisomer enumeration
--> RDKit ETKDG or Auto3D conformer seeding
--> CREST/xTB conformer search and ensemble reduction
--> xTB thermo / CREST entropy Delta G ranking
--> optional CENSO
--> optional Psi4/PySCF final rescoring
+Input SMILES/SDF -> standardization and validity checks -> plausible pH/protomer generation at target pH, default pH 7.0 -> early protomer filtering -> Auto3D tautomer enumeration/ranking/filtering using RDKit tautomer engine and ANI2xt/AIMNet2 -> RDKit stereoisomer enumeration with timeout/caps after tautomer filtering -> Auto3D one-conformer optimization/ranking/filtering of stereoisomers -> final SDF/CSV/JSON report with one optimized 3D conformer per surviving structural variant -> optional CREST/xTB validation only if explicitly enabled
 ```
 
-## Auto3D Representative Protocol
-
-The repository also includes a practical Auto3D-owned enumeration protocol. It is
-intended for large compounds where exhaustive conformer searches are not a useful
-default:
-
-```text
-molscrub protonation/protomer generation at target pH
--> Auto3D tautomer enumeration
--> Auto3D stereoisomer enumeration
--> Auto3D representative conformer generation
--> DSVR SVPScore plausibility ranking of representative variants
-```
-
-CREST/xTB ensemble reduction, configurational entropy ranking, CENSO, and
-Psi4/PySCF rescoring are intentionally not part of this default protocol. Run
-those as explicit follow-up protocols when the candidate set is small enough.
-
-Run it with:
+Start with:
 
 ```bash
-dsvr run examples/test_molecules.smi \
-  --config configs/auto3d_entropy_protocol.yaml \
-  --outdir runs/auto3d_entropy_water_pH7
+dsvr run examples/test_molecules.smi   --config configs/ligprep_like_default.yaml   --outdir runs/ligprep_like_water_pH7
 ```
 
-For a fast sanity-check, use:
+The old CREST/xTB-centered workflow is expensive and optional. Use `configs/physics_validation_optional.yaml` or `configs/physics_heavy.yaml` only for selected validation/refinement runs after the candidate set is small. `configs/exhaustive_debug.yaml` remains useful for small-molecule debugging, but it is intentionally expensive.
 
-```bash
-dsvr run examples/test_molecules_minimal.smi \
-  --config configs/auto3d_entropy_smoke.yaml \
-  --outdir runs/auto3d_entropy_smoke
-```
+## Auto3D Energy Triage
 
-The corresponding Auto3D-native parameter template is
-`configs/auto3d_entropy.auto3d.yaml`. DSVR writes lineage and ranking outputs
-under `seeding/auto3d_protocol`, `auto3d_representatives`, and `ranking`.
+RDKit alone can enumerate too many tautomers and does not rank tautomer abundance. The default workflow filters tautomers before stereoisomer enumeration because expanding stereoisomers for every tautomer multiplies the candidate count before any energy signal is available.
 
-Default implementation notes:
-
-- Default pH: `7.0`
-- Default solvent: `water`
-- Default temperature: `298.15 K`
-- Default initial seeder: RDKit ETKDG
-- Optional seeder/prefilter: Auto3D
-- Main decision engine: CREST/xTB
-- Optional high-confidence refinement: CENSO
-- Optional final QM rescoring: Psi4 or PySCF
+Auto3D ranking is approximate potential-energy triage. It ranks low-energy tautomer and stereoisomer candidates by optimized conformer energies, not by true solution abundance. Auto3D thermodynamics, when used, are not substitutes for validated solvated free energies.
 
 ## Scientific Warning
 
-DSVR does not perform rigorous pH-dependent population calculations unless a
-micro-pKa/proton chemical potential correction plugin is added. By default,
-molscrub is used for practical pH/protomer candidate generation, then
-CREST/xTB-derived free energies rank the generated candidates in the configured
-solvent model.
+The default pipeline is fast ligand preparation, not an exhaustive conformational free-energy workflow. It does not perform rigorous pH-dependent population calculations, pKa prediction, or solution speciation.
 
-Boltzmann populations are derived from relative free energies and must be
-labeled with their scope:
-
-- Comparable within the same formula/proton count.
-- Approximate across different protonation/protomer states unless corrections
-  are available.
-
-RDKit tautomer canonicalization is not stability ranking. RDKit stereoisomer
-enumeration is explicit and controlled by configuration. Auto3D can be useful
-for seed generation or prefiltering, but it must not double-enumerate tautomers
-or stereoisomers unless the user explicitly enables Auto3D internal enumeration.
+CREST/xTB, xTB thermo, CREST entropy estimates, CENSO, and Psi4/PySCF rescoring are optional validation/refinement steps. Psi4/PySCF rescoring is outside the default workflow and should be treated as an advanced legacy module unless explicitly enabled.
 
 ## Quick Start
 
@@ -100,65 +39,22 @@ conda env create -f environment.yml
 conda activate dsvr
 python -m pip install -e ".[dev]"
 dsvr doctor
-dsvr run examples/test_molecules_minimal.smi --config configs/fast_smoke.yaml --outdir runs/smoke
+dsvr run examples/test_molecules_minimal.smi --config configs/ligprep_like_default.yaml --outdir runs/smoke
 ```
 
-For production local runs, start with the bounded balanced profile:
-
-```bash
-dsvr run examples/test_molecules.smi \
-  --config configs/production_balanced.yaml \
-  --outdir runs/production_balanced_water_pH7
-```
-
-`configs/exhaustive_debug.yaml` is intentionally expensive and may generate
-very large variant and XYZ counts. Use it only for small molecules or debugging.
-
-For a direct source-tree smoke check:
+For direct source-tree smoke checks:
 
 ```bash
 PYTHONPATH=src python -m dsvr.cli --help
 PYTHONPATH=src python -m pytest
 ```
 
-For GitHub Actions debugging, use:
-
-```bash
-python scripts/inspect_ci_run.py https://github.com/tevang/dominant-structural-variant-ranker/actions/runs/<run_id>
-```
-
-If `GH_TOKEN` is not set, the script will reuse `GITHUB_TOKEN` when available.
-
-Short form:
-
-```bash
-make ci-log RUN=https://github.com/tevang/dominant-structural-variant-ranker/actions/runs/<run_id>
-```
-
 ## Dependency Strategy
 
 - Do not vendor third-party repositories.
 - Install Python packages via conda or pip.
-- Install external binaries via conda, official binaries, or user-managed
-  modules.
-- Use `dsvr doctor` to verify the environment before running physics-heavy
-  workflows.
-
-### xTB / CREST
-
-This repo installs the official xTB and CREST binaries into the shared `dsvr`
-conda prefix and adds a conda activation hook so they are available after
-`conda activate dsvr`. You should not need to export `PATH` manually.
-
-If you ever recreate the environment, verify that these files still exist:
-
-```bash
-/mnt/ssd_6.986tb/conda_envs/dsvr/etc/conda/activate.d/xtb_crest_activate.sh
-/mnt/ssd_6.986tb/conda_envs/dsvr/etc/conda/deactivate.d/xtb_crest_deactivate.sh
-```
-
-After activation, `xtb`, `crest`, `XTBHOME`, and `CRESTHOME` should be set
-automatically. `dsvr doctor` should report both executables as available.
+- Install external binaries via conda, official binaries, or user-managed modules.
+- Use `dsvr doctor` to verify the environment before running optional physics-heavy workflows.
 
 Optional Python tools:
 
@@ -173,13 +69,14 @@ python -m dsvr.cli --help
 dsvr --help
 dsvr doctor
 dsvr inspect examples/test_molecules.smi
-dsvr run examples/test_molecules_minimal.smi --config configs/fast_smoke.yaml --outdir runs/smoke
+dsvr run examples/test_molecules_minimal.smi --config configs/ligprep_like_default.yaml --outdir runs/smoke
 ```
 
 ## Documentation
 
 - [Architecture](docs/architecture.md)
 - [Workflow](docs/workflow.md)
+- [Plausible variant workflow](docs/plausible_variant_workflow.md)
 - [Limitations](docs/limitations.md)
 - [External tools](docs/external_tools.md)
 - [File formats](docs/file_formats.md)

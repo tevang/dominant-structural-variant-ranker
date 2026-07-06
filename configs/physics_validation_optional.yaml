@@ -1,0 +1,74 @@
+description: LigPrep-like plausible-variant ligand-preparation workflow.
+run_name: physics-validation-optional
+input_path: examples/test_molecules.smi
+input_format: auto
+output_dir: runs/physics-validation-optional
+max_workers: 1
+dry_run: false
+overwrite: false
+resume: true
+
+chemistry:
+  ph: 7.0
+  ph_low: 7.0
+  ph_high: 7.0
+  solvent: water
+  temperature_kelvin: 298.15
+  workflow_mode: ligprep_like
+
+protonation:
+  enabled: true
+  tool: molscrub
+  mode: plausible
+  max_protomers_per_molecule: 4
+  keep_input_state: true
+  keep_best_per_charge: true
+  skip_gen3d_in_molscrub: true
+  timeout_seconds_per_molecule: 60
+
+tautomer_filtering:
+  enabled: true
+  tool: auto3d
+  tauto_engine: rdkit
+  optimizing_engine: ANI2xt
+  fallback_optimizing_engine: AIMNET
+  use_gpu: true
+  max_rdkit_tautomers_before_auto3d: 64
+  rdkit_tautomer_timeout_seconds: 30
+  auto3d_max_confs_per_tautomer: 3
+  auto3d_patience: 100
+  tauto_k: 3
+  tauto_window_kcal_mol: 5.0
+  keep_input_tautomer: true
+  timeout_seconds_per_protomer: 600
+
+stereoisomer_filtering:
+  enabled: true
+  enumerator: rdkit
+  max_stereoisomers_per_tautomer: 16
+  timeout_seconds_per_tautomer: 300
+  try_embedding: true
+  only_unassigned: true
+  collapse_enantiomers_in_achiral_solvent: true
+  run_energy_for_enantiomer_representatives_only: true
+  stereo_energy_window_kcal_mol: 7.0
+  keep_top_n_diastereomers: 8
+
+final_3d:
+  tool: auto3d
+  optimizing_engine: AIMNET
+  fallback_optimizing_engine: ANI2xt
+  use_gpu: true
+  k: 1
+  max_confs: 10
+  patience: 100
+  energy_window_kcal_mol: 7.0
+  one_conformer_per_variant: true
+
+optional_validation:
+  crest_xtb_enabled: true
+  censo_enabled: false
+  xtb_thermo_enabled: true
+
+# Expensive optional validation path for selected small candidate sets only.
+# CREST/xTB, xTB thermo, CREST entropy, CENSO, Psi4, and PySCF are not default ligand-preparation steps.

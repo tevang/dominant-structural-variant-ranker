@@ -1,136 +1,54 @@
 # Workflow
 
-The default DSVR workflow is physics-heavy and maintenance-oriented. It is
-designed to generate chemically plausible candidate structural variants, search
-their conformational ensembles, and rank generated candidates by parsed
-free-energy estimates.
+DSVR's default workflow is a LigPrep-like plausible-variant ligand-preparation protocol. It is designed for fast preparation of ligand libraries for docking, ligand-based modeling, and batch processing, not exhaustive conformational free-energy ranking.
 
-## Defaults
+## Default Path
 
-| Setting | Default |
-| --- | --- |
-| pH | `7.0` |
-| Solvent | `water` |
-| Temperature | `298.15 K` |
-| Initial seeder | RDKit ETKDG |
-| Optional seeder/prefilter | Auto3D |
-| Main decision engine | CREST/xTB |
-| High-confidence refinement | Optional CENSO |
-| Final QM rescoring | Optional Psi4 or PySCF |
+```text
+Input SMILES/SDF
+-> standardization and validity checks
+-> plausible pH/protomer generation at target pH, default pH 7.0
+-> early protomer filtering
+-> Auto3D tautomer enumeration/ranking/filtering using RDKit tautomer engine and ANI2xt/AIMNet2
+-> RDKit stereoisomer enumeration with timeout/caps after tautomer filtering
+-> Auto3D one-conformer optimization/ranking/filtering of stereoisomers
+-> final SDF/CSV/JSON report with one optimized 3D conformer per surviving structural variant
+-> optional CREST/xTB validation only if explicitly enabled
+```
 
-## Step-by-Step Table
+Recommended config:
 
-| Step | Software | Function | Status |
-| --- | --- | --- | --- |
-| 1 | molscrub | Generate practical pH/protomer/protonation candidates at the target pH or pH window. | Compulsory for pH/protomer workflow |
-| 2 | RDKit | Enumerate tautomers from generated candidates. | Compulsory by default |
-| 3 | RDKit | Enumerate stereoisomers explicitly under configured limits. | Compulsory by default |
-| 4 | RDKit ETKDG | Generate initial 3D conformer seeds. | Compulsory default seeder |
-| 5 | Auto3D | Optional seed generation or prefiltering with neural-network potentials. | Optional |
-| 6 | CREST/xTB | Perform conformer search and ensemble reduction. | Compulsory for physics-heavy ranking |
-| 7 | xTB thermo / CREST entropy | Extract free-energy terms and rank by relative Delta G. | Compulsory for population-oriented ranking |
-| 8 | CENSO | Refine conformer ensemble ranking with higher-confidence settings. | Optional |
-| 9 | Psi4 or PySCF | Final quantum-chemistry rescoring of selected structures. | Optional |
-| 10 | DSVR reporting | Write ranked tables, provenance, logs, summaries, and scope labels. | Compulsory |
+```bash
+dsvr run examples/test_molecules.smi   --config configs/ligprep_like_default.yaml   --outdir runs/ligprep_like_water_pH7
+```
 
-## Operational Sequence
+## Step Responsibilities
 
-1. Read SMILES or SDF inputs and assign stable input hashes.
-2. Standardize molecules enough to support deterministic downstream records.
-3. Use molscrub for practical pH/protomer candidate generation.
-4. Enumerate RDKit tautomers within configured caps.
-5. Enumerate RDKit stereoisomers within configured caps.
-6. Deduplicate generated candidates by configured identifiers.
-7. Generate seed 3D geometries with RDKit ETKDG by default.
-8. Optionally use Auto3D for seed generation or prefiltering.
-9. Run CREST/xTB to search conformer space and reduce ensembles.
-10. Parse xTB thermo and CREST entropy/free-energy outputs.
-11. Optionally run CENSO for higher-confidence ensemble refinement.
-12. Optionally rescore selected structures with Psi4 or PySCF.
-13. Compute relative free energies and scoped Boltzmann weights.
-14. Emit ranked outputs, logs, provenance, and reports.
+| Step | Tooling | Scope |
+| --- | --- | --- |
+| Input | DSVR readers | Read SMILES/SDF and report invalid records. |
+| Standardization | RDKit | Normalize molecules and keep valid ligand inputs. |
+| Protomer generation | molscrub/fallback logic | Generate plausible pH/protomer candidates at target pH. |
+| Early protomer filtering | DSVR filters | Cap protomer count before tautomer work. |
+| Tautomer candidate generation | RDKit via Auto3D path | Generate bounded tautomer candidates. |
+| Tautomer energy triage | Auto3D ANI2xt/AIMNet2 | Rank/filter by optimized conformer energies. |
+| Stereoisomer enumeration | RDKit | Enumerate after tautomer filtering with timeouts/caps. |
+| Stereoisomer energy triage | Auto3D one-conformer optimization | Filter high-energy stereoisomers. |
+| Final 3D | Auto3D | Keep one optimized conformer per surviving structural variant. |
+| Reporting | DSVR | Write SDF, CSV, JSON, manifest, and summary outputs. |
 
-## Enumeration Controls
+## Why Tautomer Filtering Comes First
 
-RDKit tautomer canonicalization is not a stability ranking. Tautomer
-canonicalization can be useful for deduplication or representative naming, but
-the workflow must not treat the canonical tautomer as the physically dominant
-tautomer.
+RDKit tautomer enumeration can generate many chemically possible candidates, but RDKit does not rank tautomer abundance. If stereoisomers are expanded for every tautomer, candidate counts grow multiplicatively before any energy-based pruning happens.
 
-Tautomer enumeration is timeout-protected. DSVR runs RDKit
-`TautomerEnumerator` in a separate process for each protomer so problematic
-molecules can be killed without stopping the full workflow. Safe mode defaults
-to `max_tautomers_per_protomer: 32`, `max_tautomer_transforms: 256`, and
-`tautomer_timeout_seconds: 30`.
+The default workflow therefore filters tautomer candidates before stereoisomer enumeration. This makes the stereochemistry and final 3D stages bounded and focused on plausible low-energy tautomer families.
 
-If tautomer enumeration times out, DSVR keeps the parent protomer itself as a
-fallback tautomer candidate, labels the record with `tautomer enumeration
-timeout`, and continues. If the enumeration cap is hit, DSVR records a warning
-and prioritizes the retained subset using SVPScore/RDKit tautomer heuristic
-features. `tautomer_strategy: exhaustive` is available, but it is explicitly
-expensive and should be used only for targeted investigations.
+## Interpretation of Auto3D Scores
 
-RDKit stereoisomer enumeration is explicit and controlled. The workflow should
-record stereochemistry assumptions, maximum enumeration counts, skipped states,
-and whether undefined stereocenters were expanded.
+Auto3D ranks low-energy tautomers and stereoisomers by optimized conformer energies. This is approximate potential-energy triage, not true solution abundance. Auto3D thermodynamics, when used, are not substitutes for validated solvated free energies.
 
-In achiral solvent calculations, DSVR reduces redundant downstream work for
-pure enantiomeric pairs. RDKit stereoisomer records are still preserved, but
-only one representative enantiomer is sent to CREST/xTB when
-`stereo_filtering.collapse_enantiomers_in_achiral_solvent` and
-`stereo_filtering.run_crest_for_enantiomer_pairs_once` are enabled. The
-representative energy or thermochemistry is mapped back to the equivalent
-enantiomeric partner with warnings and provenance annotations.
+## Optional Physics Validation
 
-Diastereomers are not collapsed. If a molecule will later be evaluated in a
-chiral binding pocket, set `stereo_filtering.solvent_is_chiral: true` or disable
-`collapse_enantiomers_in_achiral_solvent`.
+CREST/xTB conformer searches, xTB thermo, CREST entropy estimates, CENSO, and Psi4/PySCF rescoring are optional validation/refinement steps. They should be explicitly enabled only for selected small candidate sets.
 
-Auto3D can internally enumerate tautomers and stereoisomers. DSVR should disable
-that behavior by default when RDKit already performed enumeration. Enable Auto3D
-internal enumeration only when the user explicitly selects that mode.
-
-## SVPScore Filtering
-
-DSVR uses an open heuristic Structural Variant Penalty Score, SVPScore, to
-triage generated variants before expensive CREST/xTB and thermochemistry. This
-score is inspired by the general idea of state-penalty triage, but it is not a
-proprietary formula and is not a thermodynamic population model.
-
-SVPScore combines transparent components for protomer plausibility, tautomer
-features, stereochemical enumeration uncertainty, chemistry sanity checks,
-computational complexity, and cheap 3D relative energy when available. The
-complexity component affects scheduling priority only; it is not evidence that a
-variant is physically less stable.
-
-pH-related SVPScore terms are approximate unless a real micro-pKa or proton
-chemical-potential correction provider is configured. Without such a provider,
-molscrub controls pH/protomer candidate generation and SVPScore uses only
-conservative rule-based penalties.
-
-Filtering decisions are written to:
-
-- `filtering/variant_penalties.csv`
-- `filtering/accepted_variants.csv`
-- `filtering/rejected_variants.csv`
-- `filtering/penalty_breakdown.jsonl`
-
-Every rejected variant records a reason. Rescue candidates, such as the original
-input state and the best candidate per formula, formal charge, protomer, and
-tautomer family, record a rescue reason when accepted.
-
-## Ranking and Population Scope
-
-CREST/xTB is the main physics-based ranking layer. DSVR ranks generated
-candidates by parsed relative free energies when available.
-
-Boltzmann populations are derived from relative free energies and must be
-labeled with their scope:
-
-- Comparable within same formula/proton count.
-- Approximate across different protonation/protomer states unless micro-pKa or
-  proton chemical-potential corrections are available.
-
-Without those corrections, DSVR reports approximate ranking of generated
-candidates under the configured preparation assumptions, not rigorous
-pH-dependent solution populations.
+Use `configs/physics_validation_optional.yaml` for bounded validation and `configs/physics_heavy.yaml` only when an expensive legacy-style workflow is intended. `configs/exhaustive_debug.yaml` remains useful for debugging small molecules and stress-testing enumeration limits.

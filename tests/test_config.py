@@ -124,6 +124,10 @@ def test_production_configs_load() -> None:
         Path("configs/crest_disk_safe.yaml"),
         Path("configs/auto3d_entropy_protocol.yaml"),
         Path("configs/auto3d_entropy_smoke.yaml"),
+        Path("configs/ligprep_like_default.yaml"),
+        Path("configs/ligprep_like_conservative.yaml"),
+        Path("configs/ligprep_like_aggressive.yaml"),
+        Path("configs/physics_validation_optional.yaml"),
     ]:
         config = load_config(path)
         assert config.run_name
@@ -170,3 +174,21 @@ def test_warns_for_unknown_solvent_but_allows_it() -> None:
 def test_rejects_nonpositive_enumeration_caps() -> None:
     with pytest.raises(ValidationError, match="enumeration caps must be positive"):
         RunConfig(enumeration={"max_tautomers_per_protomer": 0})
+
+
+def test_ligprep_like_default_config_loads() -> None:
+    config = load_config(Path("configs/ligprep_like_default.yaml"))
+
+    assert config.chemistry.workflow_mode == "ligprep_like"
+    assert config.chemistry.ph == 7.0
+    assert config.chemistry.ph_low == 7.0
+    assert config.protonation.max_protomers_per_molecule == 4
+    assert config.tautomer_filtering.tool == "auto3d"
+    assert config.tautomer_filtering.tauto_engine == "rdkit"
+    assert config.tautomer_filtering.optimizing_engine == "ANI2xt"
+    assert config.stereoisomer_filtering.max_stereoisomers_per_tautomer == 16
+    assert config.final_3d.k == 1
+    assert config.final_3d.one_conformer_per_variant is True
+    assert config.optional_validation.crest_xtb_enabled is False
+    assert config.optional_validation.censo_enabled is False
+    assert config.optional_validation.xtb_thermo_enabled is False

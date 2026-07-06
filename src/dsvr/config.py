@@ -12,6 +12,7 @@ SolventModel = Literal["alpb", "gbsa", "none"]
 SeederMethod = Literal["etkdg", "auto3d", "both"]
 RdkitForcefield = Literal["uff", "mmff", "none"]
 Auto3dModel = Literal["AIMNET", "AIMNet2", "ANI2x", "ANI2xt", "auto"]
+WorkflowMode = Literal["ligprep_like", "physics_heavy"]
 WorkflowProtocol = Literal["default", "auto3d_entropy"]
 PopulationScope = Literal["same_formula", "same_charge", "all_approximate"]
 EnergyUnit = Literal["kcal/mol"]
@@ -52,6 +53,7 @@ class ChemistryConfig(StrictModel):
     standardize: bool = True
     keep_salts: bool = False
     largest_fragment_only: bool = True
+    workflow_mode: WorkflowMode | None = None
 
     @model_validator(mode="after")
     def validate_ph_window_and_solvent(self) -> ChemistryConfig:
@@ -110,6 +112,125 @@ class EnumerationConfig(StrictModel):
         if value <= 0:
             raise ValueError("enumeration caps must be positive")
         return value
+
+
+class ProtonationConfig(StrictModel):
+    enabled: bool = True
+    tool: str = "molscrub"
+    mode: str = "plausible"
+    max_protomers_per_molecule: int = 4
+    keep_input_state: bool = True
+    keep_best_per_charge: bool = True
+    skip_gen3d_in_molscrub: bool = True
+    timeout_seconds_per_molecule: int = 60
+
+    @field_validator("max_protomers_per_molecule", "timeout_seconds_per_molecule")
+    @classmethod
+    def positive_protonation_limit(cls, value: int) -> int:
+        if value <= 0:
+            raise ValueError("protonation limits must be positive")
+        return value
+
+
+class TautomerFilteringConfig(StrictModel):
+    enabled: bool = True
+    tool: str = "auto3d"
+    tauto_engine: str = "rdkit"
+    optimizing_engine: Auto3dModel = "ANI2xt"
+    fallback_optimizing_engine: Auto3dModel = "AIMNET"
+    use_gpu: bool = True
+    max_rdkit_tautomers_before_auto3d: int = 64
+    rdkit_tautomer_timeout_seconds: int = 30
+    auto3d_max_confs_per_tautomer: int = 3
+    auto3d_patience: int = 100
+    tauto_k: int = 3
+    tauto_window_kcal_mol: float = 5.0
+    keep_input_tautomer: bool = True
+    timeout_seconds_per_protomer: int = 600
+
+    @field_validator(
+        "max_rdkit_tautomers_before_auto3d",
+        "rdkit_tautomer_timeout_seconds",
+        "auto3d_max_confs_per_tautomer",
+        "auto3d_patience",
+        "tauto_k",
+        "timeout_seconds_per_protomer",
+    )
+    @classmethod
+    def positive_tautomer_filtering_limit(cls, value: int) -> int:
+        if value <= 0:
+            raise ValueError("tautomer filtering limits must be positive")
+        return value
+
+    @field_validator("tauto_window_kcal_mol")
+    @classmethod
+    def nonnegative_tautomer_window(cls, value: float) -> float:
+        if value < 0:
+            raise ValueError("tautomer filtering energy window must be non-negative")
+        return value
+
+
+class StereoisomerFilteringConfig(StrictModel):
+    enabled: bool = True
+    enumerator: str = "rdkit"
+    max_stereoisomers_per_tautomer: int = 16
+    timeout_seconds_per_tautomer: int = 300
+    try_embedding: bool = True
+    only_unassigned: bool = True
+    collapse_enantiomers_in_achiral_solvent: bool = True
+    run_energy_for_enantiomer_representatives_only: bool = True
+    stereo_energy_window_kcal_mol: float = 7.0
+    keep_top_n_diastereomers: int = 8
+
+    @field_validator(
+        "max_stereoisomers_per_tautomer",
+        "timeout_seconds_per_tautomer",
+        "keep_top_n_diastereomers",
+    )
+    @classmethod
+    def positive_stereoisomer_filtering_limit(cls, value: int) -> int:
+        if value <= 0:
+            raise ValueError("stereoisomer filtering limits must be positive")
+        return value
+
+    @field_validator("stereo_energy_window_kcal_mol")
+    @classmethod
+    def nonnegative_stereo_window(cls, value: float) -> float:
+        if value < 0:
+            raise ValueError("stereoisomer filtering energy window must be non-negative")
+        return value
+
+
+class Final3dConfig(StrictModel):
+    tool: str = "auto3d"
+    optimizing_engine: Auto3dModel = "AIMNET"
+    fallback_optimizing_engine: Auto3dModel = "ANI2xt"
+    use_gpu: bool = True
+    k: int = 1
+    max_confs: int = 10
+    patience: int = 100
+    energy_window_kcal_mol: float = 7.0
+    one_conformer_per_variant: bool = True
+
+    @field_validator("k", "max_confs", "patience")
+    @classmethod
+    def positive_final_3d_limit(cls, value: int) -> int:
+        if value <= 0:
+            raise ValueError("final_3d limits must be positive")
+        return value
+
+    @field_validator("energy_window_kcal_mol")
+    @classmethod
+    def nonnegative_final_3d_window(cls, value: float) -> float:
+        if value < 0:
+            raise ValueError("final_3d energy window must be non-negative")
+        return value
+
+
+class OptionalValidationConfig(StrictModel):
+    crest_xtb_enabled: bool = False
+    censo_enabled: bool = False
+    xtb_thermo_enabled: bool = False
 
 
 class SeedingConfig(StrictModel):
@@ -424,6 +545,11 @@ class RunConfig(StrictModel):
     resume: bool = True
     chemistry: ChemistryConfig = Field(default_factory=ChemistryConfig)
     enumeration: EnumerationConfig = Field(default_factory=EnumerationConfig)
+    protonation: ProtonationConfig = Field(default_factory=ProtonationConfig)
+    tautomer_filtering: TautomerFilteringConfig = Field(default_factory=TautomerFilteringConfig)
+    stereoisomer_filtering: StereoisomerFilteringConfig = Field(default_factory=StereoisomerFilteringConfig)
+    final_3d: Final3dConfig = Field(default_factory=Final3dConfig)
+    optional_validation: OptionalValidationConfig = Field(default_factory=OptionalValidationConfig)
     seeding: SeedingConfig = Field(default_factory=SeedingConfig)
     crest: CrestConfig = Field(default_factory=CrestConfig)
     xtb_prefilter: XtbPrefilterConfig = Field(default_factory=XtbPrefilterConfig)
