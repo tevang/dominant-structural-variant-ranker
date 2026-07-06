@@ -6,6 +6,7 @@ from rdkit import Chem
 
 from dsvr.config import RunConfig
 from dsvr.io.write_outputs import RANKED_VARIANT_COLUMNS, SDF_RANKED_PROPERTIES
+from dsvr.reporting.audit import VARIANT_DECISION_COLUMNS
 from dsvr.models import CrestConformerRecord
 from dsvr.workflow.engine import run_workflow
 
@@ -158,6 +159,32 @@ def test_default_ligprep_like_writes_final_auto3d_variants_without_crest(
     assert (outdir / "final_variants.json").exists()
     assert (outdir / "final_variant_energies.csv").exists()
     assert (outdir / "ranked_variants.csv").exists()
+    assert (outdir / "variant_decisions.csv").exists()
+    for name in (
+        "protomers_all.csv",
+        "protomers_selected.csv",
+        "protomers_rejected.csv",
+        "tautomers_all_pre_auto3d.csv",
+        "tautomers_auto3d_ranked.csv",
+        "tautomers_selected.csv",
+        "tautomers_rejected.csv",
+        "stereoisomers_all.csv",
+        "stereoisomers_selected.csv",
+        "stereoisomers_rejected.csv",
+    ):
+        assert (outdir / name).exists(), name
+
+    decisions = pd.read_csv(outdir / "variant_decisions.csv")
+    assert set(VARIANT_DECISION_COLUMNS).issubset(decisions.columns)
+    assert "final_variant" in set(decisions["stage"])
+    assert decisions["rejection_reason"].fillna("").map(type).eq(str).all()
+
+    report = (outdir / "report.md").read_text(encoding="utf-8")
+    assert "Concise Audit Summary" in report
+    assert "Molecules read:" in report
+    assert "Final variants written:" in report
+    assert "Agent interventions enabled:" in report
+    assert "Optional validation results enabled:" in report
     assert not any((outdir / "crest").glob("*/crest_provenance.jsonl"))
 
 

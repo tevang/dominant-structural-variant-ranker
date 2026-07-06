@@ -94,6 +94,7 @@ def _report_text(
     stereo_reduction = manifest.get("filtering", {}).get("stereo_reduction", {})
     xtb_prefilter = manifest.get("filtering", {}).get("xtb_prefilter", {})
     stage_summary_rows = _stage_summary_rows(config.output_dir / "stage_summary.csv")
+    audit_summary_rows = _audit_summary_rows(config.output_dir, config, records, ranked_records)
     lines = [
         "# DSVR Run Report",
         "",
@@ -152,6 +153,10 @@ def _report_text(
         "## Stage Counts",
         "",
         *[f"- {stage}: {count}" for stage, count in sorted(counts.items())],
+        "",
+        "## Concise Audit Summary",
+        "",
+        *audit_summary_rows,
         "",
         "## Top Ranked Variants Per Input",
         "",
@@ -239,6 +244,98 @@ def _report_text(
         "",
     ]
     return "\n".join(lines)
+
+
+def _audit_summary_rows(
+    outdir: Path,
+    config: RunConfig,
+    records: list[AnyLineageRecord],
+    ranked_records: list[RankedVariantRecord],
+) -> list[str]:
+    summary = _stage_summary_counts(outdir / "stage_summary.csv")
+    rows = [
+        f"- Molecules read: {_molecules_read(outdir, records)}",
+        f"- Molecules failed: {_molecules_failed(outdir)}",
+        _stage_count_line("Protomers", summary.get("Protomer generation"), outdir / "protomers_all.csv", outdir / "protomers_selected.csv", outdir / "protomers_rejected.csv"),
+        _stage_count_line("Tautomers", summary.get("Tautomer filtering"), outdir / "tautomers_all_pre_auto3d.csv", outdir / "tautomers_selected.csv", outdir / "tautomers_rejected.csv"),
+        _stage_count_line("Stereoisomers", summary.get("Stereoisomer Auto3D filtering") or summary.get("Stereoisomer enumeration"), outdir / "stereoisomers_all.csv", outdir / "stereoisomers_selected.csv", outdir / "stereoisomers_rejected.csv"),
+        f"- Final variants written: {len(ranked_records)}",
+        f"- Timeouts: {sum(row.get('timeout_count', 0) for row in summary.values())}",
+        f"- Agent interventions enabled: {config.agent.enabled}",
+        (
+            "- Optional validation results enabled: "
+            f"{config.optional_validation.crest_xtb_enabled or config.optional_validation.xtb_thermo_enabled}"
+        ),
+    ]
+    return rows
+
+
+def _stage_summary_counts(path: Path) -> dict[str, dict[str, int]]:
+    if not path.exists():
+        return {}
+    rows: dict[str, dict[str, int]] = {}
+    with path.open(encoding="utf-8", newline="") as handle:
+        for row in csv.DictReader(handle):
+            rows[row.get("stage", "")] = {
+                "generated_count": _int_cell(row.get("generated_count")),
+                "selected_count": _int_cell(row.get("selected_count") or row.get("accepted_count")),
+                "rejected_count": _int_cell(row.get("rejected_count")),
+                "timeout_count": _int_cell(row.get("timeout_count")),
+            }
+    return rows
+
+
+def _stage_count_line(
+    label: str,
+    summary: dict[str, int] | None,
+    all_path: Path,
+    selected_path: Path,
+    rejected_path: Path,
+) -> str:
+    generated = summary.get("generated_count", 0) if summary else _csv_data_row_count(all_path)
+    selected = summary.get("selected_count", 0) if summary else _csv_data_row_count(selected_path)
+    rejected = summary.get("rejected_count", 0) if summary else _csv_data_row_count(rejected_path)
+    if generated == 0:
+        generated = _csv_data_row_count(all_path)
+    if selected == 0:
+        selected = _csv_data_row_count(selected_path)
+    if rejected == 0:
+        rejected = _csv_data_row_count(rejected_path)
+    return f"- {label} generated/selected/rejected: {generated}/{selected}/{rejected}"
+
+
+def _molecules_read(outdir: Path, records: list[AnyLineageRecord]) -> int:
+    inputs = _csv_data_row_count(outdir / "inputs.csv")
+    if inputs:
+        return inputs
+    return len({record.input_molecule_id for record in records if record.stage_name == "input"})
+
+
+def _molecules_failed(outdir: Path) -> int:
+    invalid = _csv_data_row_count(outdir / "invalid_inputs.csv")
+    failures_path = outdir / "structure_failures.csv"
+    if not failures_path.exists():
+        return invalid
+    failed_ids: set[str] = set()
+    with failures_path.open(encoding="utf-8", newline="") as handle:
+        for row in csv.DictReader(handle):
+            failed_ids.add(row.get("input_molecule_id") or row.get("input_id") or row.get("molname") or "")
+    failed_ids.discard("")
+    return invalid + len(failed_ids)
+
+
+def _csv_data_row_count(path: Path) -> int:
+    if not path.exists() or path.stat().st_size == 0:
+        return 0
+    with path.open(encoding="utf-8", newline="") as handle:
+        return sum(1 for _row in csv.DictReader(handle))
+
+
+def _int_cell(value: object) -> int:
+    try:
+        return int(float(str(value or "0")))
+    except ValueError:
+        return 0
 
 
 def _stage_summary_rows(path: Path) -> list[str]:
