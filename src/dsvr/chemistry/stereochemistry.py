@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import csv
+import multiprocessing as mp
+import queue
 from pathlib import Path
 
 from rdkit import Chem
@@ -14,19 +16,68 @@ from dsvr.config import RunConfig
 from dsvr.models import StereoRecord, TautomerRecord, make_stereo_id
 
 
+STEREO_TIMEOUT_FALLBACK = "STEREO_TIMEOUT_FALLBACK"
+
+
 def enumerate_stereoisomers(
     tautomer_record: TautomerRecord,
     config: RunConfig,
 ) -> list[StereoRecord]:
+    max_isomers = _max_stereoisomers(config)
     options = StereoEnumerationOptions(
-        tryEmbedding=config.enumeration.stereo_try_embedding,
-        onlyUnassigned=config.enumeration.stereo_only_unassigned,
+        tryEmbedding=(
+            config.stereoisomer_filtering.try_embedding
+            and config.enumeration.stereo_try_embedding
+        ),
+        onlyUnassigned=(
+            config.stereoisomer_filtering.only_unassigned
+            and config.enumeration.stereo_only_unassigned
+        ),
         unique=config.enumeration.stereo_unique,
-        maxIsomers=config.enumeration.max_stereoisomers_per_tautomer,
+        maxIsomers=max_isomers,
         rand=config.enumeration.stereo_random_seed,
     )
     input_mol = Chem.Mol(tautomer_record.rdkit_mol)
-    raw_stereoisomers = list(EnumerateStereoisomers(input_mol, options=options))
+    extra_warnings: list[str] = []
+    try:
+        raw_stereoisomers = _enumerate_with_timeout(
+            input_mol,
+            timeout_seconds=config.stereoisomer_filtering.timeout_seconds_per_tautomer,
+            try_embedding=options.tryEmbedding,
+            only_unassigned=options.onlyUnassigned,
+            unique=options.unique,
+            max_isomers=max_isomers,
+            random_seed=options.rand,
+        )
+        if (
+            options.tryEmbedding
+            and len(raw_stereoisomers) < max_isomers
+            and _has_potential_double_bond_stereo(input_mol)
+        ):
+            retry_stereoisomers = _enumerate_with_timeout(
+                input_mol,
+                timeout_seconds=config.stereoisomer_filtering.timeout_seconds_per_tautomer,
+                try_embedding=False,
+                only_unassigned=options.onlyUnassigned,
+                unique=options.unique,
+                max_isomers=max_isomers,
+                random_seed=options.rand,
+            )
+            if len(retry_stereoisomers) > len(raw_stereoisomers):
+                raw_stereoisomers = retry_stereoisomers
+                extra_warnings.append(
+                    "RDKit tryEmbedding under-enumerated potential double-bond stereo; "
+                    "retried enumeration without embedding to preserve E/Z candidates."
+                )
+    except TimeoutError:
+        raw_stereoisomers = [input_mol]
+        extra_warnings.append(
+            f"{STEREO_TIMEOUT_FALLBACK}: RDKit stereoisomer enumeration timeout; "
+            "retained input stereo state"
+        )
+    except RuntimeError as exc:
+        raw_stereoisomers = [input_mol]
+        extra_warnings.append(f"RDKit stereoisomer enumeration failed; retained input state: {exc}")
     output_dir = config.output_dir / "enumeration" / "stereoisomers"
     output_dir.mkdir(parents=True, exist_ok=True)
     records = _records_from_stereoisomers(
@@ -35,6 +86,7 @@ def enumerate_stereoisomers(
         config=config,
         options=options,
         output_dir=output_dir,
+        extra_warnings=extra_warnings,
     )
     _write_stereo_sdf(output_dir / f"{tautomer_record.id}_stereoisomers.sdf", records)
     _write_stereo_csv(output_dir / f"{tautomer_record.id}_stereoisomers.csv", records)
@@ -48,6 +100,7 @@ def _records_from_stereoisomers(
     config: RunConfig,
     options: StereoEnumerationOptions,
     output_dir: Path,
+    extra_warnings: list[str] | None = None,
 ) -> list[StereoRecord]:
     seen: set[str] = set()
     unique_stereoisomers: list[Chem.Mol] = []
@@ -58,7 +111,7 @@ def _records_from_stereoisomers(
         seen.add(isomeric_smiles)
         unique_stereoisomers.append(stereoisomer)
 
-    cap = config.enumeration.max_stereoisomers_per_tautomer
+    cap = _max_stereoisomers(config)
     hit_cap = len(unique_stereoisomers) >= cap and len(stereoisomers) >= cap
     limited_stereoisomers = unique_stereoisomers[:cap]
     records: list[StereoRecord] = []
@@ -75,6 +128,7 @@ def _records_from_stereoisomers(
             "dedupe_key": {"isomeric_smiles": isomeric_smiles},
         }
         warnings = [
+            *(extra_warnings or []),
             "RDKit stereoisomer enumeration is candidate generation only; dominance "
             "ranking occurs later.",
             "tryEmbedding is a heuristic filter and can be computationally expensive.",
@@ -120,6 +174,121 @@ def _records_from_stereoisomers(
             )
         )
     return records
+
+
+def _has_potential_double_bond_stereo(molecule: Chem.Mol) -> bool:
+    for bond in molecule.GetBonds():
+        if bond.GetBondType() != Chem.BondType.DOUBLE or bond.IsInRing():
+            continue
+        begin = bond.GetBeginAtom()
+        end = bond.GetEndAtom()
+        if begin.GetAtomicNum() == 6 and end.GetAtomicNum() == 6:
+            if begin.GetDegree() > 1 and end.GetDegree() > 1:
+                return True
+    return False
+
+
+def _max_stereoisomers(config: RunConfig) -> int:
+    return min(
+        config.stereoisomer_filtering.max_stereoisomers_per_tautomer,
+        config.enumeration.max_stereoisomers_per_tautomer,
+    )
+
+
+def _enumerate_with_timeout(
+    molecule: Chem.Mol,
+    *,
+    timeout_seconds: int,
+    try_embedding: bool,
+    only_unassigned: bool,
+    unique: bool,
+    max_isomers: int,
+    random_seed: int,
+) -> list[Chem.Mol]:
+    output_queue: mp.Queue = mp.Queue(maxsize=1)
+    process = mp.Process(
+        target=_stereo_worker,
+        args=(
+            Chem.MolToSmiles(molecule, canonical=True, isomericSmiles=True),
+            try_embedding,
+            only_unassigned,
+            unique,
+            max_isomers,
+            random_seed,
+            output_queue,
+        ),
+    )
+    try:
+        process.start()
+        process.join(timeout_seconds)
+        if process.is_alive():
+            process.terminate()
+            process.join(2)
+            if process.is_alive():
+                process.kill()
+                process.join(2)
+            raise TimeoutError("RDKit stereoisomer enumeration timed out")
+        try:
+            payload = output_queue.get_nowait()
+        except queue.Empty as exc:
+            raise RuntimeError("RDKit stereoisomer worker produced no output") from exc
+        if payload.get("status") != "ok":
+            raise RuntimeError(str(payload.get("error", "unknown stereo worker error")))
+        molecules = [
+            mol
+            for mol in (
+                Chem.MolFromMolBlock(block, sanitize=True, removeHs=False)
+                for block in payload.get("molblocks", [])
+            )
+            if mol is not None
+        ]
+        return molecules or [Chem.Mol(molecule)]
+    finally:
+        if process.is_alive():
+            process.terminate()
+            process.join(2)
+            if process.is_alive():
+                process.kill()
+                process.join(2)
+        output_queue.close()
+        output_queue.join_thread()
+        close = getattr(process, "close", None)
+        if close is not None:
+            close()
+
+
+def _stereo_worker(
+    smiles: str,
+    try_embedding: bool,
+    only_unassigned: bool,
+    unique: bool,
+    max_isomers: int,
+    random_seed: int,
+    output_queue: mp.Queue,
+) -> None:
+    try:
+        molecule = Chem.MolFromSmiles(smiles, sanitize=True)
+        if molecule is None:
+            raise ValueError("could not parse stereo worker molecule")
+        options = StereoEnumerationOptions(
+            tryEmbedding=try_embedding,
+            onlyUnassigned=only_unassigned,
+            unique=unique,
+            maxIsomers=max_isomers,
+            rand=random_seed,
+        )
+        stereoisomers = list(EnumerateStereoisomers(molecule, options=options))
+        output_queue.put(
+            {
+                "status": "ok",
+                "molblocks": [
+                    Chem.MolToMolBlock(stereoisomer)
+                    for stereoisomer in stereoisomers[:max_isomers]
+                ],
+            }
+        )
+    except Exception as exc:  # pragma: no cover - exercised through parent process.
+        output_queue.put({"status": "error", "error": str(exc)})
 
 
 def read_tautomers_sdf(path: Path) -> list[TautomerRecord]:

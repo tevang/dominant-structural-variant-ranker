@@ -113,3 +113,47 @@ def _tautomer(molname: str, smiles: str) -> TautomerRecord:
         tautomer_index=1,
         rdkit_mol=molecule,
     )
+
+
+
+def test_stereo_timeout_fallback_keeps_input_state(tmp_path: Path, monkeypatch) -> None:
+    import time
+
+    tautomer = _tautomer("lactic", "CC(O)C(=O)O")
+
+    def hanging_worker(*args, **kwargs):
+        time.sleep(10)
+
+    monkeypatch.setattr("dsvr.chemistry.stereochemistry._stereo_worker", hanging_worker)
+    config = RunConfig(
+        input_path=tmp_path / "input.sdf",
+        output_dir=tmp_path / "run",
+        stereoisomer_filtering={"timeout_seconds_per_tautomer": 1},
+    )
+
+    records = enumerate_stereoisomers(tautomer, config)
+
+    assert len(records) == 1
+    assert records[0].isomeric_smiles == "CC(O)C(=O)O"
+    assert any("STEREO_TIMEOUT_FALLBACK" in warning for warning in records[0].warnings)
+
+
+def test_assigned_stereo_is_preserved_unless_assigned_centers_are_enabled(tmp_path: Path) -> None:
+    tautomer = _tautomer("bromochlorofluoromethane", "F[C@H](Cl)Br")
+    default_config = RunConfig(input_path=tmp_path / "input.sdf", output_dir=tmp_path / "default")
+    default_records = enumerate_stereoisomers(tautomer, default_config)
+
+    enumerate_assigned_config = RunConfig(
+        input_path=tmp_path / "input.sdf",
+        output_dir=tmp_path / "assigned",
+        stereoisomer_filtering={"only_unassigned": False},
+        enumeration={"stereo_only_unassigned": False},
+    )
+    assigned_records = enumerate_stereoisomers(tautomer, enumerate_assigned_config)
+
+    assert len(default_records) == 1
+    assert default_records[0].isomeric_smiles == "F[C@H](Cl)Br"
+    assert {record.isomeric_smiles for record in assigned_records} == {
+        "F[C@H](Cl)Br",
+        "F[C@@H](Cl)Br",
+    }

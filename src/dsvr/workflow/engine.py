@@ -18,6 +18,7 @@ from dsvr.chemistry.conformers_auto3d import (
 from dsvr.chemistry.conformers_rdkit import generate_rdkit_seeds, read_stereo_sdf
 from dsvr.chemistry.protonation import generate_protomer_candidates
 from dsvr.chemistry.stereochemistry import enumerate_stereoisomers, read_tautomers_sdf
+from dsvr.chemistry.stereo_auto3d_filter import filter_stereoisomers_with_auto3d
 from dsvr.chemistry.tautomer_auto3d_filter import filter_tautomers_with_auto3d
 from dsvr.chemistry.tautomers import enumerate_tautomers, read_protomers_sdf
 from dsvr.config import RunConfig, write_resolved_config
@@ -245,11 +246,20 @@ def run_workflow(config: RunConfig) -> WorkflowResult:
         progress=progress,
         progress_stage="Stereoisomer enumeration",
     )
+    stereo_energy_result = filter_stereoisomers_with_auto3d(stereos, config)
+    stereos = stereo_energy_result.all_records
+    stereos_for_seeding = stereo_energy_result.selected_records
     records.extend(stereos)
     _write_stage_summary_sdf(outdir / "all_stereoisomers.sdf", stereos)
-    progress.record("Stereoisomer enumeration", "completed", generated_count=len(stereos))
-    progress.record("Cheap variant scoring", "started", generated_count=len(stereos))
-    stereos_for_seeding, decisions = select_stereo_records(stereos, config, "pre_3d")
+    progress.record(
+        "Stereoisomer enumeration",
+        "completed",
+        generated_count=len(stereos),
+        accepted_count=len(stereos_for_seeding),
+        rejected_count=len(stereo_energy_result.rejected_records),
+    )
+    progress.record("Cheap variant scoring", "started", generated_count=len(stereos_for_seeding))
+    stereos_for_seeding, decisions = select_stereo_records(stereos_for_seeding, config, "pre_3d")
     filtering_decisions.extend(decisions)
     stereos_for_seeding, decisions = select_stereo_records(
         stereos_for_seeding,
@@ -498,6 +508,14 @@ def run_workflow(config: RunConfig) -> WorkflowResult:
         "enabled": config.variant_filtering.enabled,
         "decision_counts": decision_counts(filtering_decisions),
         "decision_count": len(filtering_decisions),
+        "stereo_energy_filtering": {
+            "enabled": config.stereoisomer_filtering.enabled,
+            "enumerated_count": len(stereo_energy_result.all_records),
+            "selected_count": len(stereo_energy_result.selected_records),
+            "rejected_count": len(stereo_energy_result.rejected_records),
+            "collapsed_count": stereo_energy_result.collapsed_count,
+            "energy_evaluation_count": stereo_energy_result.energy_evaluation_count,
+        },
         "stereo_reduction": {
             "jobs_saved": stereo_reduction.jobs_saved,
             "decision_count": len(stereo_reduction.decisions),
@@ -941,6 +959,11 @@ def _publish_top_level_run_outputs(outdir: Path) -> None:
         outdir / "all_tautomers.sdf",
         outdir / "all_stereoisomers.sdf",
         outdir / "all_3d_conformers.sdf",
+        outdir / "stereoisomers_all.csv",
+        outdir / "stereoisomers_selected.csv",
+        outdir / "stereoisomers_rejected.csv",
+        outdir / "stereo_energy_ranked.csv",
+        outdir / "stereo_enantiomer_groups.csv",
         outdir / "auto3d_protocol_seeds.sdf",
         outdir / "auto3d_protocol_seeds.csv",
         outdir / "auto3d_adaptive_plan.csv",
@@ -1560,6 +1583,11 @@ def _final_output_files(outdir: Path) -> list[Path]:
         "protomers.csv",
         "tautomers.csv",
         "stereoisomers.csv",
+        "stereoisomers_all.csv",
+        "stereoisomers_selected.csv",
+        "stereoisomers_rejected.csv",
+        "stereo_energy_ranked.csv",
+        "stereo_enantiomer_groups.csv",
         "all_protomers.sdf",
         "all_tautomers.sdf",
         "all_stereoisomers.sdf",

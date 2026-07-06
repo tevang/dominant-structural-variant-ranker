@@ -85,6 +85,13 @@ def test_report_states_stereo_collapse_jobs_saved(tmp_path: Path) -> None:
         ranked_records=[],
         manifest={
             "filtering": {
+                "stereo_energy_filtering": {
+                    "enumerated_count": 6,
+                    "selected_count": 4,
+                    "rejected_count": 2,
+                    "collapsed_count": 1,
+                    "energy_evaluation_count": 5,
+                },
                 "stereo_reduction": {
                     "jobs_saved": 3,
                     "enabled": True,
@@ -96,6 +103,11 @@ def test_report_states_stereo_collapse_jobs_saved(tmp_path: Path) -> None:
     )
 
     text = report_path.read_text(encoding="utf-8")
+    assert "Enumerated stereo states: 6" in text
+    assert "Selected stereo states: 4" in text
+    assert "Rejected stereo states: 2" in text
+    assert "Enantiomer states collapsed for Auto3D energy evaluation: 1" in text
+    assert "Auto3D stereo energy evaluations run: 5" in text
     assert "CREST jobs saved by enantiomer collapse: 3" in text
 
 

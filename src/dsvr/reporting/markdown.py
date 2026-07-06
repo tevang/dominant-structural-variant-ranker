@@ -89,6 +89,7 @@ def _report_text(
         if any(token in warning.lower() for token in ("failed", "unavailable", "error"))
     ]
     tautomer_timeout_rows = _tautomer_timeout_rows(records)
+    stereo_energy = manifest.get("filtering", {}).get("stereo_energy_filtering", {})
     stereo_reduction = manifest.get("filtering", {}).get("stereo_reduction", {})
     xtb_prefilter = manifest.get("filtering", {}).get("xtb_prefilter", {})
     lines = [
@@ -120,6 +121,22 @@ def _report_text(
         ),
         f"- RDKit tautomer max transforms: {config.tautomer_filtering.max_rdkit_transforms}",
         f"- RDKit tautomer timeout fallback: {config.tautomer_filtering.fallback_if_timeout}",
+        (
+            "- RDKit stereoisomer timeout seconds: "
+            f"{config.stereoisomer_filtering.timeout_seconds_per_tautomer}"
+        ),
+        (
+            "- RDKit stereoisomer max isomers per tautomer: "
+            f"{config.stereoisomer_filtering.max_stereoisomers_per_tautomer}"
+        ),
+        (
+            "- Stereo Auto3D energy window kcal/mol: "
+            f"{config.stereoisomer_filtering.stereo_energy_window_kcal_mol}"
+        ),
+        (
+            "- Stereo keep top N diastereomers: "
+            f"{config.stereoisomer_filtering.keep_top_n_diastereomers}"
+        ),
         "",
         "## Tool Versions",
         "",
@@ -165,6 +182,20 @@ def _report_text(
         "| Input ID | Molecule | Timeout fallback count |",
         "| --- | --- | ---: |",
         *(tautomer_timeout_rows or ["| none | none | 0 |"]),
+        "",
+        "## Stereoisomer Energy Filtering",
+        "",
+        f"- Enumerated stereo states: {stereo_energy.get('enumerated_count', 0)}",
+        f"- Selected stereo states: {stereo_energy.get('selected_count', 0)}",
+        f"- Rejected stereo states: {stereo_energy.get('rejected_count', 0)}",
+        (
+            "- Enantiomer states collapsed for Auto3D energy evaluation: "
+            f"{stereo_energy.get('collapsed_count', 0)}"
+        ),
+        (
+            "- Auto3D stereo energy evaluations run: "
+            f"{stereo_energy.get('energy_evaluation_count', 0)}"
+        ),
         "",
         "## Stereo Reduction",
         "",
