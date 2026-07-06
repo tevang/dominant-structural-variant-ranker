@@ -255,11 +255,13 @@ class AgentConfig(StrictModel):
     backend: str = "ollama_codex_cli"
     command: str = "codex --oss -m qwen3.6:35b"
     max_context_chars: int = 12000
+    command_timeout_seconds: int = 120
     allowed_tasks: list[str] = Field(
         default_factory=lambda: [
             "classify_failure",
             "suggest_retry_from_menu",
             "summarize_logs",
+            "suggest_config_tweak",
         ]
     )
     require_user_approval_for: list[str] = Field(
@@ -272,11 +274,18 @@ class AgentConfig(StrictModel):
     )
     max_attempts_per_failure: int = 1
 
-    @field_validator("max_context_chars", "max_attempts_per_failure")
+    @field_validator("max_context_chars", "command_timeout_seconds", "max_attempts_per_failure")
     @classmethod
     def positive_agent_limit(cls, value: int) -> int:
         if value <= 0:
             raise ValueError("agent limits must be positive")
+        return value
+
+    @field_validator("command")
+    @classmethod
+    def nonempty_agent_command(cls, value: str) -> str:
+        if not value.strip():
+            raise ValueError("agent command must not be empty")
         return value
 
 

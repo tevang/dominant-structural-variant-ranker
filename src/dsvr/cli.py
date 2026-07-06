@@ -8,6 +8,9 @@ import typer
 from rich.console import Console
 from rich.table import Table
 
+from dsvr.agent.action_menu import deterministic_action_for_failure
+from dsvr.agent.bug_package import build_bug_package
+from dsvr.agent.local_qwen import LocalAgentResult, run_local_diagnostic_agent
 from dsvr.chemistry.conformers_auto3d import generate_auto3d_seeds
 from dsvr.chemistry.conformers_rdkit import generate_rdkit_seeds, read_stereo_sdf
 from dsvr.chemistry.protonation import generate_protomer_candidates
@@ -44,6 +47,8 @@ from dsvr.workflow.status import run_status
 from dsvr.workflow.steps import planned_steps
 
 app = typer.Typer(help="Rank pH- and solvent-dependent structural variants of small molecules.")
+agent_app = typer.Typer(help="Experimental opt-in local diagnostic agent commands.")
+app.add_typer(agent_app, name="agent")
 console = Console()
 LOG_LEVELS = {"DEBUG", "INFO", "WARNING", "ERROR"}
 
@@ -96,6 +101,79 @@ def _validation_report_path(out: Path) -> Path:
     if out.suffix.lower() == ".json":
         return out
     return out / "validation_report.json"
+
+
+def _load_agent_enabled_run_config(run_dir: Path) -> RunConfig:
+    resolved_config = run_dir / "resolved_config.yaml"
+    if not resolved_config.exists():
+        raise typer.BadParameter(
+            f"{run_dir} does not contain resolved_config.yaml. Cannot run agent diagnostics."
+        )
+    config = load_config(resolved_config)
+    data = config.model_dump(mode="python")
+    data["output_dir"] = run_dir
+    config = RunConfig.model_validate(data)
+    if not config.agent.enabled:
+        raise typer.BadParameter(
+            "Local diagnostic agent is disabled. Set agent.enabled=true in resolved_config.yaml "
+            "or rerun with an enabled config to use dsvr agent commands."
+        )
+    return config
+
+
+def _run_agent_diagnostic(
+    run_dir: Path,
+    *,
+    latest: bool,
+    task_key: str,
+    task: str,
+) -> dict[str, Any]:
+    config = _load_agent_enabled_run_config(run_dir)
+    if task_key not in config.agent.allowed_tasks:
+        raise typer.BadParameter(f"Agent task is not allowed by config: {task_key}")
+    package = build_bug_package(run_dir, config, latest=latest)
+    deterministic_action = deterministic_action_for_failure(package.failure.get("failure_kind"))
+    result = run_local_diagnostic_agent(
+        agent=config.agent,
+        task=task,
+        bug_context=package.prompt_context,
+    )
+    return _agent_payload(
+        run_dir=run_dir,
+        package_path=package.path,
+        failure=package.failure,
+        deterministic_action=deterministic_action,
+        result=result,
+    )
+
+
+def _agent_payload(
+    *,
+    run_dir: Path,
+    package_path: Path,
+    failure: dict[str, Any],
+    deterministic_action: str,
+    result: LocalAgentResult,
+) -> dict[str, Any]:
+    decision = result.decision
+    return {
+        "run_dir": str(run_dir),
+        "bug_package": str(package_path),
+        "failure_kind": failure.get("failure_kind", "UNKNOWN"),
+        "stage": failure.get("stage", ""),
+        "item_id": failure.get("item_id"),
+        "deterministic_action": deterministic_action,
+        "agent_available": result.available,
+        "agent_action": decision.action,
+        "agent_output_valid": decision.valid,
+        "reasons": decision.reasons,
+        "config_tweak": decision.config_tweak,
+        "error": result.error,
+    }
+
+
+def _print_json_payload(payload: dict[str, Any]) -> None:
+    typer.echo(json.dumps(payload, indent=2, sort_keys=True, default=str))
 
 
 @app.callback()
@@ -240,6 +318,60 @@ def inspect(
     for mol in molecules:
         table.add_row(str(mol.index), mol.name, mol.input_format, mol.smiles or "")
     console.print(table)
+
+
+@agent_app.command(name="diagnose")
+def agent_diagnose(
+    run_dir: Annotated[Path, typer.Argument(exists=True, file_okay=False)],
+    latest: Annotated[
+        bool,
+        typer.Option("--latest/--no-latest", help="Diagnose the latest recorded failure."),
+    ] = True,
+) -> None:
+    """Build a compact bug package and run bounded local failure diagnostics."""
+    payload = _run_agent_diagnostic(
+        run_dir,
+        latest=latest,
+        task_key="classify_failure",
+        task="Summarize and classify the latest compact failure package.",
+    )
+    _print_json_payload(payload)
+
+
+@agent_app.command(name="suggest-retry")
+def agent_suggest_retry(
+    run_dir: Annotated[Path, typer.Argument(exists=True, file_okay=False)],
+    latest: Annotated[
+        bool,
+        typer.Option("--latest/--no-latest", help="Suggest action for the latest recorded failure."),
+    ] = True,
+) -> None:
+    """Ask the local agent to choose one action from the fixed retry menu."""
+    payload = _run_agent_diagnostic(
+        run_dir,
+        latest=latest,
+        task_key="suggest_retry_from_menu",
+        task="Choose exactly one retry or skip action from the allowed action menu.",
+    )
+    _print_json_payload(payload)
+
+
+@agent_app.command(name="summarize")
+def agent_summarize(
+    run_dir: Annotated[Path, typer.Argument(exists=True, file_okay=False)],
+    latest: Annotated[
+        bool,
+        typer.Option("--latest/--no-latest", help="Summarize the latest recorded failure."),
+    ] = True,
+) -> None:
+    """Ask the local agent for a constrained summary of the compact bug package."""
+    payload = _run_agent_diagnostic(
+        run_dir,
+        latest=latest,
+        task_key="summarize_logs",
+        task="Summarize the compact failure package and choose one allowed action.",
+    )
+    _print_json_payload(payload)
 
 
 @app.command(name="status")
