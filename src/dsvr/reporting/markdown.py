@@ -107,10 +107,11 @@ def _report_text(
         f"- Population scope: {config.thermo.population_scope}",
         f"- Thermo max variants per molecule: {config.thermo.max_variants_per_molecule}",
         f"- Thermo max conformers per variant: {config.thermo.max_conformers_per_variant}",
-        f"- CENSO enabled: {config.refinement.censo_enabled}",
-        f"- CENSO max candidates: {config.refinement.max_candidates_for_refinement}",
-        f"- QM enabled: {config.qm.enabled}",
-        f"- QM max candidates: {config.qm.max_candidates}",
+        f"- Optional CREST/xTB validation enabled: {config.optional_validation.crest_xtb_enabled}",
+        f"- Optional validation selection: {config.optional_validation.selection}",
+        f"- Optional validation max variants per molecule: {config.optional_validation.max_variants_per_molecule}",
+        f"- Optional validation cleanup policy: {config.optional_validation.cleanup_policy}",
+        f"- Optional xTB thermo validation enabled: {config.optional_validation.xtb_thermo_enabled}",
         f"- Final 3D tool: {config.final_3d.tool}",
         f"- Final 3D k: {config.final_3d.k}",
         f"- Final 3D max conformers: {config.final_3d.max_confs}",
@@ -169,8 +170,8 @@ def _report_text(
         ),
         (
             "- Ranking uses approximate final Auto3D conformer energies in the default "
-            "LigPrep-like path; optional CREST/xTB or downstream refined energies are "
-            "used only when validation stages are enabled."
+            "LigPrep-like path. Optional CREST/xTB validation writes separate outputs "
+            "and does not overwrite the default ranking."
         ),
         (
             f"- Population scope is '{config.thermo.population_scope}'; states outside "

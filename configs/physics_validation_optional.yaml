@@ -69,12 +69,13 @@ final_3d:
 
 optional_validation:
   crest_xtb_enabled: true
-  censo_enabled: false
+  max_variants_per_molecule: 5
+  selection: top_auto3d_energy
   xtb_thermo_enabled: true
-
-# Expensive optional validation path for selected small candidate sets only.
-# CREST/xTB, xTB thermo, CREST entropy, CENSO, Psi4, and PySCF are not default ligand-preparation steps.
-
+  crest_entropy_enabled: false
+  censo_enabled: false
+  keep_raw_xyz: false
+  cleanup_policy: compact
 agent:
   enabled: false
   backend: ollama_codex_cli

@@ -1,3 +1,4 @@
+import json
 from pathlib import Path
 
 import pandas as pd
@@ -5,6 +6,7 @@ from rdkit import Chem
 
 from dsvr.config import RunConfig
 from dsvr.io.write_outputs import RANKED_VARIANT_COLUMNS, SDF_RANKED_PROPERTIES
+from dsvr.models import CrestConformerRecord
 from dsvr.workflow.engine import run_workflow
 
 
@@ -157,3 +159,104 @@ def test_default_ligprep_like_writes_final_auto3d_variants_without_crest(
     assert (outdir / "final_variant_energies.csv").exists()
     assert (outdir / "ranked_variants.csv").exists()
     assert not any((outdir / "crest").glob("*/crest_provenance.jsonl"))
+
+
+
+def test_optional_crest_validation_writes_separate_outputs(tmp_path: Path, monkeypatch) -> None:
+    input_path = tmp_path / "mols.smi"
+    input_path.write_text("CCO ethanol\n", encoding="utf-8")
+    outdir = tmp_path / "run"
+    crest_calls = []
+
+    def fake_run_auto3d(
+        input_path: Path,
+        output_dir: Path,
+        *,
+        k: int,
+        model: str,
+        internal_tautomer_stereo_enum: bool,
+        max_confs: int | None = None,
+        patience: int | None = None,
+        use_gpu: bool = False,
+        timeout_s: int | None = None,
+        **kwargs,
+    ) -> tuple[Path, list[str]]:
+        supplier = Chem.SDMolSupplier(str(input_path), sanitize=True, removeHs=False)
+        output_sdf = output_dir / "mock_final_auto3d.sdf"
+        writer = Chem.SDWriter(str(output_sdf))
+        for mol in supplier:
+            if mol is None:
+                continue
+            mol.SetProp("E_kcal_mol", "-3.25")
+            writer.write(mol)
+        writer.close()
+        return output_sdf, ["auto3d", "mock", "--optimizing_engine", model]
+
+    def fake_run_crest_for_seed(seed, config):
+        crest_calls.append((seed, config))
+        return [
+            CrestConformerRecord(
+                id=f"{seed.id}_crest_validation_0001",
+                parent_id=seed.id,
+                input_molecule_id=seed.input_molecule_id,
+                molname=seed.molname,
+                canonical_smiles=seed.canonical_smiles,
+                isomeric_smiles=seed.isomeric_smiles,
+                molecular_formula=seed.molecular_formula,
+                formal_charge=seed.formal_charge,
+                explicit_proton_count=seed.explicit_proton_count,
+                source_software="crest",
+                source_python_function="test.fake_run_crest_for_seed",
+                warnings=["optional validation mock"],
+                metadata={"crest": {"workdir": str(outdir / "crest" / seed.id)}},
+                crest_index=1,
+                energy_kcal_mol=-4.0,
+                relative_energy_kcal_mol=0.0,
+            )
+        ]
+
+    monkeypatch.setattr("dsvr.chemistry.final3d.run_auto3d", fake_run_auto3d)
+    monkeypatch.setattr("dsvr.workflow.engine._tool_available", lambda executable: True)
+    monkeypatch.setattr("dsvr.workflow.engine.run_crest_for_seed", fake_run_crest_for_seed)
+
+    run_workflow(
+        RunConfig(
+            input_path=input_path,
+            output_dir=outdir,
+            overwrite=True,
+            protonation={"enabled": False},
+            tautomer_filtering={"enabled": False},
+            stereoisomer_filtering={"enabled": False},
+            enumeration={
+                "max_protomers_per_molecule": 1,
+                "max_tautomers_per_protomer": 1,
+                "max_stereoisomers_per_tautomer": 1,
+            },
+            optional_validation={"crest_xtb_enabled": True},
+        )
+    )
+
+    assert len(crest_calls) == 1
+    validation_csv = outdir / "crest_validation.csv"
+    validation_sdf = outdir / "crest_validation.sdf"
+    validation_report = outdir / "crest_validation_report.md"
+    assert validation_csv.exists()
+    assert validation_sdf.exists()
+    assert validation_report.exists()
+    assert (outdir / "optional_validation" / "selected_final_variants.sdf").exists()
+
+    validation_frame = pd.read_csv(validation_csv)
+    assert len(validation_frame) == 1
+    assert bool(validation_frame.loc[0, "optional_validation"]) is True
+    assert validation_frame.loc[0, "crest_energy_kcal_mol"] == -4.0
+
+    mols = [mol for mol in Chem.SDMolSupplier(str(validation_sdf), sanitize=True, removeHs=False) if mol]
+    assert len(mols) == 1
+    assert mols[0].GetProp("DSVR_OPTIONAL_VALIDATION") == "CREST/xTB"
+    assert mols[0].GetProp("DSVR_OPTIONAL_VALIDATION_DOES_NOT_SET_RANKING") == "True"
+
+    manifest = json.loads((outdir / "manifest.json").read_text(encoding="utf-8"))
+    assert manifest["optional_validation"]["crest_xtb_enabled"] is True
+    assert manifest["optional_validation"]["selected_count"] == 1
+    assert manifest["optional_validation"]["ranking_overwritten"] is False
+    assert (outdir / "ranked_variants.csv").exists()

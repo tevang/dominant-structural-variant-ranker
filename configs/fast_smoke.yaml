@@ -77,9 +77,13 @@ final_3d:
 
 optional_validation:
   crest_xtb_enabled: false
-  censo_enabled: false
+  max_variants_per_molecule: 5
+  selection: top_auto3d_energy
   xtb_thermo_enabled: false
-
+  crest_entropy_enabled: false
+  censo_enabled: false
+  keep_raw_xyz: false
+  cleanup_policy: compact
 refinement:
   censo_enabled: false
   psi4_enabled: false

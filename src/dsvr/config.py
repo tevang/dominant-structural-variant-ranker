@@ -22,6 +22,7 @@ FilteringMode = Literal["conservative", "balanced", "aggressive", "exhaustive"]
 CleanupPolicy = Literal["compact", "keep_selected", "debug_all"]
 TautomerStrategy = Literal["safe", "normal", "exhaustive"]
 TautomerTimeoutFallback = Literal["keep_input_and_canonical"]
+OptionalValidationSelection = Literal["top_auto3d_energy"]
 
 KNOWN_SOLVENTS = {
     "acetone",
@@ -233,8 +234,20 @@ class Final3dConfig(StrictModel):
 
 class OptionalValidationConfig(StrictModel):
     crest_xtb_enabled: bool = False
-    censo_enabled: bool = False
+    max_variants_per_molecule: int = 5
+    selection: OptionalValidationSelection = "top_auto3d_energy"
     xtb_thermo_enabled: bool = False
+    crest_entropy_enabled: bool = False
+    censo_enabled: bool = False
+    keep_raw_xyz: bool = False
+    cleanup_policy: CleanupPolicy = "compact"
+
+    @field_validator("max_variants_per_molecule")
+    @classmethod
+    def positive_optional_validation_limit(cls, value: int) -> int:
+        if value <= 0:
+            raise ValueError("optional_validation max_variants_per_molecule must be positive")
+        return value
 
 
 class AgentConfig(StrictModel):
@@ -655,6 +668,11 @@ def merge_cli_overrides(config: RunConfig, **overrides: Any) -> RunConfig:
     _set_if_present(data["chemistry"], "solvent", overrides.get("solvent"))
     _set_if_present(data["seeding"], "method", overrides.get("seeding_method"))
     _set_if_present(data["refinement"], "censo_enabled", overrides.get("censo_enabled"))
+    _set_if_present(
+        data["optional_validation"],
+        "crest_xtb_enabled",
+        overrides.get("crest_xtb_enabled"),
+    )
     return RunConfig.model_validate(data)
 
 

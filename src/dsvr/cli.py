@@ -844,6 +844,13 @@ def run(
         bool | None,
         typer.Option("--enable-censo/--disable-censo", help="Override optional CENSO refinement."),
     ] = None,
+    crest_xtb_enabled: Annotated[
+        bool | None,
+        typer.Option(
+            "--enable-crest-validation/--disable-crest-validation",
+            help="Run optional CREST/xTB validation on selected final variants.",
+        ),
+    ] = None,
     overwrite: Annotated[
         bool | None,
         typer.Option("--overwrite/--no-overwrite", help="Override workflow overwrite policy."),
@@ -866,6 +873,7 @@ def run(
         solvent=solvent,
         seeding_method=seeding_method,
         censo_enabled=censo_enabled,
+        crest_xtb_enabled=crest_xtb_enabled,
     )
     config = _apply_runtime_options(
         config,

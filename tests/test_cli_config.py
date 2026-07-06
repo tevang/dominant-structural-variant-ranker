@@ -21,10 +21,18 @@ def test_cli_overrides_config_values(tmp_path: Path) -> None:
                 "chemistry:",
                 "  ph: 7.0",
                 "  solvent: water",
+                "protonation:",
+                "  enabled: false",
+                "tautomer_filtering:",
+                "  enabled: false",
+                "stereoisomer_filtering:",
+                "  enabled: false",
                 "seeding:",
                 "  method: etkdg",
                 "refinement:",
                 "  censo_enabled: false",
+                "optional_validation:",
+                "  crest_xtb_enabled: false",
             ]
         ),
         encoding="utf-8",
@@ -46,6 +54,7 @@ def test_cli_overrides_config_values(tmp_path: Path) -> None:
             "--seeding-method",
             "auto3d",
             "--enable-censo",
+            "--enable-crest-validation",
         ],
     )
 
@@ -58,6 +67,7 @@ def test_cli_overrides_config_values(tmp_path: Path) -> None:
     assert resolved["chemistry"]["solvent"] == "dmso"
     assert resolved["seeding"]["method"] == "auto3d"
     assert resolved["refinement"]["censo_enabled"] is True
+    assert resolved["optional_validation"]["crest_xtb_enabled"] is True
 
 
 def test_cli_run_uses_config_output_dir_when_out_not_supplied(tmp_path: Path) -> None:
@@ -72,6 +82,12 @@ def test_cli_run_uses_config_output_dir_when_out_not_supplied(tmp_path: Path) ->
                 f"input_path: {input_path}",
                 "input_format: auto",
                 f"output_dir: {configured_out}",
+                "protonation:",
+                "  enabled: false",
+                "tautomer_filtering:",
+                "  enabled: false",
+                "stereoisomer_filtering:",
+                "  enabled: false",
                 "enumeration:",
                 "  max_protomers_per_molecule: 1",
                 "  max_tautomers_per_protomer: 1",

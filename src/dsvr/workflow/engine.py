@@ -593,8 +593,6 @@ def _use_final_auto3d_default_path(config: RunConfig) -> bool:
         and config.protocol == "default"
         and config.final_3d.tool == "auto3d"
         and config.final_3d.one_conformer_per_variant
-        and not config.optional_validation.crest_xtb_enabled
-        and not config.optional_validation.xtb_thermo_enabled
     )
 
 
@@ -667,20 +665,39 @@ def _run_final_auto3d_default_path(
     records.extend(ranked)
     progress.record("Ranking", "completed", generated_count=len(ranked))
 
+    validation_result = _run_optional_crest_validation(
+        final_records=final_records,
+        filtering_decisions=filtering_decisions,
+        config=config,
+        warnings=warnings,
+        progress=progress,
+    )
+    records.extend(validation_result["crest_records"])
+    records.extend(validation_result["thermo_records"])
     states.append(
         mark_done(
             steps["crest"],
-            records_hash(final_records),
+            records_hash(validation_result["selected_records"]),
             config,
-            details={"count": 0, "skipped_by": "final_3d_auto3d_default"},
+            details={
+                "count": validation_result["crest_record_count"],
+                "selected_final_variant_count": validation_result["selected_count"],
+                "enabled": config.optional_validation.crest_xtb_enabled,
+                "optional_validation": True,
+            },
         )
     )
     states.append(
         mark_done(
             steps["xtb_thermo"],
-            records_hash(final_records),
+            records_hash(validation_result["crest_records"]),
             config,
-            details={"count": 0, "input_count": 0, "enabled": False},
+            details={
+                "count": validation_result["thermo_record_count"],
+                "input_count": validation_result["thermo_input_count"],
+                "enabled": config.optional_validation.xtb_thermo_enabled,
+                "optional_validation": True,
+            },
         )
     )
     states.append(
@@ -749,6 +766,17 @@ def _run_final_auto3d_default_path(
             "pruned_count": 0,
         },
     }
+    manifest["optional_validation"] = {
+        "crest_xtb_enabled": config.optional_validation.crest_xtb_enabled,
+        "xtb_thermo_enabled": config.optional_validation.xtb_thermo_enabled,
+        "selection": config.optional_validation.selection,
+        "max_variants_per_molecule": config.optional_validation.max_variants_per_molecule,
+        "selected_count": validation_result["selected_count"],
+        "crest_record_count": validation_result["crest_record_count"],
+        "thermo_record_count": validation_result["thermo_record_count"],
+        "outputs": validation_result["outputs"],
+        "ranking_overwritten": False,
+    }
     write_json(outdir / "manifest.json", manifest)
     write_run_report(
         outdir / "report.md",
@@ -800,7 +828,7 @@ def _progress_stage_names(config: RunConfig) -> list[str]:
             "Final reporting",
         ]
     if _use_final_auto3d_default_path(config):
-        return [
+        stages = [
             "Input validation",
             "Standardization",
             "Protomer generation",
@@ -809,8 +837,11 @@ def _progress_stage_names(config: RunConfig) -> list[str]:
             "Cheap variant scoring",
             "Final 3D generation",
             "Ranking",
-            "Final reporting",
         ]
+        if config.optional_validation.crest_xtb_enabled or config.optional_validation.xtb_thermo_enabled:
+            stages.append("Optional validation")
+        stages.append("Final reporting")
+        return stages
     return [
         "Input validation",
         "Standardization",
@@ -1425,6 +1456,312 @@ def _fallback_protomer(
     return [record]
 
 
+def _run_optional_crest_validation(
+    *,
+    final_records: list[SeedConformerRecord],
+    filtering_decisions: list[FilteringDecision],
+    config: RunConfig,
+    warnings: list[str],
+    progress: ProgressRecorder,
+) -> dict[str, Any]:
+    validation_dir = config.output_dir / "optional_validation"
+    outputs = [
+        config.output_dir / "crest_validation.csv",
+        config.output_dir / "crest_validation.sdf",
+        config.output_dir / "crest_validation_report.md",
+    ]
+    if not config.optional_validation.crest_xtb_enabled:
+        return {
+            "selected_records": [],
+            "selected_count": 0,
+            "crest_records": [],
+            "crest_record_count": 0,
+            "thermo_records": [],
+            "thermo_record_count": 0,
+            "thermo_input_count": 0,
+            "outputs": [],
+        }
+
+    selected = _select_optional_validation_records(final_records, filtering_decisions, config)
+    progress.record("Optional validation", "started", generated_count=len(selected))
+    validation_dir.mkdir(parents=True, exist_ok=True)
+    _write_optional_validation_input_sdf(validation_dir / "selected_final_variants.sdf", selected)
+    _write_optional_validation_input_csv(validation_dir / "selected_final_variants.csv", selected)
+
+    validation_config = _config_for_optional_validation(config)
+    crest_records: list[CrestConformerRecord] = []
+    crest_tools_available = _tool_available(config.crest.executable) and _tool_available(
+        config.crest.xtb_executable
+    )
+    if selected and crest_tools_available and config.crest.enabled:
+        for index, record in enumerate(selected, start=1):
+            crest_records.extend(run_crest_for_seed(record, validation_config))
+            progress.record(
+                "Optional validation",
+                "running",
+                molecule_index=index,
+                molecule_total=len(selected),
+                molecule_name=record.molname,
+                generated_count=len(crest_records),
+            )
+    elif selected:
+        message = "Optional CREST/xTB validation requested but CREST/xTB is unavailable."
+        warnings.append(message)
+        crest_records = _crest_like_records_from_seeds(selected, validation_config)
+
+    thermo_records: list[ThermoRecord] = []
+    thermo_inputs: list[CrestConformerRecord] = []
+    if config.optional_validation.xtb_thermo_enabled and crest_records:
+        thermo_inputs = _select_thermo_inputs(crest_records, validation_config)
+        if _tool_available(config.crest.xtb_executable):
+            for conformer in thermo_inputs:
+                thermo_records.append(run_xtb_thermo(conformer, validation_config))
+        else:
+            warnings.append("Optional xTB thermo validation requested but xTB is unavailable.")
+
+    _write_crest_validation_csv(outputs[0], selected, crest_records, thermo_records)
+    _write_crest_validation_sdf(outputs[1], selected, crest_records)
+    _write_crest_validation_report(outputs[2], config, selected, crest_records, thermo_records)
+    progress.record(
+        "Optional validation",
+        "completed",
+        generated_count=len(crest_records),
+        accepted_count=len(selected),
+    )
+    return {
+        "selected_records": selected,
+        "selected_count": len(selected),
+        "crest_records": crest_records,
+        "crest_record_count": len(crest_records),
+        "thermo_records": thermo_records,
+        "thermo_record_count": len(thermo_records),
+        "thermo_input_count": len(thermo_inputs),
+        "outputs": [str(path) for path in outputs],
+    }
+
+
+def _select_optional_validation_records(
+    final_records: list[SeedConformerRecord],
+    filtering_decisions: list[FilteringDecision],
+    config: RunConfig,
+) -> list[SeedConformerRecord]:
+    rescue_parent_ids = {
+        decision.record_id
+        for decision in filtering_decisions
+        if decision.selected and decision.rescue_reason
+    }
+    grouped: dict[str, list[SeedConformerRecord]] = {}
+    for record in final_records:
+        grouped.setdefault(record.input_molecule_id, []).append(record)
+
+    selected: list[SeedConformerRecord] = []
+    for input_id in sorted(grouped):
+        records = sorted(grouped[input_id], key=lambda item: _seed_energy_sort_key(item))
+        chosen: list[SeedConformerRecord] = records[:3]
+        for record in records:
+            if record.parent_id in rescue_parent_ids and record not in chosen:
+                chosen.append(record)
+            if len(chosen) >= config.optional_validation.max_variants_per_molecule:
+                break
+        selected.extend(chosen[: config.optional_validation.max_variants_per_molecule])
+    return selected
+
+
+def _seed_energy_sort_key(record: SeedConformerRecord) -> tuple[float, str]:
+    return (float("inf") if record.energy_kcal_mol is None else record.energy_kcal_mol, record.id)
+
+
+def _config_for_optional_validation(config: RunConfig) -> RunConfig:
+    data = config.model_dump(mode="python")
+    keep_raw = config.optional_validation.keep_raw_xyz or config.optional_validation.cleanup_policy == "debug_all"
+    compact = config.optional_validation.cleanup_policy == "compact"
+    data["crest"]["keep_raw_xyz"] = keep_raw
+    data["crest"]["compress_raw_outputs"] = compact or data["crest"].get("compress_raw_outputs", True)
+    data["crest"]["delete_intermediate_xyz"] = compact or data["crest"].get("delete_intermediate_xyz", True)
+    data["disk"]["keep_raw_xyz"] = keep_raw
+    data["disk"]["compress_raw_outputs"] = compact or data["disk"].get("compress_raw_outputs", True)
+    data["disk"]["delete_intermediate_xyz"] = compact or data["disk"].get("delete_intermediate_xyz", True)
+    if config.optional_validation.xtb_thermo_enabled:
+        data["thermo"]["enabled"] = True
+        data["thermo"]["xtb_hessian"] = True
+        data["thermo"]["xtb_thermo"] = True
+    return RunConfig.model_validate(data)
+
+
+def _write_optional_validation_input_sdf(path: Path, records: list[SeedConformerRecord]) -> None:
+    writer = Chem.SDWriter(str(path))
+    for record in records:
+        if record.rdkit_mol is None:
+            continue
+        mol = Chem.Mol(record.rdkit_mol)
+        mol.SetProp("_Name", record.id)
+        mol.SetProp("DSVR_FINAL_VARIANT_ID", record.id)
+        mol.SetProp("DSVR_STEREO_ID", record.parent_id or "")
+        mol.SetProp("DSVR_INPUT_ID", record.input_molecule_id)
+        mol.SetProp("DSVR_OPTIONAL_VALIDATION_SELECTED", "True")
+        writer.write(mol)
+    writer.close()
+
+
+def _write_optional_validation_input_csv(path: Path, records: list[SeedConformerRecord]) -> None:
+    with path.open("w", encoding="utf-8", newline="") as handle:
+        writer = csv.DictWriter(
+            handle,
+            fieldnames=[
+                "final_variant_id",
+                "input_id",
+                "molname",
+                "stereo_id",
+                "auto3d_energy_kcal_mol",
+            ],
+        )
+        writer.writeheader()
+        for record in records:
+            writer.writerow(
+                {
+                    "final_variant_id": record.id,
+                    "input_id": record.input_molecule_id,
+                    "molname": record.molname,
+                    "stereo_id": record.parent_id,
+                    "auto3d_energy_kcal_mol": record.energy_kcal_mol,
+                }
+            )
+
+
+def _write_crest_validation_csv(
+    path: Path,
+    selected: list[SeedConformerRecord],
+    crest_records: list[CrestConformerRecord],
+    thermo_records: list[ThermoRecord],
+) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    selected_by_id = {record.id: record for record in selected}
+    thermo_by_parent = {record.parent_id: record for record in thermo_records}
+    columns = [
+        "optional_validation",
+        "input_id",
+        "molname",
+        "final_variant_id",
+        "stereo_id",
+        "auto3d_energy_kcal_mol",
+        "crest_conformer_id",
+        "crest_index",
+        "crest_energy_kcal_mol",
+        "crest_relative_energy_kcal_mol",
+        "xtb_free_energy_kcal_mol",
+        "xtb_entropy_cal_mol_k",
+        "warnings",
+    ]
+    with path.open("w", encoding="utf-8", newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=columns)
+        writer.writeheader()
+        if crest_records:
+            for record in crest_records:
+                seed = selected_by_id.get(record.parent_id or "")
+                thermo = thermo_by_parent.get(record.id)
+                writer.writerow(
+                    {
+                        "optional_validation": True,
+                        "input_id": record.input_molecule_id,
+                        "molname": record.molname,
+                        "final_variant_id": record.parent_id,
+                        "stereo_id": seed.parent_id if seed else None,
+                        "auto3d_energy_kcal_mol": seed.energy_kcal_mol if seed else None,
+                        "crest_conformer_id": record.id,
+                        "crest_index": record.crest_index,
+                        "crest_energy_kcal_mol": record.energy_kcal_mol,
+                        "crest_relative_energy_kcal_mol": record.relative_energy_kcal_mol,
+                        "xtb_free_energy_kcal_mol": thermo.free_energy_kcal_mol if thermo else None,
+                        "xtb_entropy_cal_mol_k": thermo.entropy_cal_mol_k if thermo else None,
+                        "warnings": " | ".join(record.warnings + (thermo.warnings if thermo else [])),
+                    }
+                )
+        else:
+            for record in selected:
+                writer.writerow(
+                    {
+                        "optional_validation": True,
+                        "input_id": record.input_molecule_id,
+                        "molname": record.molname,
+                        "final_variant_id": record.id,
+                        "stereo_id": record.parent_id,
+                        "auto3d_energy_kcal_mol": record.energy_kcal_mol,
+                        "warnings": "CREST/xTB validation produced no conformer records.",
+                    }
+                )
+
+
+def _write_crest_validation_sdf(
+    path: Path,
+    selected: list[SeedConformerRecord],
+    crest_records: list[CrestConformerRecord],
+) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    by_seed: dict[str, list[CrestConformerRecord]] = {}
+    for record in crest_records:
+        by_seed.setdefault(record.parent_id or "", []).append(record)
+    writer = Chem.SDWriter(str(path))
+    for seed in selected:
+        if seed.rdkit_mol is None:
+            continue
+        validation_records = sorted(by_seed.get(seed.id, []), key=lambda item: (item.crest_index, item.id))
+        best = min(validation_records, key=lambda item: (item.energy_kcal_mol or float("inf"), item.id), default=None)
+        mol = Chem.Mol(seed.rdkit_mol)
+        mol.SetProp("_Name", seed.id)
+        mol.SetProp("DSVR_OPTIONAL_VALIDATION", "CREST/xTB")
+        mol.SetProp("DSVR_OPTIONAL_VALIDATION_DOES_NOT_SET_RANKING", "True")
+        mol.SetProp("DSVR_FINAL_VARIANT_ID", seed.id)
+        mol.SetProp("DSVR_STEREO_ID", seed.parent_id or "")
+        mol.SetProp("DSVR_INPUT_ID", seed.input_molecule_id)
+        mol.SetProp("DSVR_FINAL_AUTO3D_ENERGY_KCAL_MOL", "" if seed.energy_kcal_mol is None else str(seed.energy_kcal_mol))
+        mol.SetProp("DSVR_CREST_CONFORMER_COUNT", str(len(validation_records)))
+        if best is not None:
+            mol.SetProp("DSVR_BEST_CREST_CONFORMER_ID", best.id)
+            mol.SetProp("DSVR_BEST_CREST_ENERGY_KCAL_MOL", "" if best.energy_kcal_mol is None else str(best.energy_kcal_mol))
+            mol.SetProp("DSVR_BEST_CREST_RELATIVE_ENERGY_KCAL_MOL", "" if best.relative_energy_kcal_mol is None else str(best.relative_energy_kcal_mol))
+        writer.write(mol)
+    writer.close()
+
+
+def _write_crest_validation_report(
+    path: Path,
+    config: RunConfig,
+    selected: list[SeedConformerRecord],
+    crest_records: list[CrestConformerRecord],
+    thermo_records: list[ThermoRecord],
+) -> None:
+    by_input: dict[str, int] = {}
+    for record in selected:
+        by_input[record.input_molecule_id] = by_input.get(record.input_molecule_id, 0) + 1
+    lines = [
+        "# Optional CREST/xTB Validation Report",
+        "",
+        "This validation is optional and does not overwrite the default ligand-prep ranking.",
+        "",
+        f"- Enabled: {config.optional_validation.crest_xtb_enabled}",
+        f"- Selection: {config.optional_validation.selection}",
+        f"- Max variants per molecule: {config.optional_validation.max_variants_per_molecule}",
+        f"- Selected final variants: {len(selected)}",
+        f"- CREST conformer records: {len(crest_records)}",
+        f"- xTB thermo records: {len(thermo_records)}",
+        f"- Cleanup policy: {config.optional_validation.cleanup_policy}",
+        f"- Keep raw XYZ: {config.optional_validation.keep_raw_xyz}",
+        "",
+        "## Selected Variants Per Input",
+        "",
+        "| Input ID | Selected variants |",
+        "| --- | ---: |",
+        *[f"| {input_id} | {count} |" for input_id, count in sorted(by_input.items())],
+        "",
+        "## Outputs",
+        "",
+        "- crest_validation.csv",
+        "- crest_validation.sdf",
+        "- crest_validation_report.md",
+    ]
+    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
 def _run_crest_or_seed_ranking(
     seeds: list[SeedConformerRecord],
     config: RunConfig,
@@ -1833,6 +2170,9 @@ def _final_output_files(outdir: Path) -> list[Path]:
         "final_variants.csv",
         "final_variants.json",
         "final_variant_energies.csv",
+        "crest_validation.csv",
+        "crest_validation.sdf",
+        "crest_validation_report.md",
         "report.md",
     ]
     return [outdir / name for name in names]

@@ -194,8 +194,13 @@ def test_ligprep_like_default_config_loads() -> None:
     assert config.final_3d.timeout_seconds_per_batch == 1800
     assert config.final_3d.one_conformer_per_variant is True
     assert config.optional_validation.crest_xtb_enabled is False
-    assert config.optional_validation.censo_enabled is False
+    assert config.optional_validation.max_variants_per_molecule == 5
+    assert config.optional_validation.selection == "top_auto3d_energy"
     assert config.optional_validation.xtb_thermo_enabled is False
+    assert config.optional_validation.crest_entropy_enabled is False
+    assert config.optional_validation.censo_enabled is False
+    assert config.optional_validation.keep_raw_xyz is False
+    assert config.optional_validation.cleanup_policy == "compact"
 
 
 def test_ligprep_like_variant_configs_load() -> None:
@@ -213,7 +218,10 @@ def test_physics_validation_optional_config_loads() -> None:
 
     assert config.workflow_mode == "physics_validation"
     assert config.optional_validation.crest_xtb_enabled is True
+    assert config.optional_validation.max_variants_per_molecule == 5
+    assert config.optional_validation.selection == "top_auto3d_energy"
     assert config.optional_validation.xtb_thermo_enabled is True
+    assert config.optional_validation.cleanup_policy == "compact"
 
 
 def test_agent_disabled_by_default() -> None:
@@ -234,6 +242,8 @@ def test_rejects_invalid_ligprep_caps_and_timeouts() -> None:
         RunConfig(stereoisomer_filtering={"max_stereoisomers_per_tautomer": -1})
     with pytest.raises(ValidationError, match="final_3d limits"):
         RunConfig(final_3d={"k": 0})
+    with pytest.raises(ValidationError, match="optional_validation max_variants_per_molecule"):
+        RunConfig(optional_validation={"max_variants_per_molecule": 0})
 
 
 def test_ligprep_requires_one_final_conformer_per_variant() -> None:
