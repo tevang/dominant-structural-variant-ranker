@@ -111,6 +111,10 @@ def _report_text(
         f"- CENSO max candidates: {config.refinement.max_candidates_for_refinement}",
         f"- QM enabled: {config.qm.enabled}",
         f"- QM max candidates: {config.qm.max_candidates}",
+        f"- Final 3D tool: {config.final_3d.tool}",
+        f"- Final 3D k: {config.final_3d.k}",
+        f"- Final 3D max conformers: {config.final_3d.max_confs}",
+        f"- Final 3D timeout seconds per batch: {config.final_3d.timeout_seconds_per_batch}",
         (
             "- RDKit tautomer timeout seconds: "
             f"{config.tautomer_filtering.rdkit_tautomer_timeout_seconds}"
@@ -164,8 +168,9 @@ def _report_text(
             f"'{config.chemistry.solvent_model}' is used for the configured energy model."
         ),
         (
-            "- Ranking uses relative CREST/xTB-derived free energies or downstream "
-            "refined energies when available."
+            "- Ranking uses approximate final Auto3D conformer energies in the default "
+            "LigPrep-like path; optional CREST/xTB or downstream refined energies are "
+            "used only when validation stages are enabled."
         ),
         (
             f"- Population scope is '{config.thermo.population_scope}'; states outside "

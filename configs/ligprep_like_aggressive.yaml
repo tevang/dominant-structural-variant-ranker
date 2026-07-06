@@ -65,6 +65,7 @@ final_3d:
   max_confs: 10
   patience: 100
   energy_window_kcal_mol: 7.0
+  timeout_seconds_per_batch: 1800
   one_conformer_per_variant: true
 
 optional_validation:

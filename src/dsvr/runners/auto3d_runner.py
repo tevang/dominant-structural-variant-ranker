@@ -43,6 +43,7 @@ def run_auto3d(
     opt_steps: int | None = None,
     use_gpu: bool = False,
     stream_output: bool = False,
+    timeout_s: int | None = None,
 ) -> tuple[Path, list[str]]:
     executable = _find_executable()
     python_api_available = importlib.util.find_spec("Auto3D") is not None
@@ -80,7 +81,7 @@ def run_auto3d(
         completed = run_command(
             command,
             cwd=output_dir,
-            timeout_s=None,
+            timeout_s=timeout_s,
             log_dir=output_dir / "logs",
             command_name="auto3d",
             env=_auto3d_env(mpi_np, cpu_workers),

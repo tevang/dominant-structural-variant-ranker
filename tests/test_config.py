@@ -190,6 +190,8 @@ def test_ligprep_like_default_config_loads() -> None:
     assert config.tautomer_filtering.fallback_if_timeout == "keep_input_and_canonical"
     assert config.stereoisomer_filtering.max_stereoisomers_per_tautomer == 16
     assert config.final_3d.k == 1
+    assert config.final_3d.max_confs == 10
+    assert config.final_3d.timeout_seconds_per_batch == 1800
     assert config.final_3d.one_conformer_per_variant is True
     assert config.optional_validation.crest_xtb_enabled is False
     assert config.optional_validation.censo_enabled is False

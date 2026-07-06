@@ -1,4 +1,5 @@
-description: Fast smoke test configuration for the default physics-heavy workflow.
+description: Fast smoke test configuration for the default LigPrep-like Auto3D final 3D workflow.
+workflow_mode: ligprep_like
 run_name: fast-smoke
 input_path: examples/test_molecules_minimal.smi
 input_format: auto
@@ -62,6 +63,22 @@ thermo:
   rrho_cutoff: 100.0
   population_scope: same_formula
   energy_unit: kcal/mol
+
+final_3d:
+  tool: auto3d
+  k: 1
+  max_confs: 10
+  patience: 100
+  one_conformer_per_variant: true
+  optimizing_engine: AIMNET
+  fallback_optimizing_engine: ANI2xt
+  use_gpu: true
+  timeout_seconds_per_batch: 1800
+
+optional_validation:
+  crest_xtb_enabled: false
+  censo_enabled: false
+  xtb_thermo_enabled: false
 
 refinement:
   censo_enabled: false

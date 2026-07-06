@@ -206,16 +206,17 @@ class StereoisomerFilteringConfig(StrictModel):
 
 class Final3dConfig(StrictModel):
     tool: str = "auto3d"
-    optimizing_engine: Auto3dModel = "AIMNET"
-    fallback_optimizing_engine: Auto3dModel = "ANI2xt"
-    use_gpu: bool = True
     k: int = 1
     max_confs: int = 10
     patience: int = 100
-    energy_window_kcal_mol: float = 7.0
     one_conformer_per_variant: bool = True
+    optimizing_engine: Auto3dModel = "AIMNET"
+    fallback_optimizing_engine: Auto3dModel = "ANI2xt"
+    use_gpu: bool = True
+    energy_window_kcal_mol: float = 7.0
+    timeout_seconds_per_batch: int = 1800
 
-    @field_validator("k", "max_confs", "patience")
+    @field_validator("k", "max_confs", "patience", "timeout_seconds_per_batch")
     @classmethod
     def positive_final_3d_limit(cls, value: int) -> int:
         if value <= 0:

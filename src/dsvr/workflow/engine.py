@@ -16,6 +16,7 @@ from dsvr.chemistry.conformers_auto3d import (
     score_auto3d_representative_variants,
 )
 from dsvr.chemistry.conformers_rdkit import generate_rdkit_seeds, read_stereo_sdf
+from dsvr.chemistry.final3d import generate_final_3d_variants
 from dsvr.chemistry.protonation import generate_protomer_candidates
 from dsvr.chemistry.stereochemistry import enumerate_stereoisomers, read_tautomers_sdf
 from dsvr.chemistry.stereo_auto3d_filter import filter_stereoisomers_with_auto3d
@@ -274,6 +275,19 @@ def run_workflow(config: RunConfig) -> WorkflowResult:
         accepted_count=len(stereos_for_seeding),
         rejected_count=max(0, len(stereos) - len(stereos_for_seeding)),
     )
+
+    if _use_final_auto3d_default_path(config):
+        return _run_final_auto3d_default_path(
+            config=config,
+            molecules=molecules,
+            stereos_for_seeding=stereos_for_seeding,
+            stereo_energy_result=stereo_energy_result,
+            records=records,
+            states=states,
+            filtering_decisions=filtering_decisions,
+            warnings=warnings,
+            progress=progress,
+        )
 
     seeds: list[SeedConformerRecord] = []
     progress.record("3D seeding", "started", generated_count=len(stereos_for_seeding))
@@ -573,6 +587,207 @@ def run_smoke_workflow(config: RunConfig) -> WorkflowResult:
     return run_workflow(config)
 
 
+def _use_final_auto3d_default_path(config: RunConfig) -> bool:
+    return (
+        config.workflow_mode == "ligprep_like"
+        and config.protocol == "default"
+        and config.final_3d.tool == "auto3d"
+        and config.final_3d.one_conformer_per_variant
+        and not config.optional_validation.crest_xtb_enabled
+        and not config.optional_validation.xtb_thermo_enabled
+    )
+
+
+def _run_final_auto3d_default_path(
+    *,
+    config: RunConfig,
+    molecules: list[MoleculeInput],
+    stereos_for_seeding: list[AnyLineageRecord],
+    stereo_energy_result: Any,
+    records: list[AnyLineageRecord],
+    states: list[StepState],
+    filtering_decisions: list[FilteringDecision],
+    warnings: list[str],
+    progress: ProgressRecorder,
+) -> WorkflowResult:
+    outdir = config.output_dir
+    steps = {step.name: step for step in planned_steps(config)}
+
+    progress.record("Final 3D generation", "started", generated_count=len(stereos_for_seeding))
+    final_result = generate_final_3d_variants(stereos_for_seeding, config)
+    warnings.extend(final_result.warnings)
+    final_records = final_result.records
+    states.append(
+        mark_done(
+            steps["seeding"],
+            records_hash(stereos_for_seeding),
+            config,
+            details={
+                "count": len(final_records),
+                "method": "final_3d_auto3d",
+                "one_conformer_per_variant": config.final_3d.one_conformer_per_variant,
+                "used_fallback": final_result.used_fallback,
+            },
+        )
+    )
+    records.extend(final_records)
+    _write_stage_summary_sdf(outdir / "all_3d_conformers.sdf", final_records)
+    progress.record(
+        "Final 3D generation",
+        "completed",
+        generated_count=len(final_records),
+        accepted_count=len(final_records),
+    )
+
+    stereo_reduction = StereoReductionResult(
+        selected_seeds=final_records,
+        decisions=[],
+        representative_to_equivalent_seed_ids={},
+        jobs_saved=0,
+    )
+    xtb_prefilter_decisions: list[XtbPrefilterDecision] = []
+    _write_filtering_outputs(
+        outdir,
+        filtering_decisions,
+        stereo_reduction,
+        xtb_prefilter_decisions,
+    )
+
+    progress.record("Ranking", "started", generated_count=len(final_records))
+    ranked = compute_delta_g_and_populations(final_records, config)
+    write_ranked_outputs(ranked, outdir / "ranking")
+    states.append(
+        mark_done(
+            steps["ranking"],
+            records_hash(final_records),
+            config,
+            details={"count": len(ranked), "source": "final_3d_auto3d"},
+        )
+    )
+    records.extend(ranked)
+    progress.record("Ranking", "completed", generated_count=len(ranked))
+
+    states.append(
+        mark_done(
+            steps["crest"],
+            records_hash(final_records),
+            config,
+            details={"count": 0, "skipped_by": "final_3d_auto3d_default"},
+        )
+    )
+    states.append(
+        mark_done(
+            steps["xtb_thermo"],
+            records_hash(final_records),
+            config,
+            details={"count": 0, "input_count": 0, "enabled": False},
+        )
+    )
+    states.append(
+        mark_done(
+            steps["censo"],
+            records_hash(ranked),
+            config,
+            details={"count": 0, "enabled": False},
+        )
+    )
+    states.append(
+        mark_done(
+            steps["qm"],
+            records_hash(ranked),
+            config,
+            details={"count": 0, "backend": config.refinement.qm_backend},
+        )
+    )
+
+    progress.record("Final reporting", "started", generated_count=len(ranked))
+    write_all_provenance_outputs(records, outdir)
+    write_audit_tables(
+        outdir,
+        records,
+        filtering_decisions,
+        xtb_prefilter_decisions,
+        stereo_reduction,
+    )
+    write_final_ranked_outputs(outdir, ranked, config)
+    _publish_top_level_run_outputs(outdir)
+    write_summary_markdown(
+        outdir / "summary.md",
+        molecule_count=len(molecules),
+        variant_count=len(ranked),
+    )
+    manifest = _manifest(config, states, warnings, dry_run=False)
+    manifest["filtering"] = {
+        "mode": config.variant_filtering.mode,
+        "enabled": config.variant_filtering.enabled,
+        "decision_counts": decision_counts(filtering_decisions),
+        "decision_count": len(filtering_decisions),
+        "stereo_energy_filtering": {
+            "enabled": config.stereoisomer_filtering.enabled,
+            "enumerated_count": len(stereo_energy_result.all_records),
+            "selected_count": len(stereo_energy_result.selected_records),
+            "rejected_count": len(stereo_energy_result.rejected_records),
+            "collapsed_count": stereo_energy_result.collapsed_count,
+            "energy_evaluation_count": stereo_energy_result.energy_evaluation_count,
+        },
+        "final_3d": {
+            "enabled": True,
+            "tool": config.final_3d.tool,
+            "requested_count": len(stereos_for_seeding),
+            "final_conformer_count": len(final_records),
+            "one_conformer_per_variant": config.final_3d.one_conformer_per_variant,
+            "used_fallback": final_result.used_fallback,
+        },
+        "stereo_reduction": {
+            "jobs_saved": 0,
+            "decision_count": 0,
+            "enabled": False,
+        },
+        "xtb_prefilter": {
+            "enabled": False,
+            "decision_count": 0,
+            "pruned_count": 0,
+        },
+    }
+    write_json(outdir / "manifest.json", manifest)
+    write_run_report(
+        outdir / "report.md",
+        config=config,
+        records=records,
+        ranked_records=ranked,
+        manifest=manifest,
+        output_files=_final_output_files(outdir),
+    )
+    states.append(
+        mark_done(
+            steps["reports"],
+            records_hash(records),
+            config,
+            details={"manifest": "manifest.json"},
+        )
+    )
+    legacy_records = [
+        VariantRecord(
+            variant_id=record.id,
+            parent_name=record.molname,
+            smiles=record.isomeric_smiles,
+            relative_energy_kcal_mol=record.relative_free_energy_kcal_mol,
+            approximate_population=record.boltzmann_population,
+            status="ranked",
+        )
+        for record in ranked
+    ]
+    write_ranked_csv(outdir / "ranked.csv", legacy_records)
+    write_json(outdir / "provenance.json", build_provenance(config.input_path, config, molecules))
+    _publish_top_level_run_outputs(outdir)
+    progress.record("Final reporting", "completed", generated_count=len(ranked))
+    return WorkflowResult(
+        outdir=outdir,
+        molecule_count=len(molecules),
+        ranked_records=legacy_records,
+    )
+
+
 def _progress_stage_names(config: RunConfig) -> list[str]:
     if config.protocol == "auto3d_entropy":
         return [
@@ -581,6 +796,18 @@ def _progress_stage_names(config: RunConfig) -> list[str]:
             "Protomer generation",
             "Auto3D representative generation",
             "Representative plausibility scoring",
+            "Ranking",
+            "Final reporting",
+        ]
+    if _use_final_auto3d_default_path(config):
+        return [
+            "Input validation",
+            "Standardization",
+            "Protomer generation",
+            "Tautomer enumeration",
+            "Stereoisomer enumeration",
+            "Cheap variant scoring",
+            "Final 3D generation",
             "Ranking",
             "Final reporting",
         ]
@@ -955,6 +1182,10 @@ def _publish_top_level_run_outputs(outdir: Path) -> None:
         outdir / "ranked_variants.sdf",
         outdir / "ranked_variants.csv",
         outdir / "ranked_variants.json",
+        outdir / "final_variants.sdf",
+        outdir / "final_variants.csv",
+        outdir / "final_variants.json",
+        outdir / "final_variant_energies.csv",
         outdir / "all_protomers.sdf",
         outdir / "all_tautomers.sdf",
         outdir / "all_stereoisomers.sdf",
@@ -1598,6 +1829,10 @@ def _final_output_files(outdir: Path) -> list[Path]:
         "ranked_variants.csv",
         "ranked_variants.json",
         "ranked_variants.sdf",
+        "final_variants.sdf",
+        "final_variants.csv",
+        "final_variants.json",
+        "final_variant_energies.csv",
         "report.md",
     ]
     return [outdir / name for name in names]
