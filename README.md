@@ -4,12 +4,20 @@
 
 This repository is a wrapper/orchestrator. It does **not** vendor, mirror, or clone third-party repositories. RDKit, molscrub, Auto3D, xTB, CREST, CENSO, Psi4, and PySCF remain external tools installed through conda-forge, pip, official binary distributions, or user-managed software modules.
 
-## Default LigPrep-like Workflow
+## Default Workflow
 
-The recommended default is a bounded plausible-variant ligand-preparation workflow for docking, ligand-based modeling, and batch-library preparation:
+The recommended default is a bounded plausible-variant ligand-preparation workflow for docking, ligand-based modeling, and batch-library preparation. It covers a role similar to a LigPrep workflow while using open-source components and DSVR's explicit limits and provenance.
 
-```text
-Input SMILES/SDF -> standardization and validity checks -> plausible pH/protomer generation at target pH, default pH 7.0 -> early protomer filtering -> Auto3D tautomer enumeration/ranking/filtering using RDKit tautomer engine and ANI2xt/AIMNet2 -> RDKit stereoisomer enumeration timeout/caps after tautomer filtering -> Auto3D one-conformer optimization/ranking/filtering of stereoisomers -> final SDF/CSV/JSON report one optimized 3D conformer per surviving structural variant -> optional CREST/xTB validation only if explicitly enabled
+```mermaid
+flowchart LR
+    A[SMILES or SDF] --> B[Validate and standardize]
+    B --> C[Generate plausible protomers at target pH]
+    C --> D[Early protomer filtering]
+    D --> E[Tautomer energy triage]
+    E --> F[Bounded stereoisomer enumeration]
+    F --> G[One-conformer optimization]
+    G --> H[Final SDF, CSV, and JSON]
+    H -. opt in .-> I[CREST/xTB validation]
 ```
 
 Start with:
@@ -67,7 +75,7 @@ scripts/bootstrap_mamba.sh --with-auto3d --with-molscrub
 
 ## CLI
 
-Use `dsvr prepare-ligands` for the default LigPrep-like workflow. `dsvr run` remains available for backward-compatible workflow scripts.
+Use `dsvr prepare-ligands` for the default workflow. `dsvr run` remains available for backward-compatible workflow scripts.
 
 ```bash
 python -m dsvr.cli --help

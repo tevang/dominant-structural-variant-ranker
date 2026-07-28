@@ -1,7 +1,7 @@
 # Architecture
 
-DSVR is a thin orchestration layer for a physics-heavy structural-variant
-ranking workflow. It coordinates maintained open-source chemistry tools, records
+DSVR is a thin orchestration layer for structural-variant preparation and
+optional higher-cost validation. It coordinates maintained open-source chemistry tools, records
 their inputs and outputs, parses result summaries, and reports scoped rankings.
 It is not a fork or vendored mirror of those tools.
 
@@ -32,25 +32,20 @@ It is not a fork or vendored mirror of those tools.
 
 ## Default Workflow Architecture
 
-The intended production engine follows this sequence:
+The default production engine follows this sequence:
 
-```text
-input molecules
--> standardization and identifiers
--> molscrub pH/protomer candidate generation
--> RDKit tautomer enumeration
--> RDKit stereoisomer enumeration
--> RDKit ETKDG or Auto3D seed conformers
--> CREST/xTB conformer search and ensemble reduction
--> xTB thermo / CREST entropy Delta G extraction
--> optional CENSO refinement
--> optional Psi4/PySCF final rescoring
--> scoped ranking, population labels, and provenance
+```mermaid
+flowchart LR
+    A[Input] --> B[RDKit standardization]
+    B --> C[molscrub protomer candidates]
+    C --> D[Early filtering]
+    D --> E[RDKit and Auto3D tautomer triage]
+    E --> F[RDKit and Auto3D stereo triage]
+    F --> G[Final 3D variants]
+    G --> H[Reports and provenance]
 ```
 
-The main decision engine is CREST/xTB. RDKit and Auto3D are preparation and
-seeding layers, not final physics-based dominance engines. CENSO and final
-Psi4/PySCF rescoring are optional higher-cost refinement layers.
+The default path uses RDKit for bounded enumeration and Auto3D energies for approximate candidate triage. CREST/xTB, CENSO, and Psi4/PySCF are separate, explicitly enabled validation or refinement layers; none is a default dependency.
 
 ## Dependency Boundaries
 
@@ -72,6 +67,6 @@ The architecture separates candidate generation from thermodynamic correction:
 - RDKit stereoisomer enumeration is explicit and controlled by configuration.
 - Auto3D can seed or prefilter conformers but must not double-enumerate
   tautomers/stereoisomers unless `auto3d_internal_enumeration` is enabled.
-- CREST/xTB provides the main physics-based ranking layer.
+- CREST/xTB can provide an optional physics-based validation layer.
 - Boltzmann populations are only as comparable as the free energies used to
   compute them.

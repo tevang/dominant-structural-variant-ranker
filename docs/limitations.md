@@ -4,7 +4,7 @@ DSVR is an orchestration layer for practical structural-variant preparation and 
 
 ## Default Scope
 
-The default LigPrep-like workflow is designed for fast ligand preparation, docking, ligand-based modeling, and batch-library preparation. It is not an exhaustive conformational free-energy workflow.
+The default workflow is designed for fast ligand preparation, docking, ligand-based modeling, and batch-library preparation. It is not an exhaustive conformational free-energy workflow.
 
 ## pH and Protonation
 

@@ -1,19 +1,19 @@
 # Workflow
 
-DSVR's default workflow is a LigPrep-like plausible-variant ligand-preparation protocol. It is designed for fast preparation of ligand libraries for docking, ligand-based modeling, and batch processing, not exhaustive conformational free-energy ranking.
+DSVR's default workflow is a plausible-variant ligand-preparation protocol. It serves a role similar to a LigPrep workflow, using open-source components and explicit limits. It is designed for fast preparation of ligand libraries for docking, ligand-based modeling, and batch processing, not exhaustive conformational free-energy ranking.
 
 ## Default Path
 
-```text
-Input SMILES/SDF
--> standardization and validity checks
--> plausible pH/protomer generation at target pH, default pH 7.0
--> early protomer filtering
--> Auto3D tautomer enumeration/ranking/filtering using RDKit tautomer engine and ANI2xt/AIMNet2
--> RDKit stereoisomer enumeration with timeout/caps after tautomer filtering
--> Auto3D one-conformer optimization/ranking/filtering of stereoisomers
--> final SDF/CSV/JSON report with one optimized 3D conformer per surviving structural variant
--> optional CREST/xTB validation only if explicitly enabled
+```mermaid
+flowchart TD
+    A[SMILES or SDF] --> B[Validate and standardize with RDKit]
+    B --> C[Generate plausible protomers at target pH]
+    C --> D[Apply early caps and filters]
+    D --> E[Generate and energy-triage tautomers]
+    E --> F[Enumerate bounded stereoisomers]
+    F --> G[Optimize and filter one conformer each]
+    G --> H[Write SDF, CSV, and JSON]
+    H -. explicitly enabled .-> I[Optional CREST/xTB validation]
 ```
 
 Recommended config:
@@ -49,6 +49,6 @@ Auto3D ranks low-energy tautomers and stereoisomers by optimized conformer energ
 
 ## Optional Physics Validation
 
-CREST/xTB conformer searches, xTB thermo, CREST entropy estimates, CENSO, and Psi4/PySCF rescoring are optional validation/refinement steps. They should be explicitly enabled only for selected small candidate sets.
+CREST/xTB conformer searches, xTB thermochemistry, CENSO refinement, and Psi4/PySCF rescoring have implemented runner paths, but are opt-in validation/refinement stages. They should be explicitly enabled only for selected small candidate sets.
 
 Use `configs/physics_validation_optional.yaml` for bounded validation and `configs/physics_heavy.yaml` only when an expensive legacy-style workflow is intended. `configs/exhaustive_debug.yaml` remains useful for debugging small molecules and stress-testing enumeration limits.
