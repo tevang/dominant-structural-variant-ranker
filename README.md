@@ -9,15 +9,43 @@ This repository is a wrapper/orchestrator. It does **not** vendor, mirror, or cl
 The recommended default is a bounded plausible-variant ligand-preparation workflow for docking, ligand-based modeling, and batch-library preparation. It covers a role similar to a LigPrep workflow while using open-source components and DSVR's explicit limits and provenance.
 
 ```mermaid
-flowchart LR
-    A[SMILES or SDF] --> B[Validate and standardize]
-    B --> C[Generate plausible protomers at target pH]
-    C --> D[Early protomer filtering]
-    D --> E[Tautomer energy triage]
-    E --> F[Bounded stereoisomer enumeration]
-    F --> G[One-conformer optimization]
-    G --> H[Final SDF, CSV, and JSON]
-    H -. opt in .-> I[CREST/xTB validation]
+%%{init: {"flowchart": {"nodeSpacing": 20, "rankSpacing": 12, "diagramPadding": 4, "subGraphTitleMargin": {"top": 0, "bottom": 0}, "curve": "linear"}}}%%
+flowchart TB
+    subgraph row1[" "]
+        direction LR
+        A[SMILES or SDF] --> B[Validate and<br/>standardize]
+    end
+
+    subgraph row2[" "]
+        direction RL
+        C[Generate plausible protomers<br/>at target pH] --> D[Early protomer filtering]
+    end
+
+    subgraph row3[" "]
+        direction LR
+        E[Tautomer energy triage] --> F[Bounded stereoisomer<br/>enumeration]
+    end
+
+    subgraph row4[" "]
+        direction RL
+        G[One-conformer optimization] --> H[Final SDF, CSV,<br/>and JSON]
+    end
+
+    subgraph row5[" "]
+        I[CREST/xTB validation]
+    end
+
+    %% Connect row containers so external links do not override row directions.
+    row1 --> row2
+    row2 --> row3
+    row3 --> row4
+    row4 -. opt in .-> row5
+
+    style row1 fill:none,stroke:#aaa,stroke-width:1px,stroke-dasharray:4 4
+    style row2 fill:none,stroke:#aaa,stroke-width:1px,stroke-dasharray:4 4
+    style row3 fill:none,stroke:#aaa,stroke-width:1px,stroke-dasharray:4 4
+    style row4 fill:none,stroke:#aaa,stroke-width:1px,stroke-dasharray:4 4
+    style row5 fill:none,stroke:#aaa,stroke-width:1px,stroke-dasharray:4 4
 ```
 
 Start with:
