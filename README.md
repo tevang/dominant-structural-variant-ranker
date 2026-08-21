@@ -131,3 +131,15 @@ pytest
 ruff check src tests
 mypy src
 ```
+
+For long-running checks, launch each repository-local test script in its own
+`screen` session:
+
+```bash
+screen -dmS dsvr-doctor ./scripts/test_doctor.sh
+screen -dmS dsvr-pytest ./scripts/test_pytest.sh
+screen -dmS dsvr-auto3d ./scripts/test_auto3d_smoke.sh
+screen -dmS dsvr-standard ./scripts/test_standard_protocol.sh
+```
+
+Timestamped logs are written to `logs/screen-tests/`.

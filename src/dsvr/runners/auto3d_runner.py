@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import importlib.util
+import importlib.metadata
 import shutil
 import sys
 import uuid
+from dataclasses import dataclass
 from pathlib import Path
 
 from dsvr.runners.subprocess_utils import run_command
@@ -15,6 +17,13 @@ class Auto3DUnavailableError(RuntimeError):
 
 class Auto3DExecutionError(RuntimeError):
     """Raised when Auto3D execution fails."""
+
+
+@dataclass(frozen=True)
+class _Auto3DCachePaths:
+    xdg_cache_home: Path
+    warp_cache_path: Path
+    aimnet_cache_dir: Path
 
 
 def inspect_auto3d() -> dict[str, str | bool | None]:
@@ -55,12 +64,25 @@ def run_auto3d(
         )
 
     output_dir.mkdir(parents=True, exist_ok=True)
-    wrapper_script = _ensure_auto3d_wrapper_script(output_dir)
+    cache_paths = _auto3d_cache_paths()
+    auto3d_major = _auto3d_major_version()
+    v3_wrapper_script = (
+        _ensure_auto3d_v3_wrapper_script(output_dir)
+        if auto3d_major is not None and auto3d_major >= 3
+        else None
+    )
+    wrapper_script = (
+        _ensure_auto3d_wrapper_script(output_dir)
+        if auto3d_major is not None and auto3d_major < 3
+        else None
+    )
     output_sdf = output_dir / "auto3d_output.sdf"
     job_name_base = f"{_output_dir_name(output_sdf)}_{uuid.uuid4().hex[:8]}"
     failures: list[str] = []
+    use_gpu = _should_use_gpu(use_gpu)
     for command in _command_candidates(
         executable,
+        v3_wrapper_script,
         wrapper_script,
         input_path,
         output_sdf,
@@ -84,7 +106,12 @@ def run_auto3d(
             timeout_s=timeout_s,
             log_dir=output_dir / "logs",
             command_name="auto3d",
-            env=_auto3d_env(mpi_np, cpu_workers),
+            env=_auto3d_env(
+                cache_paths,
+                mpi_np=mpi_np,
+                cpu_workers=cpu_workers,
+                use_gpu=use_gpu,
+            ),
             stream_output=stream_output,
             check=False,
         )
@@ -139,8 +166,9 @@ def _find_executable() -> str | None:
 
 
 def _command_candidates(
-    executable: str,
-    wrapper_script: Path,
+    executable: str | None,
+    v3_wrapper_script: Path | None,
+    wrapper_script: Path | None,
     input_path: Path,
     output_sdf: Path,
     job_name_base: str,
@@ -158,35 +186,70 @@ def _command_candidates(
     opt_steps: int | None,
     use_gpu: bool,
 ) -> list[list[str]]:
-    wrapper = [
-        sys.executable,
-        str(wrapper_script.resolve()),
-        str(input_path.resolve()),
-        "--k",
-        str(k),
-        "--job_name",
-        f"{job_name_base}_shim",
-        "--optimizing_engine",
-        model,
-        "--isomer_engine",
-        "rdkit",
-        "--tauto_engine",
-        "rdkit",
-        "--enumerate_tautomer",
-        "True" if internal_tautomer_stereo_enum else "False",
-        "--enumerate_isomer",
-        "True" if internal_tautomer_stereo_enum else "False",
-    ]
-    if mpi_np is not None:
-        wrapper.extend(["--mpi_np", str(mpi_np)])
-    if cpu_workers is not None and cpu_workers > 1:
-        wrapper.extend(["--gpu_idx", "0"])
-    if memory_gb is not None:
-        wrapper.extend(["--memory", str(memory_gb)])
-    if capacity is not None:
-        wrapper.extend(["--capacity", str(capacity)])
-    commands = [wrapper]
-    if executable is not None:
+    commands: list[list[str]] = []
+    auto3d_major = _auto3d_major_version()
+    if auto3d_major is not None and auto3d_major >= 3 and (
+        v3_wrapper_script is not None or executable is not None
+    ):
+        v3_prefix: list[str]
+        if v3_wrapper_script is not None:
+            v3_prefix = [sys.executable, str(v3_wrapper_script.resolve())]
+        else:
+            v3_prefix = [str(executable)]
+
+        v3 = [
+            *v3_prefix,
+            "run",
+            str(input_path.resolve()),
+            "--k",
+            str(k),
+            "--job-name",
+            f"{job_name_base}_v3",
+            "--engine",
+            _auto3d_v3_engine(model),
+            "--tauto-engine",
+            "rdkit",
+            "--isomer-engine",
+            "rdkit",
+        ]
+        if internal_tautomer_stereo_enum:
+            v3.extend(["--enumerate-tautomer", "--enumerate-isomer"])
+        else:
+            v3.extend(["--no-enumerate-tautomer", "--no-enumerate-isomer"])
+        v3.append("--gpu" if use_gpu else "--no-gpu")
+        commands.append(v3)
+
+    if wrapper_script is not None:
+        wrapper = [
+            sys.executable,
+            str(wrapper_script.resolve()),
+            str(input_path.resolve()),
+            "--k",
+            str(k),
+            "--job_name",
+            f"{job_name_base}_shim",
+            "--optimizing_engine",
+            model,
+            "--isomer_engine",
+            "rdkit",
+            "--tauto_engine",
+            "rdkit",
+            "--enumerate_tautomer",
+            "True" if internal_tautomer_stereo_enum else "False",
+            "--enumerate_isomer",
+            "True" if internal_tautomer_stereo_enum else "False",
+        ]
+        if mpi_np is not None:
+            wrapper.extend(["--mpi_np", str(mpi_np)])
+        if cpu_workers is not None and cpu_workers > 1:
+            wrapper.extend(["--gpu_idx", "0"])
+        if memory_gb is not None:
+            wrapper.extend(["--memory", str(memory_gb)])
+        if capacity is not None:
+            wrapper.extend(["--capacity", str(capacity)])
+        commands.append(wrapper)
+
+    if executable is not None and (auto3d_major is None or auto3d_major < 3):
         commands.extend(
             [
                 [
@@ -223,18 +286,25 @@ def _command_candidates(
                 ],
             ]
         )
-    for command in commands[1:]:
-        if mpi_np is not None:
-            command.extend(["--mpi_np", str(mpi_np)])
-        if cpu_workers is not None and cpu_workers > 1:
-            command.extend(["--gpu_idx", "0"])
-        if memory_gb is not None:
-            command.extend(["--memory", str(memory_gb)])
-        if capacity is not None:
-            command.extend(["--capacity", str(capacity)])
+        for command in commands:
+            if _is_auto3d_v3_run(command):
+                continue
+            if command and command[0] == sys.executable:
+                continue
+            if mpi_np is not None:
+                command.extend(["--mpi_np", str(mpi_np)])
+            if cpu_workers is not None and cpu_workers > 1:
+                command.extend(["--gpu_idx", "0"])
+            if memory_gb is not None:
+                command.extend(["--memory", str(memory_gb)])
+            if capacity is not None:
+                command.extend(["--capacity", str(capacity)])
     if max_confs is not None:
         for command in commands:
-            command.extend(["--max_confs", str(max_confs)])
+            if _is_auto3d_v3_run(command):
+                command.extend(["--max-confs", str(max_confs)])
+            else:
+                command.extend(["--max_confs", str(max_confs)])
     if patience is not None:
         for command in commands:
             command.extend(["--patience", str(patience)])
@@ -243,25 +313,49 @@ def _command_candidates(
             command.extend(["--threshold", str(threshold)])
     if opt_steps is not None:
         for command in commands:
-            command.extend(["--opt_steps", str(opt_steps)])
+            if _is_auto3d_v3_run(command):
+                command.extend(["--opt-steps", str(opt_steps)])
+            else:
+                command.extend(["--opt_steps", str(opt_steps)])
     for command in commands:
-        command.extend(["--use_gpu", "True" if use_gpu else "False"])
+        if not _is_auto3d_v3_run(command):
+            command.extend(["--use_gpu", "True" if use_gpu else "False"])
     return commands
 
 
-def _auto3d_env(mpi_np: int | None, cpu_workers: int | None) -> dict[str, str] | None:
+def _auto3d_env(
+    cache_paths: _Auto3DCachePaths,
+    *,
+    mpi_np: int | None,
+    cpu_workers: int | None,
+    use_gpu: bool,
+) -> dict[str, str]:
+    """Environment overrides to keep Auto3D/AIMNET/Warp caches repo-local."""
+
+    env: dict[str, str] = {
+        "XDG_CACHE_HOME": str(cache_paths.xdg_cache_home),
+        "WARP_CACHE_PATH": str(cache_paths.warp_cache_path),
+        "AIMNET_CACHE_DIR": str(cache_paths.aimnet_cache_dir),
+    }
+    if not use_gpu:
+        env["CUDA_VISIBLE_DEVICES"] = ""
+
     if mpi_np is None:
-        return None
+        return env
+
     per_process_threads = mpi_np
     if cpu_workers is not None and cpu_workers > 1:
         per_process_threads = max(1, mpi_np // cpu_workers)
     value = str(per_process_threads)
-    return {
-        "OMP_NUM_THREADS": value,
-        "MKL_NUM_THREADS": value,
-        "OPENBLAS_NUM_THREADS": value,
-        "NUMEXPR_NUM_THREADS": value,
-    }
+    env.update(
+        {
+            "OMP_NUM_THREADS": value,
+            "MKL_NUM_THREADS": value,
+            "OPENBLAS_NUM_THREADS": value,
+            "NUMEXPR_NUM_THREADS": value,
+        }
+    )
+    return env
 
 
 def _cpu_worker_indices(cpu_workers: int) -> str:
@@ -281,6 +375,127 @@ def _python_executable() -> str:
 
 def _output_dir_name(output_sdf: Path) -> str:
     return output_sdf.parent.name
+
+
+def _repo_root() -> Path:
+    # auto3d_runner.py -> runners -> dsvr -> src -> repo root
+    return Path(__file__).resolve().parents[3]
+
+
+def _auto3d_cache_paths() -> _Auto3DCachePaths:
+    root = _repo_root()
+    uv_root = root / ".uv"
+    paths = _Auto3DCachePaths(
+        xdg_cache_home=uv_root / "xdg-cache",
+        warp_cache_path=uv_root / "warp-cache",
+        aimnet_cache_dir=uv_root / "aimnet-cache",
+    )
+    paths.xdg_cache_home.mkdir(parents=True, exist_ok=True)
+    paths.warp_cache_path.mkdir(parents=True, exist_ok=True)
+    paths.aimnet_cache_dir.mkdir(parents=True, exist_ok=True)
+    return paths
+
+
+def _should_use_gpu(requested: bool) -> bool:
+    if not requested:
+        return False
+    if not Path("/dev/nvidia0").exists() and not Path("/dev/nvidiactl").exists():
+        return False
+    return True
+
+
+def _auto3d_major_version() -> int | None:
+    try:
+        raw = importlib.metadata.version("auto3d")
+    except importlib.metadata.PackageNotFoundError:
+        return None
+    try:
+        return int(raw.split(".", maxsplit=1)[0])
+    except ValueError:
+        return None
+
+
+def _is_auto3d_v3_run(command: list[str]) -> bool:
+    if not command:
+        return False
+    # Support both direct invocation:
+    #   auto3d run <input> ...
+    # and our sandbox-tolerant wrapper:
+    #   python _auto3d_v3_wrapper.py run <input> ...
+    return (len(command) > 1 and command[1] == "run") or (
+        len(command) > 2 and command[2] == "run"
+    )
+
+
+def _auto3d_v3_engine(model: str) -> str:
+    normalized = model.strip()
+    mapping = {
+        "AIMNet2": "aimnet2",
+        "AIMNET2": "aimnet2",
+        "AIMNET": "AIMNET",
+        "ANI2x": "ANI2x",
+        "ANI2xt": "ANI2xt",
+        "auto": "auto",
+        "AUTO": "auto",
+    }
+    return mapping.get(normalized, normalized)
+
+
+def _ensure_auto3d_v3_wrapper_script(output_dir: Path) -> Path:
+    """Wrap Auto3D v3 CLI to tolerate restricted socket syscalls.
+
+    Some sandboxed environments block ``socket.setsockopt`` used by
+    ``multiprocessing.managers.SyncManager``. Auto3D v3 can trigger Manager
+    creation even for simple CPU runs, so we patch ``setsockopt`` to ignore
+    PermissionError and keep the CLI usable.
+    """
+
+    script = output_dir / "_auto3d_v3_wrapper.py"
+    script.write_text(
+        """
+from __future__ import annotations
+
+import multiprocessing as _mp
+import multiprocessing.context as _mp_context
+import socket
+
+
+_orig_setsockopt = socket.socket.setsockopt
+
+
+def _patched_setsockopt(self, *args, **kwargs):
+    try:
+        return _orig_setsockopt(self, *args, **kwargs)
+    except PermissionError:
+        return None
+
+
+socket.socket.setsockopt = _patched_setsockopt
+
+
+class _FakeManager:
+    def Queue(self, maxsize: int = 0):
+        return _mp.Queue(maxsize)
+
+
+_mp.Manager = _FakeManager
+
+
+def _fake_context_manager(self):
+    return _FakeManager()
+
+
+_mp_context.BaseContext.Manager = _fake_context_manager
+
+from Auto3D.presentation.auto3Dcli import cli
+
+
+if __name__ == "__main__":
+    raise SystemExit(cli())
+""".lstrip(),
+        encoding="utf-8",
+    )
+    return script
 
 
 def _ensure_auto3d_wrapper_script(output_dir: Path) -> Path:
