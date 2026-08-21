@@ -35,14 +35,37 @@ It is not a fork or vendored mirror of those tools.
 The default production engine follows this sequence:
 
 ```mermaid
-flowchart LR
-    A[Input] --> B[RDKit standardization]
-    B --> C[molscrub protomer candidates]
-    C --> D[Early filtering]
-    D --> E[RDKit and Auto3D tautomer triage]
-    E --> F[RDKit and Auto3D stereo triage]
-    F --> G[Final 3D variants]
-    G --> H[Reports and provenance]
+%%{init: {"flowchart": {"nodeSpacing": 20, "rankSpacing": 12, "diagramPadding": 4, "subGraphTitleMargin": {"top": 0, "bottom": 0}, "curve": "linear"}}}%%
+flowchart TB
+    subgraph row1[" "]
+        direction LR
+        A[Input] --> B[RDKit<br/>standardization]
+    end
+
+    subgraph row2[" "]
+        direction RL
+        C[molscrub protomer<br/>candidates] --> D[Early filtering]
+    end
+
+    subgraph row3[" "]
+        direction LR
+        E[RDKit and Auto3D<br/>tautomer triage] --> F[RDKit and Auto3D<br/>stereo triage]
+    end
+
+    subgraph row4[" "]
+        direction RL
+        G[Final 3D variants] --> H[Reports and<br/>provenance]
+    end
+
+    %% Connect row containers so external links do not override row directions.
+    row1 --> row2
+    row2 --> row3
+    row3 --> row4
+
+    style row1 fill:none,stroke:#aaa,stroke-width:1px,stroke-dasharray:4 4
+    style row2 fill:none,stroke:#aaa,stroke-width:1px,stroke-dasharray:4 4
+    style row3 fill:none,stroke:#aaa,stroke-width:1px,stroke-dasharray:4 4
+    style row4 fill:none,stroke:#aaa,stroke-width:1px,stroke-dasharray:4 4
 ```
 
 The default path uses RDKit for bounded enumeration and Auto3D energies for approximate candidate triage. CREST/xTB, CENSO, and Psi4/PySCF are separate, explicitly enabled validation or refinement layers; none is a default dependency.
