@@ -2,7 +2,7 @@
 
 `dominant-structural-variant-ranker` (`dsvr`) is a Python orchestration package for preparing and ranking pH- and solvent-dependent small-molecule structural variants with maintained open-source tools.
 
-This repository is a wrapper/orchestrator. It does **not** vendor, mirror, or clone third-party repositories. RDKit, molscrub, Auto3D, xTB, CREST, CENSO, Psi4, and PySCF remain external tools installed through conda-forge, pip, official binary distributions, or user-managed software modules.
+This repository is a wrapper/orchestrator. It does **not** vendor, mirror, or clone third-party repositories. RDKit, molscrub, Auto3D, xTB, CREST, CENSO, Psi4, and PySCF remain external tools installed through uv, official binary distributions, or user-managed software modules.
 
 ## Default Workflow
 
@@ -74,9 +74,8 @@ CREST/xTB, xTB thermo, CREST entropy estimates, CENSO, and Psi4/PySCF rescoring 
 ## Quick Start
 
 ```bash
-conda env create -f environment.yml
-conda activate dsvr
-python -m pip install -e ".[dev]"
+uv sync --extra dev
+source .venv/bin/activate
 dsvr doctor
 dsvr prepare-ligands examples/test_molecules_minimal.smi --config configs/ligprep_like_default.yaml --out runs/smoke
 ```
@@ -90,15 +89,15 @@ PYTHONPATH=src python -m pytest
 
 ## Dependency Strategy
 
-- Do not vendor third-party repositories.
-- Install Python packages via conda or pip.
-- Install external binaries via conda, official binaries, or user-managed modules.
+- Do not vendor Third-party repositories.
+- Install Python packages via uv.
+- Install external binaries via official binaries or user-managed modules.
 - Use `dsvr doctor` to verify the environment before running optional physics-heavy workflows.
 
 Optional Python tools:
 
 ```bash
-scripts/bootstrap_mamba.sh --with-auto3d --with-molscrub
+uv sync --extra auto3d --extra molscrub
 ```
 
 ## CLI
