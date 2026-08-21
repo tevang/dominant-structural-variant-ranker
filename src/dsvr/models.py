@@ -187,6 +187,7 @@ class ToolStatus(BaseModel):
     version: str | None = None
     minimum_version: str | None = None
     meets_minimum_version: bool | None = None
+    group: str | None = None
 
 
 class VariantRecord(BaseModel):

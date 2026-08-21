@@ -1,0 +1,12 @@
+SMILES  molname
+Cc1cc(NC(=O)Nc2ccc(-c3c(F)ccc4[nH]nc(N)c34)cc2)ccc1F CHEMBL1993996
+COC(=O)Nc1cc(-c2c(C(=O)O)n[nH]c2C)cc2[nH]ncc12 CHEMBL4128758
+CSc1nc(O)c2c(C(N)=O)[nH]nc2n1 CHEMBL7646
+c1cc(-c2nnn[nH]2)c2[nH]ncc2c1 CHEMBL499583
+Clc1ccc(-c2n[nH]c3ccc(-c4nc[nH]n4)cc23)cc1Cl CHEMBL3964048
+O=C(NCCO)c1ccc2c(-c3nc4ccccc4[nH]3)n[nH]c2c1 CHEMBL3974274
+O=C(NC1CCCCC1)c1cccc(-c2n[nH]c3ccc(-c4nc[nH]n4)cc23)c1 CHEMBL3957293
+Nc1nccc(-c2ccc3c(N)n[nH]c3c2)n1 CHEMBL1688215
+CCOC(=O)CCCc1nnc(-c2ccc3[nH]nc(-c4ccc(F)cc4)c3c2)[nH]1 CHEMBL3896804
+Nc1nccc(Nc2cc(I)c3[nH]ncc3c2)n1 CHEMBL585958
+CC1(C)OCc2c(Nc3n[nH]c4cccc(F)c34)nc(-c3cn[nH]c3)nc21 CHEMBL3759935

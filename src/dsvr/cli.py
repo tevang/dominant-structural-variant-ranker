@@ -286,8 +286,9 @@ def doctor(
         "checks": [item.model_dump(mode="json") for item in statuses],
     }
     for item in statuses:
+        tool_summary = item.kind == "tool"
         table.add_row(
-            item.name,
+            f"[bold]{item.name}[/bold]" if tool_summary else item.name,
             item.kind,
             "yes" if item.required else "optional",
             "ok" if item.available else "missing",

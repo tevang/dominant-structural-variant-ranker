@@ -3,6 +3,7 @@ from __future__ import annotations
 import os
 import shutil
 import sys
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -15,31 +16,108 @@ from dsvr.runners.subprocess_utils import (
 )
 
 PYTHON_MINIMUM = "3.11"
-MODULE_CHECKS = {
-    "rdkit": {"required": True, "minimum": None},
-    "molscrub": {"required": True, "minimum": None},
-    "Auto3D": {"required": False, "minimum": None},
-    "psi4": {"required": False, "minimum": None},
-    "pyscf": {"required": False, "minimum": None},
+
+# Single-interface tools: (name, required).
+_MODULE_CHECKS = {
+    "rdkit": {"required": True},
+    "pyscf": {"required": False},
 }
-EXECUTABLE_CHECKS = {
-    "scrub.py": {"required": False, "version_args": ["-h"]},
-    "molscrub": {"required": False, "version_args": ["-h"]},
-    "auto3d": {"required": False, "version_args": ["--version"]},
-    "auto3D": {"required": False, "version_args": ["--version"]},
+_EXECUTABLE_CHECKS = {
     "xtb": {"required": True, "version_args": ["--version"]},
     "crest": {"required": True, "version_args": ["--version"]},
     "censo": {"required": False, "version_args": ["--version"]},
-    "psi4": {"required": False, "version_args": ["--version"]},
 }
+
+
+@dataclass(frozen=True)
+class _InterfaceCheck:
+    """One way to access a tool: a Python module import or a CLI executable."""
+
+    kind: str  # "python-module" or "executable"
+    label: str  # human-readable interface label, e.g. "python module" or "CLI"
+    probe_names: tuple[str, ...]  # module name, or executable candidates in PATH order
+    version_args: tuple[str, ...] = ("--version",)
+
+
+@dataclass(frozen=True)
+class _ToolGroup:
+    """A logical external tool that is usable if any of its interfaces works."""
+
+    name: str
+    required: bool
+    interfaces: tuple[_InterfaceCheck, ...]
+    install_hint: str
+
+
+_TOOL_GROUPS = (
+    _ToolGroup(
+        name="molscrub",
+        required=True,
+        interfaces=(
+            _InterfaceCheck(
+                kind="python-module",
+                label="python module",
+                probe_names=("molscrub",),
+            ),
+            _InterfaceCheck(
+                kind="executable",
+                label="CLI",
+                probe_names=("scrub.py", "molscrub"),
+                version_args=("-h",),
+            ),
+        ),
+        install_hint=(
+            "not usable; install with "
+            "pip install git+https://github.com/forlilab/molscrub.git "
+            "or provide scrub.py/molscrub on PATH"
+        ),
+    ),
+    _ToolGroup(
+        name="Auto3D",
+        required=False,
+        interfaces=(
+            _InterfaceCheck(
+                kind="python-module",
+                label="python module",
+                probe_names=("Auto3D",),
+            ),
+            _InterfaceCheck(
+                kind="executable",
+                label="CLI",
+                probe_names=("auto3d", "auto3D", "Auto3D"),
+            ),
+        ),
+        install_hint="optional; install with pip install Auto3D or provide auto3d on PATH",
+    ),
+    _ToolGroup(
+        name="psi4",
+        required=False,
+        interfaces=(
+            _InterfaceCheck(
+                kind="python-module",
+                label="python module",
+                probe_names=("psi4",),
+            ),
+            _InterfaceCheck(
+                kind="executable",
+                label="CLI",
+                probe_names=("psi4",),
+            ),
+        ),
+        install_hint=(
+            "optional; install the psi4 Python package or provide the psi4 "
+            "executable on PATH"
+        ),
+    ),
+)
 
 
 def check_tools(output_dir: Path | None = None) -> list[ToolStatus]:
     statuses = [
         _python_status(),
         *_module_statuses(),
+        *_tool_group_statuses(),
         *_executable_statuses(),
-        *_compound_tool_statuses(),
         _writable_output_status(output_dir or Path("runs/dsvr")),
         _cpu_status(),
         _disk_status(output_dir or Path.cwd()),
@@ -77,29 +155,91 @@ def _python_status() -> ToolStatus:
 
 def _module_statuses() -> list[ToolStatus]:
     statuses: list[ToolStatus] = []
-    for module_name, config in MODULE_CHECKS.items():
+    for module_name, config in _MODULE_CHECKS.items():
         available, version = python_import_check(module_name)
-        minimum = config["minimum"]
-        minimum_ok = meets_minimum_version(version, minimum)
-        detail = "importable" if available else _module_install_hint(module_name)
         statuses.append(
             ToolStatus(
                 name=module_name,
                 kind="python-module",
                 required=bool(config["required"]),
-                available=available and minimum_ok is not False,
-                detail=detail,
+                available=available,
+                detail="importable" if available else "not importable",
                 version=version,
-                minimum_version=minimum,
-                meets_minimum_version=minimum_ok,
             )
         )
     return statuses
 
 
+def _tool_group_statuses() -> list[ToolStatus]:
+    """One summary row per tool followed by one row per interface.
+
+    The summary row reports whether the tool is usable at all (any interface
+    available); interface rows are informational alternatives and are therefore
+    never individually required.
+    """
+    statuses: list[ToolStatus] = []
+    for tool in _TOOL_GROUPS:
+        interfaces = [_interface_status(tool, interface) for interface in tool.interfaces]
+        usable = [status for status in interfaces if status.available]
+        version = next((status.version for status in usable if status.version), None)
+        summary = ToolStatus(
+            name=tool.name,
+            kind="tool",
+            required=tool.required,
+            available=bool(usable),
+            detail=(
+                "usable via " + ", ".join(_interface_label(tool, status) for status in usable)
+                if usable
+                else tool.install_hint
+            ),
+            version=version,
+        )
+        statuses.extend([summary, *interfaces])
+    return statuses
+
+
+def _interface_label(tool: _ToolGroup, status: ToolStatus) -> str:
+    prefix = f"{tool.name} ("
+    if status.name.startswith(prefix) and status.name.endswith(")"):
+        return status.name[len(prefix) : -1]
+    return status.kind
+
+
+def _interface_status(tool: _ToolGroup, interface: _InterfaceCheck) -> ToolStatus:
+    if interface.kind == "python-module":
+        available, version = python_import_check(interface.probe_names[0])
+        detail = "importable" if available else "not importable"
+    else:
+        found = next(
+            (
+                (candidate, path)
+                for candidate in interface.probe_names
+                if (path := which_executable(candidate)) is not None
+            ),
+            None,
+        )
+        available = found is not None
+        if found is not None:
+            candidate, path = found
+            detail = path
+            version = executable_version(candidate, args=list(interface.version_args))
+        else:
+            detail = f"not on PATH (tried: {', '.join(interface.probe_names)})"
+            version = None
+    return ToolStatus(
+        name=f"{tool.name} ({interface.label})",
+        kind=interface.kind,
+        required=False,
+        available=available,
+        detail=detail,
+        version=version,
+        group=tool.name,
+    )
+
+
 def _executable_statuses() -> list[ToolStatus]:
     statuses: list[ToolStatus] = []
-    for executable, config in EXECUTABLE_CHECKS.items():
+    for executable, config in _EXECUTABLE_CHECKS.items():
         path = which_executable(executable)
         version = None
         if path is not None:
@@ -115,43 +255,6 @@ def _executable_statuses() -> list[ToolStatus]:
             )
         )
     return statuses
-
-
-def _compound_tool_statuses() -> list[ToolStatus]:
-    molscrub_module, molscrub_version = python_import_check("molscrub")
-    molscrub_cli = which_executable("scrub.py") or which_executable("molscrub")
-    auto3d_module, auto3d_version = python_import_check("Auto3D")
-    auto3d_cli = (
-        which_executable("auto3d")
-        or which_executable("auto3D")
-        or which_executable("Auto3D")
-    )
-    return [
-        ToolStatus(
-            name="molscrub-api-or-cli",
-            kind="compound",
-            required=True,
-            available=molscrub_module or molscrub_cli is not None,
-            detail=(
-                "Python import or CLI available"
-                if molscrub_module or molscrub_cli is not None
-                else "install molscrub Python package or provide scrub.py/molscrub on PATH"
-            ),
-            version=molscrub_version,
-        ),
-        ToolStatus(
-            name="Auto3D-api-or-cli",
-            kind="compound",
-            required=False,
-            available=auto3d_module or auto3d_cli is not None,
-            detail=(
-                "Python import or CLI available"
-                if auto3d_module or auto3d_cli is not None
-                else "optional; install Auto3D Python package or provide auto3d on PATH"
-            ),
-            version=auto3d_version,
-        ),
-    ]
 
 
 def _writable_output_status(output_dir: Path) -> ToolStatus:
@@ -199,14 +302,3 @@ def _disk_status(path: Path) -> ToolStatus:
         available=usage.free > 0,
         detail=f"{free_gb:.2f} GiB free at {target}",
     )
-
-
-def _module_install_hint(module_name: str) -> str:
-    if module_name == "molscrub":
-        return (
-            "not importable; install with "
-            "pip install git+https://github.com/forlilab/molscrub.git"
-        )
-    if module_name == "Auto3D":
-        return "not importable; install with pip install Auto3D"
-    return "not importable"

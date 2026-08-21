@@ -26,6 +26,70 @@ def test_doctor_returns_default_workflow_and_optional_tool_statuses(
     assert "Auto3D" not in required
 
 
+def test_doctor_groups_tool_interfaces_under_one_usability_row(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    monkeypatch.setattr(tool_check, "executable_version", lambda *args, **kwargs: "mock 1.0")
+    monkeypatch.setattr(tool_check, "python_import_check", lambda name: (False, None))
+    monkeypatch.setattr(
+        tool_check,
+        "which_executable",
+        lambda name: "/usr/bin/scrub.py" if name == "scrub.py" else None,
+    )
+
+    statuses = check_tools(output_dir=tmp_path / "out")
+
+    groups = [status for status in statuses if status.kind == "tool"]
+    assert [group.name for group in groups] == ["molscrub", "Auto3D", "psi4"]
+
+    # The summary row reports whether the tool is usable via any interface.
+    molscrub = next(status for status in groups if status.name == "molscrub")
+    assert molscrub.required
+    assert molscrub.available
+    assert "CLI" in molscrub.detail
+
+    auto3d = next(status for status in groups if status.name == "Auto3D")
+    assert not auto3d.required
+    assert not auto3d.available
+
+    # Interface rows are informational alternatives, never individually required.
+    interface_rows = [status for status in statuses if status.group == "molscrub"]
+    assert [status.name for status in interface_rows] == [
+        "molscrub (python module)",
+        "molscrub (CLI)",
+    ]
+    assert not any(status.required for status in interface_rows)
+    assert not interface_rows[0].available
+    assert interface_rows[1].available
+
+    # Interface rows immediately follow their summary row.
+    names = [status.name for status in statuses]
+    summary_index = names.index("molscrub")
+    assert names[summary_index + 1 : summary_index + 3] == [
+        "molscrub (python module)",
+        "molscrub (CLI)",
+    ]
+
+
+def test_doctor_payload_required_group_satisfied_by_any_interface(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    monkeypatch.setattr(tool_check, "executable_version", lambda *args, **kwargs: "mock 1.0")
+    monkeypatch.setattr(tool_check, "python_import_check", lambda name: (False, None))
+    monkeypatch.setattr(
+        tool_check,
+        "which_executable",
+        lambda name: "/usr/bin/scrub.py" if name == "scrub.py" else None,
+    )
+
+    payload = tool_check.doctor_payload(output_dir=tmp_path / "out")
+
+    assert "molscrub" not in payload["required_missing"]
+    assert {"xtb", "crest"}.issubset(set(payload["required_missing"]))
+
+
 def test_cli_doctor_json_writes_machine_readable_report(
     tmp_path: Path,
     monkeypatch,
