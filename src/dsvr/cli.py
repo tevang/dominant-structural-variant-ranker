@@ -967,6 +967,32 @@ def run_qm_command(
     console.print(f"Wrote QM outputs to [bold]{run_dir / 'qm' / backend}[/bold]")
 
 
+@app.command(name="view")
+def view_command(
+    run_dir: Annotated[Path, typer.Argument(file_okay=False)],
+    open_browser: Annotated[
+        bool,
+        typer.Option("--open-browser/--no-open-browser", help="Automatically open the browser."),
+    ] = True,
+) -> None:
+    """Launch the Streamlit inspection GUI for a run directory."""
+    if not (run_dir / "run_outputs.csv").exists():
+        raise typer.BadParameter(
+            f"{run_dir} does not contain run_outputs.csv. Pass a run directory produced by "
+            "`dsvr prepare-ligands` or `dsvr run`."
+        )
+    try:
+        import streamlit  # noqa: F401
+
+        from dsvr.gui.ui.app import run_inspection_app
+    except ImportError as exc:
+        raise typer.BadParameter(
+            "The GUI requires the `gui` extra. Install it with `uv sync --extra gui` or "
+            "`pip install 'dominant-structural-variant-ranker[gui]'`."
+        ) from exc
+    run_inspection_app(str(run_dir), open_browser=open_browser)
+
+
 @app.command(name="summarize")
 def summarize_command(
     run_dir: Annotated[Path, typer.Argument(exists=True, file_okay=False)],
