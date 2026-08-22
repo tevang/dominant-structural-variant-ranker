@@ -39,12 +39,23 @@ dev = [
 gui = [
   "streamlit>=1.33",
 ]
+molscrub = [
+  "molscrub @ git+https://github.com/forlilab/molscrub.git",
+  # molscrub imports joblib at runtime but does not declare it in its own install_requires.
+  "joblib",
+]
+auto3d = [
+  "Auto3D",
+]
 
 [project.scripts]
 dsvr = "dsvr.cli:app"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/dsvr"]
+
+[tool.hatch.metadata]
+allow-direct-references = true
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
