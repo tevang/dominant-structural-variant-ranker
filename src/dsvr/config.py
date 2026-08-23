@@ -1,3 +1,9 @@
+"""Configuration models and helpers for the dominant-structural-variant-ranker.
+
+This module defines the typed configuration schema consumed by the CLI and
+the various workflow runners.
+"""
+
 from __future__ import annotations
 
 import warnings
