@@ -104,3 +104,113 @@ def test_run_auto3d_v3_tries_single_cli_invocation(monkeypatch, tmp_path):
     assert calls[0][0] == sys.executable
     assert calls[0][1].endswith("_auto3d_v3_wrapper.py")
     assert calls[0][2] == "run"
+
+
+def _spawn_put(queue, value):
+    queue.put(value)
+
+
+def test_install_fake_manager_queue_survives_spawn_worker():
+    """Regression test for the fork/spawn SemLock crash.
+
+    Auto3D shares manager queues with spawn-context worker processes. A
+    queue created in the default fork context raises "RuntimeError: A
+    SemLock created in a fork context is being shared with a process in a
+    spawn context" when the worker touches it; the fake manager must
+    therefore build queues from the spawn context.
+    """
+
+    import multiprocessing as mp
+    import multiprocessing.context as mp_context
+
+    from dsvr.runners._auto3d_mp_shim import install_fake_manager
+
+    original_manager = mp.Manager
+    original_base_manager = mp_context.BaseContext.Manager
+    try:
+        install_fake_manager()
+        queue = mp.Manager().Queue()
+        process = mp.get_context("spawn").Process(
+            target=_spawn_put, args=(queue, "sentinel")
+        )
+        process.start()
+        process.join(timeout=60)
+        assert process.exitcode == 0
+        assert queue.get(timeout=30) == "sentinel"
+    finally:
+        mp.Manager = original_manager
+        mp_context.BaseContext.Manager = original_base_manager
+
+
+def test_run_auto3d_accepts_partial_output_on_nonzero_exit(monkeypatch, tmp_path):
+    """Regression test for discarding partial Auto3D results.
+
+    Auto3D exits nonzero when some inputs produce no output (e.g. charged
+    molecules), but still writes an output SDF with the results it computed.
+    run_auto3d must return that output so downstream stages can fill the
+    missing variants, instead of discarding everything and burning time on
+    duplicate GPU/CPU passes and per-molecule fallback retries.
+    """
+
+    monkeypatch.setattr(auto3d_runner, "_find_executable", lambda: "auto3d")
+    monkeypatch.setattr(auto3d_runner.importlib.util, "find_spec", lambda name: object())
+    monkeypatch.setattr(auto3d_runner, "_auto3d_major_version", lambda: 3)
+
+    def fake_run_command(command, **kwargs):
+        sdf = tmp_path / "job" / "input_out.sdf"
+        sdf.parent.mkdir(parents=True, exist_ok=True)
+        sdf.write_text("mol block\n$$$$\n", encoding="utf-8")
+        return subprocess.CompletedProcess(
+            args=command,
+            returncode=6,
+            stdout="",
+            stderr="2 input molecule(s) produced no output",
+        )
+
+    monkeypatch.setattr(auto3d_runner, "run_command", fake_run_command)
+
+    output, _command = auto3d_runner.run_auto3d(
+        tmp_path / "input.smi",
+        tmp_path,
+        k=1,
+        model="AIMNET",
+        internal_tautomer_stereo_enum=False,
+    )
+    assert output.name == "input_out.sdf"
+
+
+def test_run_auto3d_finds_output_next_to_input_file(monkeypatch, tmp_path):
+    """Regression test: Auto3D creates job directories next to the INPUT file
+    (<input_stem>_<job_name>/), which may be outside output_dir (tautomer
+    filtering passes a sibling dir). run_auto3d must find that output."""
+
+    input_dir = tmp_path / "input_here"
+    output_dir = tmp_path / "output_elsewhere"
+    input_dir.mkdir(parents=True)
+    output_dir.mkdir(parents=True)
+    input_smi = input_dir / "tautomer_candidates.smi"
+    input_smi.write_text("CCO molA\n", encoding="utf-8")
+
+    monkeypatch.setattr(auto3d_runner, "_find_executable", lambda: "auto3d")
+    monkeypatch.setattr(auto3d_runner.importlib.util, "find_spec", lambda name: object())
+    monkeypatch.setattr(auto3d_runner, "_auto3d_major_version", lambda: 3)
+
+    def fake_run_command(command, **kwargs):
+        job_name = command[command.index("--job-name") + 1]
+        job_dir = input_dir / f"tautomer_candidates_{job_name}"
+        job_dir.mkdir(parents=True, exist_ok=True)
+        (job_dir / "tautomer_candidates_out.sdf").write_text(
+            "mol block\n$$$$\n", encoding="utf-8"
+        )
+        return subprocess.CompletedProcess(args=command, returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr(auto3d_runner, "run_command", fake_run_command)
+
+    output, _command = auto3d_runner.run_auto3d(
+        input_smi,
+        output_dir,
+        k=3,
+        model="ANI2xt",
+        internal_tautomer_stereo_enum=False,
+    )
+    assert output.name == "tautomer_candidates_out.sdf"

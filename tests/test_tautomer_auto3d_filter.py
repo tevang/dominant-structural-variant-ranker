@@ -174,3 +174,29 @@ def test_rdkit_tautomer_cap_warning_is_preserved_with_auto3d(
     )
     ranked = ranked_path.read_text(encoding="utf-8")
     assert "RDKit tautomer cap reached" in ranked
+
+
+def test_energy_from_mol_reads_auto3d_v3_total_energy():
+    """Regression test: Auto3D v3 writes E_tot/E_tot(Hartree) in Hartree;
+    the tautomer energy reader must convert it so ranking gets usable
+    energies instead of silently falling back to RDKit."""
+    from rdkit import Chem
+
+    from dsvr.chemistry.tautomer_auto3d_filter import _energy_from_mol
+    from dsvr.utils.units import HARTREE_TO_KCAL_MOL
+
+    mol = Chem.MolFromSmiles("CCO")
+    mol.SetProp("E_tot(Hartree)", "-153.0123")
+    assert _energy_from_mol(mol) == pytest.approx(-153.0123 * HARTREE_TO_KCAL_MOL)
+
+    mol2 = Chem.MolFromSmiles("CCO")
+    mol2.SetProp("E_tot", "-153.0123")
+    mol2.SetProp("E_rel(kcal/mol)", "0.0")
+    # absolute total preferred over the near-zero relative conformer energy
+    assert _energy_from_mol(mol2) == pytest.approx(-153.0123 * HARTREE_TO_KCAL_MOL)
+
+    mol3 = Chem.MolFromSmiles("CCO")
+    mol3.SetProp("E_rel(kcal/mol)", "1.5")
+    assert _energy_from_mol(mol3) == pytest.approx(1.5)
+
+    assert _energy_from_mol(Chem.MolFromSmiles("CCO")) is None

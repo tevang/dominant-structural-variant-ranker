@@ -46,6 +46,7 @@ molscrub = [
 ]
 auto3d = [
   "Auto3D",
+  "torchani>=2.8.4",
 ]
 
 [project.scripts]

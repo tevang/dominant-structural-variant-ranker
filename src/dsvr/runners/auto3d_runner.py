@@ -1,7 +1,7 @@
 from __future__ import annotations
 
-import importlib.util
 import importlib.metadata
+import importlib.util
 import shutil
 import sys
 import uuid
@@ -116,6 +116,16 @@ def run_auto3d(
             check=False,
         )
         if completed.returncode != 0:
+            guessed = _find_output_sdf(
+                output_dir, input_path=input_path, job_name=job_name_base
+            )
+            if guessed is not None and _sdf_contains_records(guessed):
+                # Auto3D exits nonzero when some inputs produce no output
+                # (e.g. charged molecules it cannot optimize), but it still
+                # writes usable results for the rest. Treat that as a partial
+                # success: downstream stages fill the missing variants with
+                # the RDKit fallback and record per-variant warnings.
+                return guessed, command
             failure_text = _completed_output_tail(completed)
             failures.append(
                 f"{' '.join(command)} exited {completed.returncode}: "
@@ -126,7 +136,9 @@ def run_auto3d(
             continue
         if output_sdf.exists():
             return output_sdf, command
-        guessed = _find_output_sdf(output_dir)
+        guessed = _find_output_sdf(
+            output_dir, input_path=input_path, job_name=job_name_base
+        )
         if guessed is not None:
             return guessed, command
         failures.append(
@@ -362,11 +374,32 @@ def _cpu_worker_indices(cpu_workers: int) -> str:
     return ",".join(str(index) for index in range(cpu_workers))
 
 
-def _find_output_sdf(output_dir: Path) -> Path | None:
+def _find_output_sdf(
+    output_dir: Path,
+    *,
+    input_path: Path | None = None,
+    job_name: str | None = None,
+) -> Path | None:
     candidates = sorted(
         list(output_dir.glob("**/*_out.sdf")) + list(output_dir.glob("**/*_3d.sdf"))
     )
+    if input_path is not None and job_name:
+        # Auto3D creates job directories next to the input file
+        # (<input_stem>_<job_name>/...), which can live outside output_dir
+        # when callers pass a sibling directory as output_dir (e.g. the
+        # tautomer-filtering stage). Search there too, restricted to this
+        # invocation's unique job name to avoid matching stale outputs.
+        matches = list(input_path.parent.glob(f"*{job_name}*/**/*_out.sdf"))
+        matches += input_path.parent.glob(f"*{job_name}*/**/*_3d.sdf")
+        candidates.extend(sorted(matches))
     return candidates[0] if candidates else None
+
+
+def _sdf_contains_records(path: Path) -> bool:
+    try:
+        return b"$$$$" in path.read_bytes()
+    except OSError:
+        return False
 
 
 def _python_executable() -> str:
@@ -399,9 +432,7 @@ def _auto3d_cache_paths() -> _Auto3DCachePaths:
 def _should_use_gpu(requested: bool) -> bool:
     if not requested:
         return False
-    if not Path("/dev/nvidia0").exists() and not Path("/dev/nvidiactl").exists():
-        return False
-    return True
+    return Path("/dev/nvidia0").exists() or Path("/dev/nvidiactl").exists()
 
 
 def _auto3d_major_version() -> int | None:
@@ -455,8 +486,6 @@ def _ensure_auto3d_v3_wrapper_script(output_dir: Path) -> Path:
         """
 from __future__ import annotations
 
-import multiprocessing as _mp
-import multiprocessing.context as _mp_context
 import socket
 
 
@@ -472,20 +501,9 @@ def _patched_setsockopt(self, *args, **kwargs):
 
 socket.socket.setsockopt = _patched_setsockopt
 
+from dsvr.runners._auto3d_mp_shim import install_fake_manager
 
-class _FakeManager:
-    def Queue(self, maxsize: int = 0):
-        return _mp.Queue(maxsize)
-
-
-_mp.Manager = _FakeManager
-
-
-def _fake_context_manager(self):
-    return _FakeManager()
-
-
-_mp_context.BaseContext.Manager = _fake_context_manager
+install_fake_manager()
 
 from Auto3D.presentation.auto3Dcli import cli
 
@@ -525,15 +543,9 @@ _pkg_resources.get_distribution = _get_distribution
 _pkg_resources.DistributionNotFound = _DistributionNotFound
 sys.modules["pkg_resources"] = _pkg_resources
 
-import multiprocessing as _mp
+from dsvr.runners._auto3d_mp_shim import install_fake_manager
 
-
-class _FakeManager:
-    def Queue(self, maxsize: int = 0):
-        return _mp.Queue(maxsize)
-
-
-_mp.Manager = _FakeManager
+install_fake_manager()
 
 import Auto3D.auto3D as _auto3d_module
 
