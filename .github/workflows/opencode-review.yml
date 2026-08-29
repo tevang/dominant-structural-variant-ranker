@@ -1,0 +1,67 @@
+name: opencode-review
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
+
+jobs:
+  review:
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write
+      contents: read
+      pull-requests: write
+      issues: write
+    steps:
+      - uses: actions/checkout@v6
+        with: { fetch-depth: 0 }
+
+      - name: Precheck — large files and escalation paths
+        id: precheck
+        run: |
+          THRESHOLD=$((5*1024*1024))
+          git fetch origin ${{ github.base_ref }} --depth=1
+          CHANGED=$(git diff --name-only --diff-filter=ACM origin/${{ github.base_ref }}...HEAD)
+
+          echo "LARGE_FILES<<EOF" >> "$GITHUB_ENV"
+          for f in $CHANGED; do
+            [ -f "$f" ] || continue
+            size=$(git cat-file -s :"$f" 2>/dev/null || stat -c%s "$f")
+            if [ "$size" -gt "$THRESHOLD" ]; then echo "$f ($((size/1024/1024)) MB)"; fi
+          done >> "$GITHUB_ENV"
+          echo "EOF" >> "$GITHUB_ENV"
+
+          LINES_CHANGED=$(git diff --shortstat origin/${{ github.base_ref }}...HEAD | grep -oE '[0-9]+ insert' | grep -oE '[0-9]+' || echo 0)
+          SENSITIVE=$(echo "$CHANGED" | grep -E '^(auth|security|payments|crypto)/' || true)
+          if [ "$LINES_CHANGED" -gt 400 ] || [ -n "$SENSITIVE" ]; then
+            echo "escalate=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "escalate=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Review (default pass)
+        uses: anomalyco/opencode/github@latest
+        env:
+          LITELLM_API_KEY: ${{ secrets.LITELLM_API_KEY }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          use_github_token: true
+          model: "litellm/glm-5.2"
+          agent: "pr-reviewer"
+          share: false
+
+      - name: Review (escalation pass)
+        if: steps.precheck.outputs.escalate == 'true'
+        uses: anomalyco/opencode/github@latest
+        env:
+          LITELLM_API_KEY: ${{ secrets.LITELLM_API_KEY }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          use_github_token: true
+          model: "litellm/deepseek-v4-flash-thinking"
+          agent: "pr-reviewer"
+          share: false
+          prompt: |
+            Re-review this PR with deeper reasoning — it was flagged as
+            large or touching a sensitive path by the automated precheck.
+            Focus specifically on correctness and security; the routine
+            pass already covered Git LFS and general style.
