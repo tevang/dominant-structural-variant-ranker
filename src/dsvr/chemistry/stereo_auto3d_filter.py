@@ -23,6 +23,7 @@ from dsvr.runners.auto3d_runner import (
     Auto3DExecutionError,
     Auto3DUnavailableError,
     engine_supports_molecule,
+    output_line_id,
     partition_by_engine,
     run_auto3d,
 )
@@ -233,7 +234,11 @@ def _rank_representatives_with_auto3d(
             if errors:
                 detail += ": " + " | ".join(error.splitlines()[0] for error in errors)
             raise Auto3DExecutionError(detail)
-        command_line = [part for command in commands for part in command] if commands else []
+        command_line = (
+            [" ;; ".join(" ".join(str(part) for part in command) for command in commands)]
+            if commands
+            else []
+        )
         return energies, command_line, None, incompatible_ids, plan
     except (Auto3DExecutionError, Auto3DUnavailableError) as exc:
         note = failure_book_for(config.output_dir).note_for_exception(
@@ -252,13 +257,7 @@ def _read_auto3d_energies_by_line_id(output_sdf: Path) -> dict[str, float]:
     for molecule in supplier:
         if molecule is None:
             continue
-        line_id = None
-        for key in ("DSVR_STEREO_ID", "stereo_id", "ID", "_Name"):
-            if molecule.HasProp(key):
-                value = molecule.GetProp(key).strip()
-                line_id = value.split()[0] if value else ""
-                if line_id:
-                    break
+        line_id = output_line_id(molecule, ("DSVR_STEREO_ID", "stereo_id", "_Name"))
         if not line_id:
             continue
         energy = _energy_from_mol(molecule)

@@ -3,6 +3,7 @@ from __future__ import annotations
 import importlib.metadata
 import importlib.util
 import logging
+import re
 import shutil
 import subprocess
 import sys
@@ -28,8 +29,9 @@ CLASS_EXECUTION = "EXECUTION_ERROR"
 def classify_auto3d_failure(text: str) -> str:
     """Classify an Auto3D failure text into a stable error class."""
 
+    folded = text.casefold()
     if any(
-        f"Only {engine} can handle" in text
+        f"only {engine.casefold()} can handle" in folded
         for engine in ("AIMNET", "AIMNet2", "ANI2x", "ANI2xt")
     ):
         # Auto3D validation message, e.g. "Only AIMNET can handle: [...]"
@@ -63,6 +65,31 @@ class _Auto3DCachePaths:
     xdg_cache_home: Path
     warp_cache_path: Path
     aimnet_cache_dir: Path
+
+
+def output_line_id(molecule: Chem.Mol, prop_keys: tuple[str, ...]) -> str | None:
+    """Recover the Auto3D input line id from an output molecule.
+
+    Auto3D v3 restores ``_Name`` to the exact input line id while ``ID``
+    gains conformer suffixes (``lineid_0_0``) — so ``_Name`` and the DSVR
+    props win, and ``ID`` is only a suffix-stripped fallback.
+    """
+
+    for key in prop_keys:
+        if molecule.HasProp(key):
+            value = molecule.GetProp(key).strip()
+            token = value.split()[0] if value else ""
+            if token:
+                return token
+    if molecule.HasProp("ID"):
+        token = molecule.GetProp("ID").strip().split()[0]
+        while True:
+            stripped = re.sub(r"_\d+$", "", token)
+            if stripped == token:
+                break
+            token = stripped
+        return token or None
+    return None
 
 
 def inspect_auto3d() -> dict[str, str | bool | None]:

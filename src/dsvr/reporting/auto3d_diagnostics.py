@@ -12,6 +12,11 @@ One :class:`Auto3DFailureBook` per run directory keeps:
   Auto3D binary) or because Auto3D's own validation rejected the engine are
   not blindly re-attempted for the remaining molecules of the stage;
 - **bounded notes** — helpers keeping per-candidate warning text short.
+
+Occurrence counters are appended at powers of two (1, 2, 4, 8, ...), so the
+append-only store stays logarithmic in the storm scenario; consumers read
+last-line-wins per ``root_cause_id`` (the true in-memory count may exceed
+the last logged one between powers).
 """
 
 from __future__ import annotations
@@ -125,7 +130,7 @@ class Auto3DFailureBook:
                 count=existing.count + 1,
             )
             self.root_causes[existing.root_cause_id] = updated
-            self._write_root_cause(updated)
+            self._write_root_cause_if_due(updated)
             return updated
         excerpt = _normalize_excerpt(text)
         root_cause_id = hashlib.sha1(
@@ -142,7 +147,7 @@ class Auto3DFailureBook:
                 count=existing.count + 1,
             )
             self.root_causes[root_cause_id] = updated
-            self._write_root_cause(updated)
+            self._write_root_cause_if_due(updated)
             return updated
         cause = RootCause(
             root_cause_id=root_cause_id,
@@ -154,6 +159,13 @@ class Auto3DFailureBook:
         self.root_causes[root_cause_id] = cause
         self._write_root_cause(cause)
         return cause
+
+    def _write_root_cause_if_due(self, cause: RootCause) -> None:
+        # Log-spaced persistence: keep the append-only store O(log n) in the
+        # storm scenario instead of one line per occurrence.
+        if cause.count > 1 and cause.count & (cause.count - 1):
+            return
+        self._write_root_cause(cause)
 
     def _write_root_cause(self, cause: RootCause) -> None:
         self.run_dir.mkdir(parents=True, exist_ok=True)

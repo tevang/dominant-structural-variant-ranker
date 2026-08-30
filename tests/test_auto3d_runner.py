@@ -426,3 +426,24 @@ def test_timeout_inside_run_command_becomes_auto3d_execution_error(monkeypatch, 
             internal_tautomer_stereo_enum=False,
             timeout_s=5,
         )
+
+
+def test_output_line_id_prefers_exact_name_over_suffixed_id_prop():
+    """Regression for the v3 layout verified live: _Name is restored to the
+    exact input line id while ID carries conformer suffixes (``id_0_0``) —
+    ID must never shadow the exact id, and is only a suffix-stripped fallback."""
+
+    from rdkit import Chem
+
+    mol = Chem.MolFromSmiles("CCO")
+    mol.SetProp("_Name", "mol_x_t01")
+    mol.SetProp("ID", "mol_x_t01_0_0")
+    assert auto3d_runner.output_line_id(mol, ("DSVR_TAUTOMER_ID", "_Name")) == "mol_x_t01"
+
+    mol_id_only = Chem.MolFromSmiles("CCO")
+    mol_id_only.SetProp("ID", "mol_x_t01_0_0")
+    assert auto3d_runner.output_line_id(mol_id_only, ("DSVR_TAUTOMER_ID", "_Name")) == "mol_x_t01"
+
+    mol_expanded = Chem.MolFromSmiles("CCO")
+    mol_expanded.SetProp("ID", "mol_x_t01__st2_0")
+    assert auto3d_runner.output_line_id(mol_expanded, ("DSVR_TAUTOMER_ID", "_Name")) == "mol_x_t01__st2"
