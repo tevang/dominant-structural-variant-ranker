@@ -17,6 +17,7 @@ from dsvr.chemistry.conformers_auto3d import (
 )
 from dsvr.chemistry.conformers_rdkit import generate_rdkit_seeds, read_stereo_sdf
 from dsvr.chemistry.final3d import generate_final_3d_variants
+from dsvr.chemistry.identity import ExactDuplicateKey, exact_duplicate_key_with_warning
 from dsvr.chemistry.protonation import generate_protomer_candidates
 from dsvr.chemistry.stereo_auto3d_filter import filter_stereoisomers_with_auto3d
 from dsvr.chemistry.stereochemistry import enumerate_stereoisomers, read_tautomers_sdf
@@ -54,6 +55,7 @@ from dsvr.models import (
     ProtomerRecord,
     RankedVariantRecord,
     SeedConformerRecord,
+    TautomerRecord,
     ThermoRecord,
     VariantRecord,
     WorkflowResult,
@@ -276,9 +278,14 @@ def run_workflow(config: RunConfig) -> WorkflowResult:
     if should_skip_step(steps["tautomers"], tautomer_input_hash, config):
         states.append(skipped_state(steps["tautomers"], tautomer_input_hash, config))
         tautomers = _load_tautomers(outdir)
+        # Dedupe also covers resume-loaded records; refill pools are only
+        # available in-memory, so resume-loaded branches cannot be refilled
+        # (shortfalls are recorded instead).
+        tautomers = dedupe_and_refill_tautomers(tautomers, [], config, progress)
         progress.record("Tautomer enumeration", "skipped", generated_count=len(tautomers))
     else:
         tautomers = []
+        tautomer_pool: list[TautomerRecord] = []
         missing_protomers: list[ProtomerRecord] = []
         for protomer in protomers:
             existing = _load_existing_tautomer_outputs(protomer, outdir, config)
@@ -289,7 +296,9 @@ def run_workflow(config: RunConfig) -> WorkflowResult:
         if missing_protomers:
             if config.workflow_mode == "ligprep_like" and config.tautomer_filtering.enabled:
                 try:
-                    tautomers.extend(filter_tautomers_with_auto3d(missing_protomers, config))
+                    filter_result = filter_tautomers_with_auto3d(missing_protomers, config)
+                    tautomers.extend(filter_result.selected_records)
+                    tautomer_pool.extend(filter_result.pool_records)
                     for protomer in missing_protomers:
                         recovery.molecule(
                             item_id=protomer.id,
@@ -316,7 +325,9 @@ def run_workflow(config: RunConfig) -> WorkflowResult:
                         ):
                             continue
                         try:
-                            tautomers.extend(enumerate_tautomers(protomer, config))
+                            selection = enumerate_tautomers(protomer, config)
+                            tautomers.extend(selection.selected_records)
+                            tautomer_pool.extend(selection.pool_records)
                             recovery.molecule(
                                 item_id=protomer.id,
                                 item_name=protomer.molname,
@@ -327,7 +338,9 @@ def run_workflow(config: RunConfig) -> WorkflowResult:
                             kind = classify_failure(item_exc, stage="Tautomer enumeration")
                             retry_config = _retry_reduced_enumeration_config(config, kind)
                             try:
-                                tautomers.extend(enumerate_tautomers(protomer, retry_config))
+                                retry_selection = enumerate_tautomers(protomer, retry_config)
+                                tautomers.extend(retry_selection.selected_records)
+                                tautomer_pool.extend(retry_selection.pool_records)
                                 recovery.molecule(
                                     item_id=protomer.id,
                                     item_name=protomer.molname,
@@ -362,7 +375,9 @@ def run_workflow(config: RunConfig) -> WorkflowResult:
                     ):
                         continue
                     try:
-                        tautomers.extend(enumerate_tautomers(protomer, config))
+                        selection = enumerate_tautomers(protomer, config)
+                        tautomers.extend(selection.selected_records)
+                        tautomer_pool.extend(selection.pool_records)
                         recovery.molecule(
                             item_id=protomer.id,
                             item_name=protomer.molname,
@@ -373,7 +388,9 @@ def run_workflow(config: RunConfig) -> WorkflowResult:
                         kind = classify_failure(exc, stage="Tautomer enumeration")
                         retry_config = _retry_reduced_enumeration_config(config, kind)
                         try:
-                            tautomers.extend(enumerate_tautomers(protomer, retry_config))
+                            retry_selection = enumerate_tautomers(protomer, retry_config)
+                            tautomers.extend(retry_selection.selected_records)
+                            tautomer_pool.extend(retry_selection.pool_records)
                             recovery.molecule(
                                 item_id=protomer.id,
                                 item_name=protomer.molname,
@@ -397,6 +414,7 @@ def run_workflow(config: RunConfig) -> WorkflowResult:
                                 item_name=protomer.molname,
                                 exc=retry_exc,
                             )
+        tautomers = dedupe_and_refill_tautomers(tautomers, tautomer_pool, config, progress)
         states.append(
             mark_done(
                 steps["tautomers"],
@@ -839,6 +857,235 @@ def _retry_reduced_enumeration_config(config: RunConfig, kind: FailureKind) -> R
 
 def run_smoke_workflow(config: RunConfig) -> WorkflowResult:
     return run_workflow(config)
+
+
+def _tautomer_rank_key(record: TautomerRecord) -> tuple[float, float, float, str]:
+    """Best-first rank evidence: relative energy, then fallback rank, then ID."""
+
+    metadata = record.metadata if isinstance(record.metadata, dict) else {}
+    filtering = metadata.get("auto3d_tautomer_filtering", {})
+    if not isinstance(filtering, dict):
+        filtering = {}
+    relative = filtering.get("relative_energy_kcal_mol")
+    auto3d_rank = filtering.get("rank")
+    fallback_rank = metadata.get("tautomer_fallback_rank")
+    return (
+        float(relative) if isinstance(relative, int | float) else float("inf"),
+        float(auto3d_rank) if isinstance(auto3d_rank, int | float) else float("inf"),
+        float(fallback_rank) if isinstance(fallback_rank, int | float) else float("inf"),
+        record.id,
+    )
+
+
+def _tautomer_identity_key(record: TautomerRecord) -> tuple[ExactDuplicateKey, str | None]:
+    mol = record.rdkit_mol
+    if mol is None:
+        mol = Chem.MolFromSmiles(record.isomeric_smiles or record.canonical_smiles or "")
+    if mol is None:
+        # A record that cannot be parsed is never merged: give it a unique key.
+        return ExactDuplicateKey("__unparseable__", 0, record.id), (
+            f"could not parse a structure for {record.id}; treated as unique"
+        )
+    return exact_duplicate_key_with_warning(mol)
+
+
+def _promote_tautomer(candidate: TautomerRecord) -> TautomerRecord:
+    """Promote a ranked pool candidate into the selected set after dedupe."""
+
+    metadata = dict(candidate.metadata)
+    metadata.pop("rejection_reason", None)
+    filtering = metadata.get("auto3d_tautomer_filtering")
+    if isinstance(filtering, dict):
+        filtering = dict(filtering)
+        filtering["selected"] = True
+        filtering["reason"] = "selected_by_tautomer_dedupe_refill"
+        metadata["auto3d_tautomer_filtering"] = filtering
+    if "selected" in metadata:
+        metadata["selected"] = True
+    metadata["selection_reason"] = "selected_by_tautomer_dedupe_refill"
+    metadata["tautomer_refill"] = {"promoted_after_cross_branch_dedupe": True}
+    return candidate.model_copy(update={"metadata": metadata})
+
+
+def dedupe_and_refill_tautomers(
+    tautomers: list[TautomerRecord],
+    pool: list[TautomerRecord],
+    config: RunConfig,
+    progress: ProgressRecorder | None = None,
+) -> list[TautomerRecord]:
+    """Eliminate cross-branch exact-duplicate tautomers and refill to ``tauto_k``.
+
+    Groups records per ``(input_molecule_id, exact_duplicate_key)``, keeps the
+    best-ranked representative (lowest tautomer relative energy, else RDKit
+    fallback rank, else smallest record ID), records ``merged_from`` provenance
+    on representatives, and refills every branch that deduplication dropped
+    below ``tauto_k`` from that branch's own ranked unused unique pool. Writes
+    the ``enumeration/tautomers/tautomer_dedupe.csv`` audit artifact.
+    """
+
+    output_dir = config.output_dir / "enumeration" / "tautomers"
+    tauto_k = config.tautomer_filtering.tauto_k
+    audit_rows: list[dict[str, Any]] = []
+    shortfall_messages: list[str] = []
+
+    key_by_id: dict[str, ExactDuplicateKey] = {}
+    identity_warnings: list[str] = []
+
+    def key_of(record: TautomerRecord) -> ExactDuplicateKey:
+        key = key_by_id.get(record.id)
+        if key is None:
+            key, warning = _tautomer_identity_key(record)
+            key_by_id[record.id] = key
+            if warning:
+                identity_warnings.append(f"{record.id}: {warning}")
+        return key
+
+    by_input: dict[str, list[TautomerRecord]] = {}
+    for record in tautomers:
+        by_input.setdefault(record.input_molecule_id, []).append(record)
+    pool_by_parent: dict[str, list[TautomerRecord]] = {}
+    for record in pool:
+        pool_by_parent.setdefault(record.parent_id or "", []).append(record)
+
+    result: list[TautomerRecord] = []
+    for input_id, records in by_input.items():
+        branches: list[str] = []
+        for record in [*records, *[p for p in pool if p.input_molecule_id == input_id]]:
+            parent = record.parent_id or ""
+            if parent not in branches:
+                branches.append(parent)
+
+        groups: dict[ExactDuplicateKey, list[TautomerRecord]] = {}
+        for record in records:
+            groups.setdefault(key_of(record), []).append(record)
+
+        retained: list[TautomerRecord] = []
+        selected_keys: set[ExactDuplicateKey] = set()
+        branches_with_eliminations: set[str] = set()
+        for key, group in groups.items():
+            ordered = sorted(group, key=_tautomer_rank_key)
+            representative = ordered[0]
+            eliminated = ordered[1:]
+            if eliminated:
+                metadata = dict(representative.metadata)
+                metadata["merged_from"] = [
+                    {
+                        "tautomer_id": item.id,
+                        "protomer_id": item.parent_id,
+                        "input_molecule_id": item.input_molecule_id,
+                    }
+                    for item in eliminated
+                ]
+                representative = representative.model_copy(update={"metadata": metadata})
+                for item in eliminated:
+                    branches_with_eliminations.add(item.parent_id or "")
+                audit_rows.append(
+                    {
+                        "input_molecule_id": input_id,
+                        "action": "merge",
+                        "parent_protomer_id": representative.parent_id or "",
+                        "exact_formula": key.formula,
+                        "exact_net_charge": key.net_charge,
+                        "exact_canonical_isomeric_smiles": key.canonical_isomeric_smiles,
+                        "retained_tautomer_id": representative.id,
+                        "eliminated_tautomer_ids": " | ".join(item.id for item in eliminated),
+                        "promoted_tautomer_id": "",
+                        "detail": "kept best-ranked representative per exact-duplicate key",
+                    }
+                )
+            retained.append(representative)
+            selected_keys.add(key)
+
+        for branch in branches:
+            if branch not in branches_with_eliminations:
+                continue
+            current = [record for record in retained if (record.parent_id or "") == branch]
+            missing = tauto_k - len(current)
+            if missing <= 0:
+                continue
+            candidates = sorted(pool_by_parent.get(branch, []), key=_tautomer_rank_key)
+            promoted_count = 0
+            for candidate in candidates:
+                if missing <= 0:
+                    break
+                candidate_key = key_of(candidate)
+                if candidate_key in selected_keys:
+                    continue
+                promoted = _promote_tautomer(candidate)
+                retained.append(promoted)
+                selected_keys.add(candidate_key)
+                missing -= 1
+                promoted_count += 1
+                audit_rows.append(
+                    {
+                        "input_molecule_id": input_id,
+                        "action": "refill",
+                        "parent_protomer_id": branch,
+                        "exact_formula": candidate_key.formula,
+                        "exact_net_charge": candidate_key.net_charge,
+                        "exact_canonical_isomeric_smiles": candidate_key.canonical_isomeric_smiles,
+                        "retained_tautomer_id": "",
+                        "eliminated_tautomer_ids": "",
+                        "promoted_tautomer_id": promoted.id,
+                        "detail": "promoted unused unique ranked candidate after cross-branch dedupe",
+                    }
+                )
+            if missing > 0:
+                reason = (
+                    "refill pool exhausted"
+                    if candidates or pool_by_parent.get(branch)
+                    else "no ranked refill candidates available (pool exhausted or resume-loaded)"
+                )
+                detail = (
+                    f"branch selected {tauto_k - missing} of {tauto_k} tautomers after "
+                    f"cross-branch dedupe ({promoted_count} promoted); {reason}"
+                )
+                shortfall_messages.append(f"{branch}: {detail}")
+                audit_rows.append(
+                    {
+                        "input_molecule_id": input_id,
+                        "action": "shortfall",
+                        "parent_protomer_id": branch,
+                        "exact_formula": "",
+                        "exact_net_charge": "",
+                        "exact_canonical_isomeric_smiles": "",
+                        "retained_tautomer_id": "",
+                        "eliminated_tautomer_ids": "",
+                        "promoted_tautomer_id": "",
+                        "detail": detail,
+                    }
+                )
+        result.extend(retained)
+
+    _write_tautomer_dedupe_audit(output_dir / "tautomer_dedupe.csv", audit_rows)
+    for message in shortfall_messages:
+        if progress is not None:
+            progress.warning("Tautomer enumeration", f"tautomer refill shortfall: {message}")
+    for message in identity_warnings:
+        if progress is not None:
+            progress.warning("Tautomer enumeration", message)
+    return result
+
+
+def _write_tautomer_dedupe_audit(path: Path, rows: list[dict[str, Any]]) -> None:
+    columns = [
+        "input_molecule_id",
+        "action",
+        "parent_protomer_id",
+        "exact_formula",
+        "exact_net_charge",
+        "exact_canonical_isomeric_smiles",
+        "retained_tautomer_id",
+        "eliminated_tautomer_ids",
+        "promoted_tautomer_id",
+        "detail",
+    ]
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", encoding="utf-8", newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=columns)
+        writer.writeheader()
+        for row in rows:
+            writer.writerow(row)
 
 
 def _use_final_auto3d_default_path(config: RunConfig) -> bool:

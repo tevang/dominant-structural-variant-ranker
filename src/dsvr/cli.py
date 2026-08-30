@@ -616,7 +616,7 @@ def enumerate_tautomers_command(
     protomers = read_protomers_sdf(protomers_sdf)
     all_records = []
     for protomer in protomers:
-        all_records.extend(enumerate_tautomers(protomer, config))
+        all_records.extend(enumerate_tautomers(protomer, config).selected_records)
 
     report = {
         "input_path": str(protomers_sdf),

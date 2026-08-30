@@ -60,7 +60,7 @@ def test_auto3d_tautomer_filter_selects_ranked_survivors(
         tautomer_filtering={"tauto_k": 1, "tauto_window_kcal_mol": 20.0},
     )
 
-    records = filter_tautomers_with_auto3d([_protomer()], config)
+    records = filter_tautomers_with_auto3d([_protomer()], config).selected_records
 
     assert len(records) == 1
     tautomer_dir = tmp_path / "run" / "enumeration" / "tautomers"
@@ -96,7 +96,7 @@ def test_rdkit_tautomer_timeout_falls_back_to_input(
     monkeypatch.setattr(tautomer_filter, "run_auto3d", fail_auto3d)
     config = RunConfig(output_dir=tmp_path / "run")
 
-    records = filter_tautomers_with_auto3d([_protomer()], config)
+    records = filter_tautomers_with_auto3d([_protomer()], config).selected_records
 
     assert len(records) == 1
     selected = (
@@ -161,7 +161,7 @@ def test_rdkit_tautomer_cap_warning_is_preserved_with_auto3d(
     monkeypatch.setattr(tautomer_filter, "run_auto3d", fake_auto3d)
     config = RunConfig(output_dir=tmp_path / "run", tautomer_filtering={"tauto_k": 1})
 
-    records = filter_tautomers_with_auto3d([_protomer()], config)
+    records = filter_tautomers_with_auto3d([_protomer()], config).selected_records
 
     assert records
     assert any("RDKit tautomer cap reached" in warning for warning in records[0].warnings)
@@ -254,7 +254,7 @@ def test_mixed_engine_batch_is_split_per_engine(tmp_path, monkeypatch) -> None:
     monkeypatch.setattr(tautomer_filter, "run_auto3d", fake_auto3d)
     config = RunConfig(output_dir=tmp_path / "run")
 
-    records = filter_tautomers_with_auto3d([protomer], config)
+    records = filter_tautomers_with_auto3d([protomer], config).selected_records
 
     engines_used = [model for model, _smiles in calls]
     assert engines_used == ["ANI2xt", "AIMNET"]
@@ -299,7 +299,7 @@ def test_candidate_unsupported_by_all_engines_uses_rdkit_fallback(tmp_path, monk
     monkeypatch.setattr(tautomer_filter, "run_auto3d", fake_auto3d)
     config = RunConfig(output_dir=tmp_path / "run")
 
-    records = filter_tautomers_with_auto3d([protomer], config)
+    records = filter_tautomers_with_auto3d([protomer], config).selected_records
 
     lithium_record = next((r for r in records if "Li" in r.isomeric_smiles), None)
     assert lithium_record is not None, records

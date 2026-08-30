@@ -206,11 +206,17 @@ class StereoisomerFilteringConfig(StrictModel):
     run_energy_for_enantiomer_representatives_only: bool = True
     stereo_energy_window_kcal_mol: float = 7.0
     keep_top_n_diastereomers: int = 8
+    # Bounded over-enumeration factor: RDKit enumerates up to
+    # min(cap * multiplier, hard ceiling) candidates per tautomer so the first
+    # cap *unique* stereoisomers can still be filled when the raw enumeration
+    # contains duplicates, without unbounded enumeration cost.
+    enumeration_ceiling_multiplier: int = 4
 
     @field_validator(
         "max_stereoisomers_per_tautomer",
         "timeout_seconds_per_tautomer",
         "keep_top_n_diastereomers",
+        "enumeration_ceiling_multiplier",
     )
     @classmethod
     def positive_stereoisomer_filtering_limit(cls, value: int) -> int:
@@ -237,6 +243,9 @@ class Final3dConfig(StrictModel):
     use_gpu: bool = True
     energy_window_kcal_mol: float = 7.0
     timeout_seconds_per_batch: int = 1800
+    # Safety-net exact-duplicate removal on final 3D variants per input
+    # molecule (toolkit-local identity key), keeping the lowest-energy record.
+    dedupe_final_variants: bool = True
 
     @field_validator("k", "max_confs", "patience", "timeout_seconds_per_batch")
     @classmethod

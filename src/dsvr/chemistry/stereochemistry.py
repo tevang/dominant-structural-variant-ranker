@@ -17,12 +17,18 @@ from dsvr.models import StereoRecord, TautomerRecord, make_stereo_id
 
 STEREO_TIMEOUT_FALLBACK = "STEREO_TIMEOUT_FALLBACK"
 
+# Absolute safety bound for RDKit stereoisomer enumeration. Fill-to-cap
+# over-enumeration raises ``maxIsomers`` by the configured multiplier only up
+# to this ceiling, so enumeration cost stays bounded regardless of settings.
+STEREO_ENUMERATION_HARD_CEILING = 1024
+
 
 def enumerate_stereoisomers(
     tautomer_record: TautomerRecord,
     config: RunConfig,
 ) -> list[StereoRecord]:
-    max_isomers = _max_stereoisomers(config)
+    cap = _max_stereoisomers(config)
+    max_isomers = _enumeration_ceiling(config, cap)
     options = StereoEnumerationOptions(
         tryEmbedding=(
             config.stereoisomer_filtering.try_embedding
@@ -87,8 +93,9 @@ def enumerate_stereoisomers(
         output_dir=output_dir,
         extra_warnings=extra_warnings,
     )
-    _write_stereo_sdf(output_dir / f"{tautomer_record.id}_stereoisomers.sdf", records)
-    _write_stereo_csv(output_dir / f"{tautomer_record.id}_stereoisomers.csv", records)
+    selected = [record for record in records if record.metadata.get("selected", True)]
+    _write_stereo_sdf(output_dir / f"{tautomer_record.id}_stereoisomers.sdf", selected)
+    _write_stereo_csv(output_dir / f"{tautomer_record.id}_stereoisomers.csv", selected)
     return records
 
 
@@ -113,6 +120,9 @@ def _records_from_stereoisomers(
     cap = _max_stereoisomers(config)
     hit_cap = len(unique_stereoisomers) >= cap and len(stereoisomers) >= cap
     limited_stereoisomers = unique_stereoisomers[:cap]
+    ceiling_shortfall = (
+        len(stereoisomers) >= options.maxIsomers and len(unique_stereoisomers) < cap
+    )
     records: list[StereoRecord] = []
     for index, stereoisomer in enumerate(limited_stereoisomers, start=1):
         canonical_smiles = Chem.MolToSmiles(stereoisomer, canonical=True, isomericSmiles=False)
@@ -125,54 +135,168 @@ def _records_from_stereoisomers(
             "rdkit_stereo_parameters": _stereo_parameters(options),
             "stereochemical_smiles": isomeric_smiles,
             "dedupe_key": {"isomeric_smiles": isomeric_smiles},
+            "selected": True,
         }
-        warnings = [
-            *(extra_warnings or []),
-            "RDKit stereoisomer enumeration is candidate generation only; dominance "
-            "ranking occurs later.",
-            "tryEmbedding is a heuristic filter and can be computationally expensive.",
-        ]
-        if config.enumeration.stereo_only_unassigned:
-            warnings.append("Assigned stereochemistry was preserved by default.")
-        else:
+        warnings = _stereo_record_warnings(
+            config,
+            extra_warnings=extra_warnings,
+            hit_cap=hit_cap,
+            cap=cap,
+        )
+        if ceiling_shortfall:
             warnings.append(
-                "All stereocenters were eligible for enumeration, including assigned centers."
-            )
-        if hit_cap:
-            warnings.append(
-                "stereoisomer candidate count reached max_stereoisomers_per_tautomer; "
-                f"candidates were limited to {cap}"
+                "bounded stereoisomer enumeration ceiling reached with "
+                f"{len(unique_stereoisomers)} unique candidates below "
+                f"max_stereoisomers_per_tautomer={cap}; shortfall recorded"
             )
         records.append(
-            StereoRecord(
-                id=make_stereo_id(
-                    tautomer_record.id,
-                    index,
-                    canonical_smiles,
-                    isomeric_smiles,
-                    metadata,
-                ),
-                parent_id=tautomer_record.id,
-                input_molecule_id=tautomer_record.input_molecule_id,
-                molname=tautomer_record.molname,
+            _stereo_record(
+                tautomer_record,
+                stereoisomer,
+                index=index,
                 canonical_smiles=canonical_smiles,
                 isomeric_smiles=isomeric_smiles,
-                molecular_formula=formula,
-                formal_charge=charge,
-                explicit_proton_count=proton_count,
-                source_software="rdkit",
-                source_python_function="dsvr.chemistry.stereochemistry.enumerate_stereoisomers",
-                output_paths=[
-                    output_dir / f"{tautomer_record.id}_stereoisomers.sdf",
-                    output_dir / f"{tautomer_record.id}_stereoisomers.csv",
-                ],
-                warnings=warnings,
+                formula=formula,
+                charge=charge,
+                proton_count=proton_count,
                 metadata=metadata,
-                stereo_index=index,
-                rdkit_mol=stereoisomer,
+                warnings=warnings,
+                output_dir=output_dir,
+            )
+        )
+    records.extend(
+        _pool_records(
+            tautomer_record,
+            unique_stereoisomers[cap:],
+            config=config,
+            options=options,
+            output_dir=output_dir,
+            extra_warnings=extra_warnings,
+            stereo_index_offset=len(records),
+        )
+    )
+    return records
+
+
+def _stereo_record(
+    tautomer_record: TautomerRecord,
+    stereoisomer: Chem.Mol,
+    *,
+    index: int,
+    canonical_smiles: str,
+    isomeric_smiles: str,
+    formula: str,
+    charge: int,
+    proton_count: int,
+    metadata: dict,
+    warnings: list[str],
+    output_dir: Path,
+) -> StereoRecord:
+    return StereoRecord(
+        id=make_stereo_id(
+            tautomer_record.id,
+            index,
+            canonical_smiles,
+            isomeric_smiles,
+            metadata,
+        ),
+        parent_id=tautomer_record.id,
+        input_molecule_id=tautomer_record.input_molecule_id,
+        molname=tautomer_record.molname,
+        canonical_smiles=canonical_smiles,
+        isomeric_smiles=isomeric_smiles,
+        molecular_formula=formula,
+        formal_charge=charge,
+        explicit_proton_count=proton_count,
+        source_software="rdkit",
+        source_python_function="dsvr.chemistry.stereochemistry.enumerate_stereoisomers",
+        output_paths=[
+            output_dir / f"{tautomer_record.id}_stereoisomers.sdf",
+            output_dir / f"{tautomer_record.id}_stereoisomers.csv",
+        ],
+        warnings=warnings,
+        metadata=metadata,
+        stereo_index=index,
+        rdkit_mol=stereoisomer,
+    )
+
+
+def _pool_records(
+    tautomer_record: TautomerRecord,
+    stereoisomers: list[Chem.Mol],
+    *,
+    config: RunConfig,
+    options: StereoEnumerationOptions,
+    output_dir: Path,
+    extra_warnings: list[str] | None,
+    stereo_index_offset: int,
+) -> list[StereoRecord]:
+    """Unused unique stereoisomers beyond the cap, kept in memory as the
+    refill pool for the cross-tautomer duplicate guard (not written to the
+    per-tautomer SDF/CSV)."""
+
+    cap = _max_stereoisomers(config)
+    records: list[StereoRecord] = []
+    for offset, stereoisomer in enumerate(stereoisomers, start=1):
+        index = stereo_index_offset + offset
+        canonical_smiles = Chem.MolToSmiles(stereoisomer, canonical=True, isomericSmiles=False)
+        isomeric_smiles = Chem.MolToSmiles(stereoisomer, canonical=True, isomericSmiles=True)
+        metadata = {
+            "candidate_generation_only": True,
+            "rdkit_stereo_parameters": _stereo_parameters(options),
+            "stereochemical_smiles": isomeric_smiles,
+            "dedupe_key": {"isomeric_smiles": isomeric_smiles},
+            "selected": False,
+            "rejection_reason": "beyond_max_stereoisomers_per_tautomer",
+        }
+        records.append(
+            _stereo_record(
+                tautomer_record,
+                stereoisomer,
+                index=index,
+                canonical_smiles=canonical_smiles,
+                isomeric_smiles=isomeric_smiles,
+                formula=_formula(stereoisomer),
+                charge=Chem.GetFormalCharge(stereoisomer),
+                proton_count=_explicit_proton_count(stereoisomer),
+                metadata=metadata,
+                warnings=_stereo_record_warnings(
+                    config,
+                    extra_warnings=extra_warnings,
+                    hit_cap=False,
+                    cap=cap,
+                ),
+                output_dir=output_dir,
             )
         )
     return records
+
+
+def _stereo_record_warnings(
+    config: RunConfig,
+    *,
+    extra_warnings: list[str] | None,
+    hit_cap: bool,
+    cap: int,
+) -> list[str]:
+    warnings = [
+        *(extra_warnings or []),
+        "RDKit stereoisomer enumeration is candidate generation only; dominance "
+        "ranking occurs later.",
+        "tryEmbedding is a heuristic filter and can be computationally expensive.",
+    ]
+    if config.enumeration.stereo_only_unassigned:
+        warnings.append("Assigned stereochemistry was preserved by default.")
+    else:
+        warnings.append(
+            "All stereocenters were eligible for enumeration, including assigned centers."
+        )
+    if hit_cap:
+        warnings.append(
+            "stereoisomer candidate count reached max_stereoisomers_per_tautomer; "
+            f"candidates were limited to {cap}"
+        )
+    return warnings
 
 
 def _has_potential_double_bond_stereo(molecule: Chem.Mol) -> bool:
@@ -190,6 +314,15 @@ def _max_stereoisomers(config: RunConfig) -> int:
     return min(
         config.stereoisomer_filtering.max_stereoisomers_per_tautomer,
         config.enumeration.max_stereoisomers_per_tautomer,
+    )
+
+
+def _enumeration_ceiling(config: RunConfig, cap: int) -> int:
+    """Bounded over-enumeration ceiling (fill-to-cap with duplicate slack)."""
+
+    return min(
+        cap * config.stereoisomer_filtering.enumeration_ceiling_multiplier,
+        STEREO_ENUMERATION_HARD_CEILING,
     )
 
 

@@ -216,36 +216,42 @@ def _pipeline_decision_rows(
                 warnings=" | ".join(decision.warnings or []) or _record_warnings(record),
             )
         )
-    for decision in xtb_prefilter_decisions:
+    for xtb_decision in xtb_prefilter_decisions:
         rows.append(
             _decision_row(
-                input_id=decision.input_molecule_id,
-                molname=decision.molname,
-                protomer_id=_ancestor(decision.stereo_id, "p"),
-                tautomer_id=_ancestor(decision.stereo_id, "t"),
-                stereoisomer_id=decision.stereo_id,
-                final_variant_id=decision.seed_id,
+                input_id=xtb_decision.input_molecule_id,
+                molname=xtb_decision.molname,
+                protomer_id=_ancestor(xtb_decision.stereo_id, "p"),
+                tautomer_id=_ancestor(xtb_decision.stereo_id, "t"),
+                stereoisomer_id=xtb_decision.stereo_id,
+                final_variant_id=xtb_decision.seed_id,
                 stage="xtb_prefilter",
-                selected=decision.selected,
-                rejection_reason="" if decision.selected else decision.reason,
-                formal_charge=decision.charge,
-                formula=decision.formula,
-                final_auto3d_energy=decision.energy_kcal_mol,
-                warnings=" | ".join(decision.warnings or []),
+                selected=xtb_decision.selected,
+                rejection_reason="" if xtb_decision.selected else xtb_decision.reason,
+                formal_charge=xtb_decision.charge,
+                formula=xtb_decision.formula,
+                final_auto3d_energy=xtb_decision.energy_kcal_mol,
+                warnings=" | ".join(xtb_decision.warnings or []),
             )
         )
-    for decision in stereo_reduction.decisions:
+    for reduction_decision in stereo_reduction.decisions:
         rows.append(
             _decision_row(
-                input_id=decision.input_molecule_id,
-                protomer_id=_ancestor(decision.stereo_id, "p"),
-                tautomer_id=_ancestor(decision.stereo_id, "t"),
-                stereoisomer_id=decision.stereo_id,
-                final_variant_id=decision.seed_id,
+                input_id=reduction_decision.input_molecule_id,
+                protomer_id=_ancestor(reduction_decision.stereo_id, "p"),
+                tautomer_id=_ancestor(reduction_decision.stereo_id, "t"),
+                stereoisomer_id=reduction_decision.stereo_id,
+                final_variant_id=reduction_decision.seed_id,
                 stage="crest_stereo_reduction",
-                selected=decision.selected_for_crest,
-                rejection_reason="" if decision.selected_for_crest else decision.reason,
-                rescue_rule="representative_seed" if decision.relationship != "not_reduced" else "",
+                selected=reduction_decision.selected_for_crest,
+                rejection_reason=(
+                    "" if reduction_decision.selected_for_crest else reduction_decision.reason
+                ),
+                rescue_rule=(
+                    "representative_seed"
+                    if reduction_decision.relationship != "not_reduced"
+                    else ""
+                ),
             )
         )
     return rows

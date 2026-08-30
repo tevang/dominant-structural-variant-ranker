@@ -17,6 +17,43 @@ Input SMILES/SDF
 -> optional CREST/xTB validation only if explicitly enabled
 ```
 
+## Duplicate Elimination and Fill-to-Cap Semantics
+
+Each expansion step (protomers per input, tautomers per protomer,
+stereoisomers per tautomer, one conformer per variant) is deduplicated
+branch-locally, and additionally every step is followed by a cross-branch
+exact-duplicate guard per input molecule: identical structures that arise from
+different protomer branches (for example protomers that are tautomers of one
+another, such as neutral azoles protonated on different ring nitrogens) are
+collapsed to one representative.
+
+"Same structure" is decided by a toolkit-local exact-duplicate key: molecular
+formula, net formal charge, and canonical isomeric SMILES computed after RDKit
+`rdMolStandardize.Cleanup` (ChEMBL-style standardization; never uncharged and
+never tautomer/charge-parent). Standard InChI/InChIKey is deliberately **not**
+used, because its normalization collapses mobile-hydrogen tautomers into one
+identifier and would over-merge distinct tautomers; raw unstandardized SMILES
+is likewise not used, because Kekulé or charge-representation differences
+would under-merge. The key is valid only within this RDKit-based pipeline and
+this stated policy; it is not a global identifier.
+
+When deduplication drops a branch below its configured cap, the branch is
+refilled to the cap from its own next-best unused unique ranked candidates
+(`tauto_k` per protomer branch for tautomers, `max_stereoisomers_per_tautomer`
+for stereoisomers) — fill-to-cap semantics — and a final safety-net dedupe
+(lowest final energy wins) runs before `final_variants.sdf/csv/json` are
+written. Eliminated duplicates, refill promotions, and unfillable shortfalls
+are recorded in `enumeration/tautomers/tautomer_dedupe.csv`,
+`stereoisomer_filtering/stereo_dedupe.csv`, and `final_dedupe_audit.csv`, and
+the retained record carries `merged_from` provenance.
+
+Because deduplication changes the record sets that downstream steps consume,
+resuming a run from before this policy was introduced re-executes the tautomer
+and later stages automatically (their input hashes change). Within a current
+run, resume re-derives the same dedupe decisions from the per-branch SDF
+outputs; ranked refill pools only exist in memory, so resume-loaded branches
+can dedupe but cannot refill (shortfalls are recorded instead).
+
 ## Why Tautomers Are Filtered Before Stereoisomers
 
 RDKit can enumerate many tautomer candidates, but RDKit tautomer enumeration is

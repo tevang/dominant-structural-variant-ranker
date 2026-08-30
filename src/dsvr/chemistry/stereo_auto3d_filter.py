@@ -16,6 +16,8 @@ from dsvr.chemistry.auto3d_stereo_policy import (
     policy_metadata,
     treatment_note,
 )
+from dsvr.chemistry.identity import ExactDuplicateKey, exact_duplicate_key_with_warning
+from dsvr.chemistry.stereochemistry import _max_stereoisomers
 from dsvr.config import RunConfig
 from dsvr.models import StereoRecord
 from dsvr.reporting.auto3d_diagnostics import bounded, failure_book_for
@@ -70,13 +72,23 @@ def filter_stereoisomers_with_auto3d(
         write_stereo_energy_outputs(output_dir, result)
         return result
 
-    representative_by_id = _enantiomer_representatives(records, config)
-    representatives = _representative_records(records, representative_by_id)
+    # Cross-tautomer exact-duplicate guard: only one copy of each exact
+    # stereoisomer structure per input molecule reaches Auto3D ranking, and
+    # affected tautomers refill their candidate sets from their own unused
+    # unique stereoisomers.
+    candidates = [record for record in records if record.metadata.get("selected", True)]
+    pool = [record for record in records if not record.metadata.get("selected", True)]
+    deduped, eliminated, dedupe_audit_rows = _dedupe_and_refill_stereoisomers(
+        candidates, pool, config
+    )
+    _write_stereo_dedupe_audit(output_dir / "stereo_dedupe.csv", dedupe_audit_rows)
+    representative_by_id = _enantiomer_representatives(deduped, config)
+    representatives = _representative_records(deduped, representative_by_id)
     energies, command, warning, incompatible_ids, stereo_plan = _rank_representatives_with_auto3d(
         representatives, config, output_dir
     )
     decisions = _decisions_from_energies(
-        records,
+        deduped,
         representative_by_id,
         energies,
         command=command,
@@ -84,13 +96,23 @@ def filter_stereoisomers_with_auto3d(
         incompatible_ids=incompatible_ids,
         config=config,
     )
+    decisions.extend(
+        _eliminated_duplicate_decision(record, kept_id) for record, kept_id in eliminated
+    )
     selected_ids = {decision.stereo_id for decision in decisions if decision.selected}
-    rejected_ids = {decision.stereo_id for decision in decisions if not decision.selected}
-    selected = [_annotated_record(record, _decision_for(record.id, decisions), config, stereo_plan) for record in records if record.id in selected_ids]
-    rejected = [_annotated_record(record, _decision_for(record.id, decisions), config, stereo_plan) for record in records if record.id in rejected_ids]
+    selected = [_annotated_record(record, _decision_for(record.id, decisions), config, stereo_plan) for record in deduped if record.id in selected_ids]
+    rejected = [_annotated_record(record, _decision_for(record.id, decisions), config, stereo_plan) for record in deduped if record.id not in selected_ids]
+    rejected.extend(
+        _annotated_record(record, _decision_for(record.id, decisions), config, stereo_plan)
+        for record, _kept_id in eliminated
+    )
     selected_by_id = {record.id: record for record in selected}
     rejected_by_id = {record.id: record for record in rejected}
-    all_records = [selected_by_id.get(record.id) or rejected_by_id.get(record.id) or record for record in records]
+    all_records = [
+        selected_by_id.get(record.id) or rejected_by_id.get(record.id) or record
+        for record in deduped
+    ]
+    all_records.extend(rejected_by_id[record.id] for record, _kept_id in eliminated)
     collapsed_count = sum(1 for decision in decisions if decision.relationship == "enantiomer_mapped")
     energy_evaluation_count = len(representatives) if command and not warning else 0
     result = StereoEnergyFilteringResult(
@@ -103,6 +125,181 @@ def filter_stereoisomers_with_auto3d(
     )
     write_stereo_energy_outputs(output_dir, result)
     return result
+
+
+def _dedupe_and_refill_stereoisomers(
+    candidates: list[StereoRecord],
+    pool: list[StereoRecord],
+    config: RunConfig,
+) -> tuple[list[StereoRecord], list[tuple[StereoRecord, str]], list[dict[str, Any]]]:
+    """Cross-tautomer exact-duplicate guard before Auto3D ranking.
+
+    Groups candidates per ``(input_molecule_id, exact_duplicate_key)`` and
+    keeps exactly one copy (deterministic smallest record ID), then refills
+    each affected tautomer back to ``max_stereoisomers_per_tautomer`` from
+    its own unused unique stereoisomers (enumeration order). Returns the
+    ranked candidate set, ``(eliminated record, kept stereo id)`` pairs, and
+    audit rows.
+    """
+
+    cap = _max_stereoisomers(config)
+    key_by_id: dict[str, ExactDuplicateKey] = {}
+
+    def key_of(record: StereoRecord) -> ExactDuplicateKey:
+        key = key_by_id.get(record.id)
+        if key is None:
+            mol = _mol(record)
+            if mol is None:
+                key = ExactDuplicateKey("__unparseable__", 0, record.id)
+            else:
+                key, _warning = exact_duplicate_key_with_warning(mol)
+            key_by_id[record.id] = key
+        return key
+
+    by_input: dict[str, list[StereoRecord]] = {}
+    for record in candidates:
+        by_input.setdefault(record.input_molecule_id, []).append(record)
+    pool_by_parent: dict[str, list[StereoRecord]] = {}
+    for record in pool:
+        pool_by_parent.setdefault(record.parent_id or "", []).append(record)
+
+    ranked: list[StereoRecord] = []
+    eliminated: list[tuple[StereoRecord, str]] = []
+    audit_rows: list[dict[str, Any]] = []
+    for input_id, group_records in by_input.items():
+        groups: dict[ExactDuplicateKey, list[StereoRecord]] = {}
+        for record in group_records:
+            groups.setdefault(key_of(record), []).append(record)
+        retained: list[StereoRecord] = []
+        selected_keys: set[ExactDuplicateKey] = set()
+        tautomers_with_eliminations: set[str] = set()
+        for key, group in groups.items():
+            ordered = sorted(group, key=lambda record: record.id)
+            kept = ordered[0]
+            retained.append(kept)
+            selected_keys.add(key)
+            for duplicate in ordered[1:]:
+                tautomers_with_eliminations.add(duplicate.parent_id or "")
+                eliminated.append((duplicate, kept.id))
+                audit_rows.append(
+                    {
+                        "input_molecule_id": input_id,
+                        "action": "merge",
+                        "parent_tautomer_id": duplicate.parent_id or "",
+                        "exact_formula": key.formula,
+                        "exact_net_charge": key.net_charge,
+                        "exact_canonical_isomeric_smiles": key.canonical_isomeric_smiles,
+                        "retained_stereo_id": kept.id,
+                        "eliminated_stereo_ids": duplicate.id,
+                        "promoted_stereo_id": "",
+                        "detail": f"exact duplicate of {kept.id} enumerated from another tautomer branch",
+                    }
+                )
+        for tautomer_id in sorted(tautomers_with_eliminations):
+            current = [record for record in retained if (record.parent_id or "") == tautomer_id]
+            missing = cap - len(current)
+            if missing <= 0:
+                continue
+            branch_pool = sorted(
+                pool_by_parent.get(tautomer_id, []),
+                key=lambda record: (record.stereo_index, record.id),
+            )
+            promoted_count = 0
+            for candidate in branch_pool:
+                if missing <= 0:
+                    break
+                candidate_key = key_of(candidate)
+                if candidate_key in selected_keys:
+                    continue
+                retained.append(_promote_stereo(candidate))
+                selected_keys.add(candidate_key)
+                missing -= 1
+                promoted_count += 1
+                audit_rows.append(
+                    {
+                        "input_molecule_id": input_id,
+                        "action": "refill",
+                        "parent_tautomer_id": tautomer_id,
+                        "exact_formula": candidate_key.formula,
+                        "exact_net_charge": candidate_key.net_charge,
+                        "exact_canonical_isomeric_smiles": candidate_key.canonical_isomeric_smiles,
+                        "retained_stereo_id": "",
+                        "eliminated_stereo_ids": "",
+                        "promoted_stereo_id": candidate.id,
+                        "detail": "promoted unused unique stereoisomer after cross-tautomer dedupe",
+                    }
+                )
+            if missing > 0:
+                reason = (
+                    "refill pool exhausted"
+                    if branch_pool
+                    else "no unused refill candidates available (pool exhausted or resume-loaded)"
+                )
+                audit_rows.append(
+                    {
+                        "input_molecule_id": input_id,
+                        "action": "shortfall",
+                        "parent_tautomer_id": tautomer_id,
+                        "exact_formula": "",
+                        "exact_net_charge": "",
+                        "exact_canonical_isomeric_smiles": "",
+                        "retained_stereo_id": "",
+                        "eliminated_stereo_ids": "",
+                        "promoted_stereo_id": "",
+                        "detail": (
+                            f"tautomer offers {cap - missing} of {cap} stereoisomers after "
+                            f"cross-tautomer dedupe ({promoted_count} promoted); {reason}"
+                        ),
+                    }
+                )
+        ranked.extend(retained)
+    return ranked, eliminated, audit_rows
+
+
+def _promote_stereo(candidate: StereoRecord) -> StereoRecord:
+    metadata = dict(candidate.metadata)
+    metadata.pop("rejection_reason", None)
+    metadata["selected"] = True
+    metadata["selection_reason"] = "selected_by_stereo_dedupe_refill"
+    metadata["stereo_refill"] = {"promoted_after_cross_tautomer_dedupe": True}
+    return candidate.model_copy(update={"metadata": metadata})
+
+
+def _eliminated_duplicate_decision(record: StereoRecord, kept_id: str) -> StereoEnergyDecision:
+    return StereoEnergyDecision(
+        stereo_id=record.id,
+        parent_tautomer_id=record.parent_id,
+        input_molecule_id=record.input_molecule_id,
+        molname=record.molname,
+        representative_stereo_id=kept_id,
+        enantiomer_group_id="",
+        relationship="exact_duplicate",
+        energy_kcal_mol=None,
+        relative_energy_kcal_mol=None,
+        energy_rank=None,
+        selected=False,
+        reason=f"rejected_exact_duplicate_pre_ranking (exact duplicate of {kept_id})",
+        warnings=(
+            f"Exact duplicate of {kept_id} enumerated from another tautomer branch; "
+            "only one copy proceeds to Auto3D ranking.",
+        ),
+    )
+
+
+def _write_stereo_dedupe_audit(path: Path, rows: list[dict[str, Any]]) -> None:
+    columns = [
+        "input_molecule_id",
+        "action",
+        "parent_tautomer_id",
+        "exact_formula",
+        "exact_net_charge",
+        "exact_canonical_isomeric_smiles",
+        "retained_stereo_id",
+        "eliminated_stereo_ids",
+        "promoted_stereo_id",
+        "detail",
+    ]
+    _write_rows(path, columns, rows)
 
 
 def write_stereo_energy_outputs(path: Path, result: StereoEnergyFilteringResult) -> None:

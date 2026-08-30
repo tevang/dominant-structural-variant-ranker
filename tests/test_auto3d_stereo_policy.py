@@ -116,7 +116,7 @@ def test_enumerate_policy_sends_specified_isomers_and_records_provenance(tmp_pat
     monkeypatch.setattr(tautomer_filter, "run_auto3d", fake)
     config = RunConfig(output_dir=tmp_path / "run", tautomer_filtering={"tauto_k": 2})
 
-    records = filter_tautomers_with_auto3d([protomer], config)
+    records = filter_tautomers_with_auto3d([protomer], config).selected_records
 
     assert all(kw.get("isomer_enum_only") is False for kw in calls)
     all_lines = "\n".join(seen_inputs)
@@ -153,7 +153,7 @@ def test_auto3d_enumerate_policy_enables_isomer_enumeration_for_subset(tmp_path,
         auto3d={"on_unspecified_stereo": "auto3d_enumerate"},
     )
 
-    records = filter_tautomers_with_auto3d([protomer], config)
+    records = filter_tautomers_with_auto3d([protomer], config).selected_records
 
     assert set(seen) == {False, True}, seen.keys()
     assert f"{chiral.tautomer_id}\n" in seen[True]  # original id, not expanded

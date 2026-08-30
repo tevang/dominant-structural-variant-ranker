@@ -42,9 +42,10 @@ def test_stereoisomer_max_isomers_cap(tmp_path: Path) -> None:
     )
 
     records = enumerate_stereoisomers(tautomer, config)
+    selected = [record for record in records if record.metadata.get("selected", True)]
 
-    assert len(records) == 1
-    assert any("max_stereoisomers_per_tautomer" in warning for warning in records[0].warnings)
+    assert len(selected) == 1
+    assert any("max_stereoisomers_per_tautomer" in warning for warning in selected[0].warnings)
 
 
 def test_preserves_assigned_stereochemistry_by_default(tmp_path: Path) -> None:

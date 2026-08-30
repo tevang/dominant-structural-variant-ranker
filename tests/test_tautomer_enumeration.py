@@ -18,7 +18,7 @@ def test_enumerate_tautomers_known_example(tmp_path: Path) -> None:
         enumeration={"max_tautomers_per_protomer": 16},
     )
 
-    records = enumerate_tautomers(protomer, config)
+    records = enumerate_tautomers(protomer, config).selected_records
 
     assert len(records) >= 2
     assert all(record.parent_id == protomer.id for record in records)
@@ -33,7 +33,7 @@ def test_tautomer_records_do_not_claim_stability_ranking(tmp_path: Path) -> None
     protomer = _protomer("acetylacetone", "CC(=O)CC(C)=O")
     config = RunConfig(input_path=tmp_path / "input.sdf", output_dir=tmp_path / "run")
 
-    records = enumerate_tautomers(protomer, config)
+    records = enumerate_tautomers(protomer, config).selected_records
 
     assert records
     assert all(record.metadata["candidate_generation_only"] is True for record in records)
@@ -49,7 +49,7 @@ def test_tautomer_enumeration_cap_warns(tmp_path: Path) -> None:
         enumeration={"max_tautomers_per_protomer": 1},
     )
 
-    records = enumerate_tautomers(protomer, config)
+    records = enumerate_tautomers(protomer, config).selected_records
 
     assert len(records) == 1
     assert any("max_tautomers_per_protomer" in warning for warning in records[0].warnings)
@@ -68,7 +68,7 @@ def test_tautomer_timeout_falls_back_to_parent_candidate(tmp_path: Path, monkeyp
 
     monkeypatch.setattr(tautomer_module, "_enumerate_molblocks_with_timeout", timeout_worker)
 
-    records = enumerate_tautomers(protomer, config)
+    records = enumerate_tautomers(protomer, config).selected_records
 
     assert len(records) == 1
     assert records[0].metadata["fallback"] is True
