@@ -13,27 +13,20 @@ jobs:
       fail-fast: false
       matrix:
         python-version: ["3.11", "3.12"]
-    defaults:
-      run:
-        shell: bash -el {0}
-
     steps:
       - name: Check out repository
         uses: actions/checkout@v4
 
-      - name: Set up Micromamba
-        uses: mamba-org/setup-micromamba@v3
+      - name: Set up uv
+        uses: astral-sh/setup-uv@v6
         with:
-          environment-file: environment.yml
-          environment-name: dsvr-py${{ matrix.python-version }}
-          create-args: >-
-            python=${{ matrix.python-version }}
-          cache-environment: true
-          cache-downloads: true
-          post-cleanup: all
+          enable-cache: true
+
+      - name: Install dependencies
+        run: uv sync --locked --extra dev --python ${{ matrix.python-version }}
 
       - name: Lint
-        run: ruff check src tests
+        run: uv run ruff check src tests
 
       - name: Test
-        run: python -m pytest -m "not external"
+        run: uv run python -m pytest -m "not external"
