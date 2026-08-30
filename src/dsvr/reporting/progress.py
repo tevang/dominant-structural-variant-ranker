@@ -300,9 +300,8 @@ class WorkflowProgress:
             return
         now = time.monotonic()
         event = str(record.get("event") or "")
-        if not force and event not in {"start_stage", "finish_stage"}:
-            if now - self._last_terminal_update < self.interval_seconds:
-                return
+        if not force and event not in {"start_stage", "finish_stage"} and now - self._last_terminal_update < self.interval_seconds:
+            return
         self._last_terminal_update = now
         if self._live_terminal:
             self.console.print(self._summary_block())

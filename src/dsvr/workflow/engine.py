@@ -18,8 +18,8 @@ from dsvr.chemistry.conformers_auto3d import (
 from dsvr.chemistry.conformers_rdkit import generate_rdkit_seeds, read_stereo_sdf
 from dsvr.chemistry.final3d import generate_final_3d_variants
 from dsvr.chemistry.protonation import generate_protomer_candidates
-from dsvr.chemistry.stereochemistry import enumerate_stereoisomers, read_tautomers_sdf
 from dsvr.chemistry.stereo_auto3d_filter import filter_stereoisomers_with_auto3d
+from dsvr.chemistry.stereochemistry import enumerate_stereoisomers, read_tautomers_sdf
 from dsvr.chemistry.tautomer_auto3d_filter import filter_tautomers_with_auto3d
 from dsvr.chemistry.tautomers import enumerate_tautomers, read_protomers_sdf
 from dsvr.config import RunConfig, write_resolved_config

@@ -7,7 +7,6 @@ from enum import StrEnum
 from pathlib import Path
 from typing import Any, Literal
 
-
 CheckpointStatus = Literal["started", "completed", "failed", "skipped"]
 
 

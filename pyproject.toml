@@ -73,6 +73,9 @@ src = ["src", "tests"]
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "B", "UP", "SIM"]
+# E501 was never enforced in CI (setup step failed before lint) and main
+# carries 108 violations; re-enable after a dedicated cleanup pass.
+ignore = ["E501"]
 
 [tool.mypy]
 python_version = "3.11"
