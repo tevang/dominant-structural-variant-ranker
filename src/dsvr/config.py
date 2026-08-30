@@ -11,6 +11,9 @@ InputFormat = Literal["auto", "smi", "smiles", "sdf"]
 SolventModel = Literal["alpb", "gbsa", "none"]
 SeederMethod = Literal["etkdg", "auto3d", "both"]
 RdkitForcefield = Literal["uff", "mmff", "none"]
+# NOTE: "auto" has no Auto3D v3 equivalent (v3 accepts only named engines);
+# with a v3 install it fails once per batch and the chain advances to named
+# engines. Prefer naming the engine explicitly.
 Auto3dModel = Literal["AIMNET", "AIMNet2", "ANI2x", "ANI2xt", "auto"]
 WorkflowMode = Literal["ligprep_like", "physics_validation", "exhaustive_debug"]
 WorkflowProtocol = Literal["default", "auto3d_entropy"]
