@@ -49,6 +49,8 @@ def run_inspection_app(run_dir: str, *, open_browser: bool = True) -> None:
         "--browser.gatherUsageStats",
         "false",
     ]
+    if not open_browser:
+        command.extend(["--server.headless", "true"])
     subprocess.run(command, env=env, check=False)
 
 

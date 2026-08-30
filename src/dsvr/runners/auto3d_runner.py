@@ -380,9 +380,18 @@ def _find_output_sdf(
     input_path: Path | None = None,
     job_name: str | None = None,
 ) -> Path | None:
-    candidates = sorted(
-        list(output_dir.glob("**/*_out.sdf")) + list(output_dir.glob("**/*_3d.sdf"))
-    )
+    candidates: list[Path] = []
+    if job_name:
+        # Prefer outputs created by this invocation: its unique job name
+        # appears in the job directory name, so a scoped search cannot pick
+        # up a stale ``*_out.sdf`` left behind by an earlier crashed run in
+        # the same persistent output_dir (e.g. the final-3D stage).
+        candidates.extend(sorted(output_dir.glob(f"*{job_name}*/**/*_out.sdf")))
+        candidates.extend(sorted(output_dir.glob(f"*{job_name}*/**/*_3d.sdf")))
+    if not candidates:
+        candidates = sorted(
+            list(output_dir.glob("**/*_out.sdf")) + list(output_dir.glob("**/*_3d.sdf"))
+        )
     if input_path is not None and job_name:
         # Auto3D creates job directories next to the input file
         # (<input_stem>_<job_name>/...), which can live outside output_dir

@@ -214,3 +214,31 @@ def test_run_auto3d_finds_output_next_to_input_file(monkeypatch, tmp_path):
         internal_tautomer_stereo_enum=False,
     )
     assert output.name == "tautomer_candidates_out.sdf"
+
+
+def test_find_output_sdf_prefers_current_job_over_stale_output(tmp_path):
+    """Regression test for PR #3 review: a stale ``*_out.sdf`` left in a
+    persistent output_dir by an earlier crashed invocation must not shadow
+    this invocation's job-scoped output, even when it sorts first."""
+
+    from dsvr.runners.auto3d_runner import _find_output_sdf
+
+    stale = tmp_path / "aaa_stale" / "stale_out.sdf"
+    stale.parent.mkdir(parents=True)
+    stale.write_text("stale\n$$$$\n", encoding="utf-8")
+    fresh = tmp_path / "zzz_input_abc123_x1" / "input_out.sdf"
+    fresh.parent.mkdir(parents=True)
+    fresh.write_text("mol block\n$$$$\n", encoding="utf-8")
+
+    assert _find_output_sdf(tmp_path, job_name="abc123_x1") == fresh
+
+
+def test_find_output_sdf_falls_back_to_unscoped_when_no_job_match(tmp_path):
+    """Legacy Auto3D writes ``<input>_out.sdf`` without a job-named
+    directory; the unscoped search must still find it."""
+
+    from dsvr.runners.auto3d_runner import _find_output_sdf
+
+    legacy = tmp_path / "input_out.sdf"
+    legacy.write_text("mol block\n$$$$\n", encoding="utf-8")
+    assert _find_output_sdf(tmp_path, job_name="nomatch") == legacy
