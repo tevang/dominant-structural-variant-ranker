@@ -17,7 +17,7 @@ from dsvr.chemistry.auto3d_stereo_policy import (
     treatment_note,
 )
 from dsvr.chemistry.identity import ExactDuplicateKey, exact_duplicate_key_with_warning
-from dsvr.chemistry.stereochemistry import _max_stereoisomers
+from dsvr.chemistry.stereochemistry import max_stereoisomers_cap
 from dsvr.config import RunConfig
 from dsvr.models import StereoRecord
 from dsvr.reporting.auto3d_diagnostics import bounded, failure_book_for
@@ -70,6 +70,7 @@ def filter_stereoisomers_with_auto3d(
     if not records:
         result = StereoEnergyFilteringResult([], [], [], [], 0, 0)
         write_stereo_energy_outputs(output_dir, result)
+        _write_stereo_dedupe_audit(output_dir / "stereo_dedupe.csv", [])
         return result
 
     # Cross-tautomer exact-duplicate guard: only one copy of each exact
@@ -142,8 +143,9 @@ def _dedupe_and_refill_stereoisomers(
     audit rows.
     """
 
-    cap = _max_stereoisomers(config)
+    cap = max_stereoisomers_cap(config)
     key_by_id: dict[str, ExactDuplicateKey] = {}
+    identity_warnings: dict[str, str] = {}
 
     def key_of(record: StereoRecord) -> ExactDuplicateKey:
         key = key_by_id.get(record.id)
@@ -152,7 +154,9 @@ def _dedupe_and_refill_stereoisomers(
             if mol is None:
                 key = ExactDuplicateKey("__unparseable__", 0, record.id)
             else:
-                key, _warning = exact_duplicate_key_with_warning(mol)
+                key, warning = exact_duplicate_key_with_warning(mol)
+                if warning:
+                    identity_warnings[record.id] = warning
             key_by_id[record.id] = key
         return key
 
@@ -176,9 +180,33 @@ def _dedupe_and_refill_stereoisomers(
         for key, group in groups.items():
             ordered = sorted(group, key=lambda record: record.id)
             kept = ordered[0]
+            duplicates = ordered[1:]
+            kept_extra_metadata: dict[str, Any] = {}
+            kept_extra_warnings: list[str] = []
+            if duplicates:
+                kept_extra_metadata["merged_from"] = [
+                    {
+                        "stereo_id": duplicate.id,
+                        "tautomer_id": duplicate.parent_id,
+                        "input_molecule_id": duplicate.input_molecule_id,
+                    }
+                    for duplicate in duplicates
+                ]
+            identity_warning = identity_warnings.get(kept.id)
+            if identity_warning:
+                kept_extra_warnings.append(identity_warning)
+            if kept_extra_metadata or kept_extra_warnings:
+                metadata = dict(kept.metadata)
+                metadata.update(kept_extra_metadata)
+                kept = kept.model_copy(
+                    update={
+                        "metadata": metadata,
+                        "warnings": [*kept.warnings, *kept_extra_warnings],
+                    }
+                )
             retained.append(kept)
             selected_keys.add(key)
-            for duplicate in ordered[1:]:
+            for duplicate in duplicates:
                 tautomers_with_eliminations.add(duplicate.parent_id or "")
                 eliminated.append((duplicate, kept.id))
                 audit_rows.append(
@@ -211,7 +239,15 @@ def _dedupe_and_refill_stereoisomers(
                 candidate_key = key_of(candidate)
                 if candidate_key in selected_keys:
                     continue
-                retained.append(_promote_stereo(candidate))
+                retained.append(
+                    _promote_stereo(
+                        candidate,
+                        [
+                            config.output_dir / "stereoisomer_filtering" / "stereo_dedupe.csv",
+                            config.output_dir / "all_stereoisomers.sdf",
+                        ],
+                    )
+                )
                 selected_keys.add(candidate_key)
                 missing -= 1
                 promoted_count += 1
@@ -256,13 +292,13 @@ def _dedupe_and_refill_stereoisomers(
     return ranked, eliminated, audit_rows
 
 
-def _promote_stereo(candidate: StereoRecord) -> StereoRecord:
+def _promote_stereo(candidate: StereoRecord, output_paths: list[Path]) -> StereoRecord:
     metadata = dict(candidate.metadata)
     metadata.pop("rejection_reason", None)
     metadata["selected"] = True
     metadata["selection_reason"] = "selected_by_stereo_dedupe_refill"
     metadata["stereo_refill"] = {"promoted_after_cross_tautomer_dedupe": True}
-    return candidate.model_copy(update={"metadata": metadata})
+    return candidate.model_copy(update={"metadata": metadata, "output_paths": output_paths})
 
 
 def _eliminated_duplicate_decision(record: StereoRecord, kept_id: str) -> StereoEnergyDecision:

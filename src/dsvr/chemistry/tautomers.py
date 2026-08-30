@@ -291,10 +291,16 @@ def _build_tautomer_records(
                 explicit_proton_count=proton_count,
                 source_software="rdkit",
                 source_python_function="dsvr.chemistry.tautomers.enumerate_tautomers",
-                output_paths=[
-                    output_dir / f"{protomer_record.id}_tautomers.sdf",
-                    output_dir / f"{protomer_record.id}_tautomers.csv",
-                ],
+                # Unused pool records are not written to the per-branch outputs;
+                # only selected records appear there.
+                output_paths=(
+                    [
+                        output_dir / f"{protomer_record.id}_tautomers.sdf",
+                        output_dir / f"{protomer_record.id}_tautomers.csv",
+                    ]
+                    if selected
+                    else []
+                ),
                 warnings=warnings,
                 metadata=metadata,
                 tautomer_index=index,

@@ -36,6 +36,8 @@ When cross-branch deduplication leaves a protomer branch with fewer selected tau
 
 Stereoisomer enumeration SHALL deduplicate within each tautomer and SHALL guard against exact duplicates across tautomers of one input molecule. If deduplication leaves a tautomer below `max_stereoisomers_per_tautomer`, the workflow SHALL enumerate additional candidates up to a bounded internal ceiling and select the first unique candidates until the cap is reached or the enumeration space is exhausted.
 
+The cross-tautomer exact-duplicate guard has no enable/disable toggle, unlike `final_3d.dedupe_final_variants`: removing exact duplicates is orthogonal to Auto3D energy filtering, so the guard applies even when `stereoisomer_filtering.enabled=false`.
+
 #### Scenario: Unique stereoisomers per tautomer up to cap
 
 - **WHEN** a tautomer's enumeration yields duplicates and additional distinct stereoisomers exist within the bounded ceiling

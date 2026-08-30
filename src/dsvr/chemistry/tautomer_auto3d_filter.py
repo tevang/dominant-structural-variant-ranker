@@ -912,12 +912,19 @@ def _records_from_ranked(
                 explicit_proton_count=_explicit_proton_count(candidate.molecule),
                 source_software=item.source,
                 source_python_function="dsvr.chemistry.tautomer_auto3d_filter.filter_tautomers_with_auto3d",
-                output_paths=[
-                    output_dir / f"{protomer.id}_tautomers.sdf",
-                    output_dir / f"{protomer.id}_tautomers.csv",
-                    output_dir / "tautomers_selected.csv",
-                    output_dir / "tautomers_rejected.csv",
-                ],
+                # Pool (=not selected) records appear on disk only in
+                # tautomers_rejected.csv; the per-branch outputs and
+                # tautomers_selected.csv contain selected records.
+                output_paths=(
+                    [
+                        output_dir / f"{protomer.id}_tautomers.sdf",
+                        output_dir / f"{protomer.id}_tautomers.csv",
+                        output_dir / "tautomers_selected.csv",
+                        output_dir / "tautomers_rejected.csv",
+                    ]
+                    if selected
+                    else [output_dir / "tautomers_rejected.csv"]
+                ),
                 warnings=[
                     "Auto3D tautomer filtering is a fast potential-energy triage step, not a solution abundance estimate.",
                     *item.warnings,

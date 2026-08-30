@@ -92,6 +92,50 @@ def test_cli_enumerate_stereo_from_tautomer_sdf(tmp_path: Path) -> None:
     assert (outdir / "enumeration" / "stereoisomers" / "stereo_report.json").exists()
 
 
+def test_cli_enumerate_stereo_report_counts_selected_only(tmp_path: Path) -> None:
+    """The CLI report must count selected candidates only, not the in-memory
+    refill pool, so it agrees with the per-tautomer SDF it just wrote."""
+
+    import json
+
+    tautomer = _tautomer("twocenters", "CC(O)C(F)Cl")  # two stereocenters -> 4 isomers
+    tautomers_sdf = tmp_path / "tautomers.sdf"
+    writer = Chem.SDWriter(str(tautomers_sdf))
+    mol = Chem.Mol(tautomer.rdkit_mol)
+    mol.SetProp("_Name", tautomer.id)
+    mol.SetProp("DSVR_TAUTOMER_ID", tautomer.id)
+    mol.SetProp("DSVR_INPUT_ID", tautomer.input_molecule_id)
+    mol.SetProp("DSVR_PARENT_PROTOMER_ID", tautomer.parent_id or "")
+    mol.SetProp("DSVR_MOLNAME", tautomer.molname)
+    writer.write(mol)
+    writer.close()
+    outdir = tmp_path / "out"
+
+    result = CliRunner().invoke(
+        app,
+        ["enumerate-stereo", str(tautomers_sdf), "--out", str(outdir), "--max-isomers", "2"],
+    )
+
+    assert result.exit_code == 0, result.output
+    report = json.loads(
+        (outdir / "enumeration" / "stereoisomers" / "stereo_report.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    sdf_records = [
+        mol
+        for mol in Chem.SDMolSupplier(
+            str(outdir / "enumeration" / "stereoisomers" / f"{tautomer.id}_stereoisomers.sdf"),
+            sanitize=True,
+            removeHs=False,
+        )
+        if mol is not None
+    ]
+    assert len(sdf_records) == 2
+    assert report["stereoisomer_count"] == len(sdf_records)
+    assert len(report["stereo_ids"]) == len(sdf_records)
+
+
 def _tautomer(molname: str, smiles: str) -> TautomerRecord:
     molecule = Chem.MolFromSmiles(smiles)
     canonical = Chem.MolToSmiles(molecule, canonical=True, isomericSmiles=False)

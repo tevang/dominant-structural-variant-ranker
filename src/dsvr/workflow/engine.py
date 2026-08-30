@@ -889,7 +889,7 @@ def _tautomer_identity_key(record: TautomerRecord) -> tuple[ExactDuplicateKey, s
     return exact_duplicate_key_with_warning(mol)
 
 
-def _promote_tautomer(candidate: TautomerRecord) -> TautomerRecord:
+def _promote_tautomer(candidate: TautomerRecord, output_paths: list[Path]) -> TautomerRecord:
     """Promote a ranked pool candidate into the selected set after dedupe."""
 
     metadata = dict(candidate.metadata)
@@ -904,7 +904,7 @@ def _promote_tautomer(candidate: TautomerRecord) -> TautomerRecord:
         metadata["selected"] = True
     metadata["selection_reason"] = "selected_by_tautomer_dedupe_refill"
     metadata["tautomer_refill"] = {"promoted_after_cross_branch_dedupe": True}
-    return candidate.model_copy(update={"metadata": metadata})
+    return candidate.model_copy(update={"metadata": metadata, "output_paths": output_paths})
 
 
 def dedupe_and_refill_tautomers(
@@ -1011,7 +1011,13 @@ def dedupe_and_refill_tautomers(
                 candidate_key = key_of(candidate)
                 if candidate_key in selected_keys:
                     continue
-                promoted = _promote_tautomer(candidate)
+                promoted = _promote_tautomer(
+                    candidate,
+                    [
+                        output_dir / "tautomer_dedupe.csv",
+                        config.output_dir / "all_tautomers.sdf",
+                    ],
+                )
                 retained.append(promoted)
                 selected_keys.add(candidate_key)
                 missing -= 1
@@ -1729,6 +1735,9 @@ def _publish_top_level_run_outputs(outdir: Path) -> None:
         outdir / "stereoisomers_rejected.csv",
         outdir / "stereo_energy_ranked.csv",
         outdir / "stereo_enantiomer_groups.csv",
+        outdir / "enumeration" / "tautomers" / "tautomer_dedupe.csv",
+        outdir / "stereoisomer_filtering" / "stereo_dedupe.csv",
+        outdir / "final_dedupe_audit.csv",
         outdir / "auto3d_protocol_seeds.sdf",
         outdir / "auto3d_protocol_seeds.csv",
         outdir / "auto3d_adaptive_plan.csv",
@@ -2866,6 +2875,7 @@ def _final_output_files(outdir: Path) -> list[Path]:
         "final_variants.csv",
         "final_variants.json",
         "final_variant_energies.csv",
+        "final_dedupe_audit.csv",
         "variant_decisions.csv",
         "protomers_all.csv",
         "protomers_selected.csv",

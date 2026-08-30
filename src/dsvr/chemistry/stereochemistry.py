@@ -27,7 +27,7 @@ def enumerate_stereoisomers(
     tautomer_record: TautomerRecord,
     config: RunConfig,
 ) -> list[StereoRecord]:
-    cap = _max_stereoisomers(config)
+    cap = max_stereoisomers_cap(config)
     max_isomers = _enumeration_ceiling(config, cap)
     options = StereoEnumerationOptions(
         tryEmbedding=(
@@ -117,7 +117,7 @@ def _records_from_stereoisomers(
         seen.add(isomeric_smiles)
         unique_stereoisomers.append(stereoisomer)
 
-    cap = _max_stereoisomers(config)
+    cap = max_stereoisomers_cap(config)
     hit_cap = len(unique_stereoisomers) >= cap and len(stereoisomers) >= cap
     limited_stereoisomers = unique_stereoisomers[:cap]
     ceiling_shortfall = (
@@ -143,7 +143,8 @@ def _records_from_stereoisomers(
             hit_cap=hit_cap,
             cap=cap,
         )
-        if ceiling_shortfall:
+        if ceiling_shortfall and index == 1:
+            # Record the shortfall once per tautomer, not on every record.
             warnings.append(
                 "bounded stereoisomer enumeration ceiling reached with "
                 f"{len(unique_stereoisomers)} unique candidates below "
@@ -191,6 +192,7 @@ def _stereo_record(
     metadata: dict,
     warnings: list[str],
     output_dir: Path,
+    on_disk: bool = True,
 ) -> StereoRecord:
     return StereoRecord(
         id=make_stereo_id(
@@ -210,10 +212,14 @@ def _stereo_record(
         explicit_proton_count=proton_count,
         source_software="rdkit",
         source_python_function="dsvr.chemistry.stereochemistry.enumerate_stereoisomers",
-        output_paths=[
-            output_dir / f"{tautomer_record.id}_stereoisomers.sdf",
-            output_dir / f"{tautomer_record.id}_stereoisomers.csv",
-        ],
+        output_paths=(
+            [
+                output_dir / f"{tautomer_record.id}_stereoisomers.sdf",
+                output_dir / f"{tautomer_record.id}_stereoisomers.csv",
+            ]
+            if on_disk
+            else []
+        ),
         warnings=warnings,
         metadata=metadata,
         stereo_index=index,
@@ -235,7 +241,7 @@ def _pool_records(
     refill pool for the cross-tautomer duplicate guard (not written to the
     per-tautomer SDF/CSV)."""
 
-    cap = _max_stereoisomers(config)
+    cap = max_stereoisomers_cap(config)
     records: list[StereoRecord] = []
     for offset, stereoisomer in enumerate(stereoisomers, start=1):
         index = stereo_index_offset + offset
@@ -267,6 +273,7 @@ def _pool_records(
                     cap=cap,
                 ),
                 output_dir=output_dir,
+                on_disk=False,
             )
         )
     return records
@@ -310,7 +317,7 @@ def _has_potential_double_bond_stereo(molecule: Chem.Mol) -> bool:
     return False
 
 
-def _max_stereoisomers(config: RunConfig) -> int:
+def max_stereoisomers_cap(config: RunConfig) -> int:
     return min(
         config.stereoisomer_filtering.max_stereoisomers_per_tautomer,
         config.enumeration.max_stereoisomers_per_tautomer,

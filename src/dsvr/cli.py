@@ -19,7 +19,7 @@ from dsvr.chemistry.tautomers import enumerate_tautomers, read_protomers_sdf
 from dsvr.config import RunConfig, SeederMethod, load_config, merge_cli_overrides
 from dsvr.io.read_inputs import InputFormat, read_molecules, validate_input_file
 from dsvr.io.write_outputs import write_final_ranked_outputs, write_json
-from dsvr.models import CrestConformerRecord, RankedVariantRecord, ThermoRecord
+from dsvr.models import CrestConformerRecord, RankedVariantRecord, StereoRecord, ThermoRecord
 from dsvr.ranking.population import (
     compute_delta_g_and_populations,
     load_rankable_records,
@@ -668,9 +668,15 @@ def enumerate_stereo_command(
         enumeration=enumeration_config,
     )
     tautomers = read_tautomers_sdf(tautomers_sdf)
-    all_records = []
+    all_records: list[StereoRecord] = []
     for tautomer in tautomers:
-        all_records.extend(enumerate_stereoisomers(tautomer, config))
+        # Only selected candidates are reported; unused refill-pool records are
+        # excluded so the counts match the per-tautomer SDF/CSV contents.
+        all_records.extend(
+            record
+            for record in enumerate_stereoisomers(tautomer, config)
+            if record.metadata.get("selected", True)
+        )
 
     report = {
         "input_path": str(tautomers_sdf),

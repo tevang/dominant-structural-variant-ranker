@@ -50,6 +50,7 @@ def generate_final_3d_variants(
     output_dir = config.output_dir / "final_3d"
     output_dir.mkdir(parents=True, exist_ok=True)
     if not stereo_records:
+        _write_final_dedupe_audit(config.output_dir / "final_dedupe_audit.csv", [])
         _write_final_outputs(config.output_dir, [], config)
         return Final3DResult(records=[], used_fallback=False, warnings=[])
 
@@ -96,7 +97,8 @@ def generate_final_3d_variants(
     # Safety net: no exact-duplicate structural variants per input molecule in
     # the final outputs, even for resumed or mixed-generation runs.
     if config.final_3d.dedupe_final_variants:
-        records, dedupe_audit_rows = _dedupe_final_variants(records)
+        records, dedupe_audit_rows, dedupe_warnings = _dedupe_final_variants(records)
+        warnings = [*warnings, *dedupe_warnings]
     else:
         dedupe_audit_rows = []
     _write_final_dedupe_audit(config.output_dir / "final_dedupe_audit.csv", dedupe_audit_rows)
@@ -518,16 +520,18 @@ def _dedupe_one_conformer_per_variant(records: list[SeedConformerRecord]) -> lis
 
 def _dedupe_final_variants(
     records: list[SeedConformerRecord],
-) -> tuple[list[SeedConformerRecord], list[dict[str, object]]]:
+) -> tuple[list[SeedConformerRecord], list[dict[str, object]], list[str]]:
     """Remove exact-duplicate final variants per input molecule.
 
     Groups records per ``(input_molecule_id, exact_duplicate_key)`` and keeps
     the lowest-energy record (``None`` energy sorts last; ties break by record
     ID), attaching ``merged_from`` provenance to the retained record. Returns
-    the deduplicated records and audit rows for ``final_dedupe_audit.csv``.
+    the deduplicated records, audit rows for ``final_dedupe_audit.csv``, and
+    any identity-standardization warnings encountered.
     """
 
     key_by_id: dict[str, ExactDuplicateKey] = {}
+    identity_warnings: list[str] = []
 
     def key_of(record: SeedConformerRecord) -> ExactDuplicateKey:
         key = key_by_id.get(record.id)
@@ -538,7 +542,9 @@ def _dedupe_final_variants(
             if mol is None:
                 key = ExactDuplicateKey("__unparseable__", 0, record.id)
             else:
-                key, _warning = exact_duplicate_key_with_warning(mol)
+                key, warning = exact_duplicate_key_with_warning(mol)
+                if warning:
+                    identity_warnings.append(f"{record.id}: {warning}")
             key_by_id[record.id] = key
         return key
 
@@ -580,7 +586,7 @@ def _dedupe_final_variants(
                     }
                 )
             retained.append(kept)
-    return retained, audit_rows
+    return retained, audit_rows, identity_warnings
 
 
 def _write_final_dedupe_audit(path: Path, rows: list[dict[str, object]]) -> None:

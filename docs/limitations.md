@@ -63,11 +63,21 @@ default 4), so a branch can remain below cap when its candidate space is
 exhausted; that shortfall is recorded rather than padded with duplicates.
 Resumed runs re-execute the tautomer-and-later stages because the deduped
 record sets change downstream input hashes; refill pools are in-memory only,
-so resume-loaded branches can dedupe but cannot refill.
+so resume-loaded branches can dedupe but cannot refill. Rank metadata is not
+persisted to the per-branch SDFs, so on a tautomers-step resume the
+representative of a duplicate group falls back to record-ID order instead of
+best-ranked provenance; the final structures still converge because any
+representative has the same identity key and the final safety net holds.
+
+Per-branch artifacts (`enumeration/tautomers/*_tautomers.sdf`,
+`enumeration/stereoisomers/*_stereoisomers.sdf`) are branch-local snapshots
+written before cross-branch deduplication; the deduplicated view lives in
+`all_tautomers.sdf`, `all_stereoisomers.sdf`, the `*_dedupe.csv` audit files,
+and downstream artifacts.
 
 ## Enumeration Bias
 
-Missing candidate states cannot be recovered by downstream ranking. If molscrub, RDKit, or Auto3D omits a relevant protomer, tautomer, stereoisomers, or conformer, DSVR can only rank the candidates it receives.
+Missing candidate states cannot be recovered by downstream ranking. If molscrub, RDKit, or Auto3D omits a relevant protomer, tautomer, stereoisomer, or conformer, DSVR can only rank the candidates it receives.
 
 ## Dependency and Version Sensitivity
 
