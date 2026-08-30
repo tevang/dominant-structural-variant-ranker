@@ -222,7 +222,7 @@ def _select_plausible_protomers(
 
     if config.protonation.keep_input_state:
         input_key = _candidate_key(mol_record.rdkit_mol)
-        for candidate, plausibility in scored:
+        for candidate, _plausibility in scored:
             if _candidate_key(candidate) == input_key and len(selected) < cap:
                 selected.append(candidate)
                 selected_keys.add(input_key)
@@ -241,7 +241,7 @@ def _select_plausible_protomers(
             current = best_by_charge.get(charge)
             if current is None or plausibility.score < current[1].score:
                 best_by_charge[charge] = (candidate, plausibility)
-        for candidate, plausibility in sorted(
+        for candidate, _plausibility in sorted(
             best_by_charge.values(), key=lambda item: (item[1].score, abs(Chem.GetFormalCharge(item[0])))
         ):
             key = _candidate_key(candidate)
@@ -255,7 +255,7 @@ def _select_plausible_protomers(
                     for mol, pl in scored
                 ]
 
-    for candidate, plausibility in sorted(scored, key=lambda item: (item[1].score, item[0].GetNumAtoms())):
+    for candidate, _plausibility in sorted(scored, key=lambda item: (item[1].score, item[0].GetNumAtoms())):
         key = _candidate_key(candidate)
         if key not in selected_keys and len(selected) < cap:
             selected.append(candidate)

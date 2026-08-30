@@ -27,6 +27,7 @@ def test_cli_commands_have_help() -> None:
         "run",
         "prepare-ligands",
         "summarize",
+        "view",
     ]
 
     root = runner.invoke(app, ["--help"])

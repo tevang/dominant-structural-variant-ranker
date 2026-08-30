@@ -67,7 +67,6 @@ def filter_stereoisomers_with_auto3d(
     rejected_ids = {decision.stereo_id for decision in decisions if not decision.selected}
     selected = [_annotated_record(record, _decision_for(record.id, decisions)) for record in records if record.id in selected_ids]
     rejected = [_annotated_record(record, _decision_for(record.id, decisions)) for record in records if record.id in rejected_ids]
-    annotated_all = selected + rejected
     selected_by_id = {record.id: record for record in selected}
     rejected_by_id = {record.id: record for record in rejected}
     all_records = [selected_by_id.get(record.id) or rejected_by_id.get(record.id) or record for record in records]

@@ -15,7 +15,6 @@ from rdkit.Chem.EnumerateStereoisomers import (
 from dsvr.config import RunConfig
 from dsvr.models import StereoRecord, TautomerRecord, make_stereo_id
 
-
 STEREO_TIMEOUT_FALLBACK = "STEREO_TIMEOUT_FALLBACK"
 
 
@@ -182,9 +181,8 @@ def _has_potential_double_bond_stereo(molecule: Chem.Mol) -> bool:
             continue
         begin = bond.GetBeginAtom()
         end = bond.GetEndAtom()
-        if begin.GetAtomicNum() == 6 and end.GetAtomicNum() == 6:
-            if begin.GetDegree() > 1 and end.GetDegree() > 1:
-                return True
+        if begin.GetAtomicNum() == 6 and end.GetAtomicNum() == 6 and begin.GetDegree() > 1 and end.GetDegree() > 1:
+            return True
     return False
 
 

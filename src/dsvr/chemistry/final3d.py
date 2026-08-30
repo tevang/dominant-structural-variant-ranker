@@ -11,6 +11,7 @@ from rdkit.Chem import AllChem, rdMolDescriptors
 from dsvr.config import RunConfig
 from dsvr.models import SeedConformerRecord, StereoRecord, make_seed_id
 from dsvr.runners.auto3d_runner import Auto3DExecutionError, Auto3DUnavailableError, run_auto3d
+from dsvr.utils.units import HARTREE_TO_KCAL_MOL as _HARTREE_TO_KCAL_MOL
 
 FINAL_3D_WARNING = (
     "Final Auto3D energies are approximate gas-phase/neural-potential conformer energies; "
@@ -473,18 +474,28 @@ def _final_properties(record: SeedConformerRecord, config: RunConfig) -> dict[st
     }
 
 
+# Preference order: absolute total energies first (needed to compare variants
+# of the same molecule), relative conformer energies last. Auto3D v3 writes
+# total electronic energy as "E_tot"/"E_tot(Hartree)" in Hartree; its
+# "E_rel(kcal/mol)" is 0.0 for the selected best-of-k conformer and carries
+# no signal for one-conformer-per-variant ranking.
+_ENERGY_PROPS: tuple[tuple[str, float], ...] = (
+    ("E_kcal_mol", 1.0),
+    ("E_tot(Hartree)", _HARTREE_TO_KCAL_MOL),
+    ("E_tot", _HARTREE_TO_KCAL_MOL),
+    ("E_tot(kcal/mol)", 1.0),
+    ("energy_kcal_mol", 1.0),
+    ("Energy", 1.0),
+    ("ENERGY", 1.0),
+    ("E_rel(kcal/mol)", 1.0),
+)
+
+
 def _extract_energy(molecule: Chem.Mol) -> tuple[float | None, str | None]:
-    for prop in (
-        "E_kcal_mol",
-        "E_rel(kcal/mol)",
-        "E_tot(kcal/mol)",
-        "energy_kcal_mol",
-        "Energy",
-        "ENERGY",
-    ):
+    for prop, factor in _ENERGY_PROPS:
         if molecule.HasProp(prop):
             try:
-                return float(molecule.GetProp(prop)), prop
+                return float(molecule.GetProp(prop)) * factor, prop
             except ValueError:
                 continue
     return None, None

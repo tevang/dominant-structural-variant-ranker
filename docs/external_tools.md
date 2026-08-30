@@ -28,8 +28,8 @@ to check whether expected Python modules and executables are available.
 | Tool | Role in DSVR | Install notes | URLs |
 | --- | --- | --- | --- |
 | RDKit | Core cheminformatics toolkit for reading, standardization hooks, tautomer enumeration, stereoisomer enumeration, and ETKDG seeding. | Prefer conda-forge: `conda install -c conda-forge rdkit`. | Docs: https://www.rdkit.org/docs/ |
-| molscrub | Practical pH/protomer/protonation candidate generation. | Upstream currently documents pip-from-GitHub style installs; keep it optional and check with `dsvr doctor`. | GitHub: https://github.com/forlilab/molscrub ; Docs: https://molscrub.readthedocs.io/ |
-| Auto3D | Optional conformer seeder or prefilter using neural-network potentials. | Install only when selected. The upstream project documents pip and conda-forge options. Disable internal tautomer/stereoisomer enumeration unless explicitly requested. | GitHub: https://github.com/isayevlab/Auto3D_pkg ; Docs: https://auto3d.readthedocs.io/ |
+| molscrub | Practical pH/protomer/protonation candidate generation. Required for the default `prepare-ligands` workflow. | Upstream currently documents pip-from-GitHub style installs; install with the `molscrub` extra and check with `dsvr doctor`. | GitHub: https://github.com/forlilab/molscrub ; Docs: https://molscrub.readthedocs.io/ |
+| Auto3D | Neural-network-potential conformer generation and energy triage. Required for the default `prepare-ligands` workflow (tautomer energy triage and final 3D conformer generation). Optional as a seeding method when `seeding.method` is `auto3d` or `both`. | Install with the `auto3d` extra. The upstream project documents pip and conda-forge options. Disable internal tautomer/stereoisomer enumeration unless explicitly requested. | GitHub: https://github.com/isayevlab/Auto3D_pkg ; Docs: https://auto3d.readthedocs.io/ |
 | AIMNet / aimnetcentral | Neural-network potential ecosystem relevant to Auto3D engines. | Usually pulled through the selected Auto3D configuration or installed as required by Auto3D. | GitHub: https://github.com/isayevlab/aimnetcentral |
 | xTB | Semiempirical quantum engine for optimization, thermo, solvation, and CREST-backed workflows. | Prefer conda-forge where available, or official upstream binaries/source builds. Ensure `xtb` is on `PATH`. | GitHub: https://github.com/grimme-lab/xtb ; Docs: https://xtb-docs.readthedocs.io/en/latest/ |
 | CREST | Opt-in conformer search and ensemble validation. | Prefer conda-forge or official releases. Ensure `crest` is on `PATH`; CREST workflows often require xTB availability. | GitHub: https://github.com/crest-lab/crest ; Docs: https://crest-lab.github.io/crest-docs/ |
@@ -77,8 +77,11 @@ tool.
 
 Examples:
 
-- A fast RDKit-only smoke workflow should not require Auto3D, xTB, CREST, CENSO,
-  Psi4, or PySCF.
+- An RDKit-only `--dry-run` or CI-safe smoke workflow should not require Auto3D,
+  molscrub, xTB, CREST, CENSO, Psi4, or PySCF.
+- The default `prepare-ligands` workflow requires molscrub (protomer
+  generation) and Auto3D (tautomer energy triage and final 3D conformer
+  generation).
 - A physics-heavy workflow must require xTB and CREST.
 - A CENSO refinement workflow must require CENSO plus its configured backend
   requirements.

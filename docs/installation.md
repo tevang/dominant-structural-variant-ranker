@@ -15,6 +15,33 @@ dsvr doctor
 
 This minimal environment supports input parsing, RDKit enumeration, ETKDG seeding, dry runs, reports, and CI-safe smoke tests. External physics steps require additional tools.
 
+## Default `prepare-ligands` Workflow
+
+The default `prepare-ligands` (LigPrep-like) workflow uses molscrub for pH/protomer
+generation, Auto3D for tautomer energy triage, and Auto3D for final 3D conformer
+generation. Both are required for any non-dry-run `prepare-ligands` invocation.
+
+With `uv` (recommended):
+
+```bash
+uv sync --extra dev --extra auto3d --extra molscrub
+source .venv/bin/activate
+dsvr doctor
+```
+
+With conda/pip:
+
+```bash
+conda activate dsvr
+python -m pip install -e ".[dev]"
+python -m pip install Auto3D
+python -m pip install git+https://github.com/forlilab/molscrub.git
+dsvr doctor
+```
+
+For RDKit-only `--dry-run` checks or CI-safe smoke tests, the `auto3d` and
+`molscrub` extras are not required.
+
 ## Bootstrap Helpers
 
 The helper scripts create or update an environment named `dsvr`, install the package editable, and run `dsvr doctor`.
@@ -99,7 +126,16 @@ Use workflow configuration to avoid CPU oversubscription. For example, set `cres
 
 Auto3D can use ML models such as AIMNet2. GPU support depends on the Auto3D/PyTorch/AIMNet installation and the local CUDA driver stack. Install GPU-enabled dependencies according to Auto3D and PyTorch guidance for your machine. CPU-only Auto3D may work but can be slower.
 
-DSVR uses Auto3D only as an optional seeding/prefiltering layer unless explicitly configured otherwise.
+Auto3D is required for the default `prepare-ligands` workflow: it performs
+tautomer energy triage (`--tauto-k`, `--tauto-window`) and final 3D conformer
+generation. It is only optional for RDKit-only `--dry-run` checks and CI-safe
+smoke tests. Install it with the `auto3d` extra:
+
+```bash
+uv sync --extra auto3d
+# or
+python -m pip install Auto3D
+```
 
 ## molscrub
 

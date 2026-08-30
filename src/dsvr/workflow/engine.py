@@ -18,8 +18,8 @@ from dsvr.chemistry.conformers_auto3d import (
 from dsvr.chemistry.conformers_rdkit import generate_rdkit_seeds, read_stereo_sdf
 from dsvr.chemistry.final3d import generate_final_3d_variants
 from dsvr.chemistry.protonation import generate_protomer_candidates
-from dsvr.chemistry.stereochemistry import enumerate_stereoisomers, read_tautomers_sdf
 from dsvr.chemistry.stereo_auto3d_filter import filter_stereoisomers_with_auto3d
+from dsvr.chemistry.stereochemistry import enumerate_stereoisomers, read_tautomers_sdf
 from dsvr.chemistry.tautomer_auto3d_filter import filter_tautomers_with_auto3d
 from dsvr.chemistry.tautomers import enumerate_tautomers, read_protomers_sdf
 from dsvr.config import RunConfig, write_resolved_config
@@ -44,12 +44,13 @@ from dsvr.filtering.xtb_prefilter import (
     apply_xtb_prefilter,
     write_xtb_prefilter_outputs,
 )
-from dsvr.io.read_inputs import read_molecules
+from dsvr.io.read_inputs import validate_input_file
 from dsvr.io.write_outputs import write_final_ranked_outputs, write_json, write_ranked_csv
 from dsvr.models import (
     AnyLineageRecord,
     CrestConformerRecord,
     MoleculeInput,
+    MoleculeRecord,
     ProtomerRecord,
     RankedVariantRecord,
     SeedConformerRecord,
@@ -124,7 +125,7 @@ def run_workflow(config: RunConfig) -> WorkflowResult:
         )
     input_hash = file_hash(config.input_path)
 
-    molecules = read_molecules(
+    molecules, invalid_records = validate_input_file(
         config.input_path,
         input_format=config.input_format,
         invalid_output_path=outdir / "invalid_inputs.csv",
@@ -132,12 +133,15 @@ def run_workflow(config: RunConfig) -> WorkflowResult:
     progress.record(
         "Input validation",
         "completed",
-        generated_count=len(molecules),
+        generated_count=len(molecules) + len(invalid_records),
         accepted_count=len(molecules),
+        rejected_count=len(invalid_records),
     )
-    _ensure_invalid_inputs_csv(outdir / "invalid_inputs.csv")
+    for invalid in invalid_records:
+        progress.warning("Input validation", _input_rejection_message(invalid))
     _write_input_table(outdir / "input" / "inputs.csv", molecules)
     for molecule in molecules:
+        records.append(_input_molecule_record(molecule, config))
         recovery.molecule(
             item_id=molecule.input_id,
             item_name=molecule.molname,
@@ -2422,10 +2426,37 @@ def _write_input_table(path: Path, molecules: list[MoleculeInput]) -> None:
             )
 
 
-def _ensure_invalid_inputs_csv(path: Path) -> None:
-    if path.exists():
-        return
-    path.write_text("record_index,raw_record,error\n", encoding="utf-8")
+def _input_rejection_message(record: dict[str, str]) -> str:
+    raw = " ".join(str(record.get("raw_record", "")).split())[:160]
+    label = record.get("name") or record.get("input_id") or "unknown"
+    detail = f" [{raw}]" if raw else ""
+    return f"Rejected input {label}: {record.get('error', 'invalid input')}{detail}"
+
+
+def _input_molecule_record(molecule: MoleculeInput, config: RunConfig) -> MoleculeRecord:
+    mol = Chem.Mol(molecule.rdkit_mol)
+    metadata: dict[str, Any] = {
+        "source_path": str(config.input_path),
+        "source_format": molecule.source_format,
+    }
+    for key in ("line_number", "original_name", "input_hash"):
+        value = molecule.input_properties.get(key)
+        if value:
+            metadata[key] = value
+    return MoleculeRecord(
+        id=molecule.input_id,
+        parent_id=None,
+        input_molecule_id=molecule.input_id,
+        molname=molecule.molname,
+        canonical_smiles=molecule.canonical_smiles,
+        isomeric_smiles=molecule.isomeric_smiles,
+        molecular_formula=rdMolDescriptors.CalcMolFormula(mol),
+        formal_charge=Chem.GetFormalCharge(mol),
+        explicit_proton_count=_explicit_proton_count(mol),
+        source_software="rdkit",
+        source_python_function="dsvr.io.read_inputs.validate_input_file",
+        metadata=metadata,
+    )
 
 
 def _write_stage_summary_sdf(path: Path, records: list[AnyLineageRecord]) -> None:

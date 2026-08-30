@@ -2,12 +2,13 @@ import json
 from pathlib import Path
 
 import pandas as pd
+import pytest
 from rdkit import Chem
 
 from dsvr.config import RunConfig
 from dsvr.io.write_outputs import RANKED_VARIANT_COLUMNS, SDF_RANKED_PROPERTIES
-from dsvr.reporting.audit import VARIANT_DECISION_COLUMNS
 from dsvr.models import CrestConformerRecord
+from dsvr.reporting.audit import VARIANT_DECISION_COLUMNS
 from dsvr.workflow.engine import run_workflow
 
 
@@ -73,6 +74,42 @@ def test_report_generated_even_with_invalid_input_records(tmp_path: Path) -> Non
 
     assert (outdir / "invalid_inputs.csv").exists()
     assert (outdir / "report.md").exists()
+    report_text_pre = (outdir / "report.md").read_text(encoding="utf-8")
+    assert "- Molecules read: 1" in report_text_pre
+    assert "- Molecules failed: 1" in report_text_pre
+
+    stage_summary = pd.read_csv(outdir / "stage_summary.csv")
+    input_row = stage_summary.loc[stage_summary["stage"] == "Input validation"].iloc[0]
+    assert input_row["accepted_count"] == 1
+    assert input_row["rejected_count"] == 1
+    assert input_row["generated_count"] == 2
+
+    warnings = [
+        json.loads(line)
+        for line in (outdir / "warnings.jsonl").read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+    rejections = [
+        item
+        for item in warnings
+        if item["level"] == "warning" and item["stage"] == "Input validation"
+    ]
+    assert len(rejections) == 1
+    assert "\n" not in rejections[0]["message"]
+    assert "not_a_smiles" in rejections[0]["message"]
+
+    invalid_frame = pd.read_csv(outdir / "invalid_inputs.csv")
+    assert list(invalid_frame.columns) == [
+        "input_id", "source_format", "line_number", "name", "smiles", "raw_record", "error",
+    ]
+    assert len(invalid_frame) == 1
+    assert invalid_frame.iloc[0]["smiles"] == "not_a_smiles"
+    assert invalid_frame.iloc[0]["name"] == "bad"
+
+    inputs_frame = pd.read_csv(outdir / "inputs.csv")
+    assert len(inputs_frame) == 1
+    assert inputs_frame.iloc[0]["molname"] == "ethanol"
+    assert inputs_frame.iloc[0]["input_molecule_id"] == "mol_000001"
     report = (outdir / "report.md").read_text(encoding="utf-8")
     assert "Run Settings" in report
     assert "Tool Versions" in report
@@ -83,6 +120,56 @@ def test_report_generated_even_with_invalid_input_records(tmp_path: Path) -> Non
     assert "Ranking uses approximate final Auto3D conformer energies" in report
     assert "Population scope is 'same_formula'" in report
     assert "micro-pKa/proton chemical-potential corrections" in report
+
+
+
+def test_clean_run_overwrites_stale_invalid_inputs_with_fresh_header(tmp_path: Path) -> None:
+    input_path = tmp_path / "mols.smi"
+    input_path.write_text("CCO ethanol\nCCN ethylamine\n", encoding="utf-8")
+    outdir = tmp_path / "run"
+    outdir.mkdir()
+    (outdir / "invalid_inputs.csv").write_text(
+        "record_index,raw_record,error\n0,stale,boom\n", encoding="utf-8"
+    )
+
+    run_workflow(
+        RunConfig(
+            input_path=input_path,
+            output_dir=outdir,
+            overwrite=True,
+            protonation={"enabled": False},
+            tautomer_filtering={"enabled": False},
+            stereoisomer_filtering={"enabled": False},
+            enumeration={
+                "max_protomers_per_molecule": 1,
+                "max_tautomers_per_protomer": 1,
+                "max_stereoisomers_per_tautomer": 1,
+            },
+            seeding={"rdkit_num_conformers": 1},
+            crest={"enabled": False},
+            thermo={"enabled": False, "xtb_hessian": False, "xtb_thermo": False},
+        )
+    )
+
+    invalid_text = (outdir / "invalid_inputs.csv").read_text(encoding="utf-8")
+    assert "stale" not in invalid_text
+    assert invalid_text == (
+        "input_id,source_format,line_number,name,smiles,raw_record,error\n"
+    )
+
+    stage_summary = pd.read_csv(outdir / "stage_summary.csv")
+    input_row = stage_summary.loc[stage_summary["stage"] == "Input validation"].iloc[0]
+    assert input_row["accepted_count"] == 2
+    assert input_row["rejected_count"] == 0
+
+    warnings_text = (outdir / "warnings.jsonl").read_text(encoding="utf-8")
+    assert "Rejected input" not in warnings_text
+
+    inputs_frame = pd.read_csv(outdir / "inputs.csv")
+    assert len(inputs_frame) == 2
+    report = (outdir / "report.md").read_text(encoding="utf-8")
+    assert "- Molecules read: 2" in report
+    assert "- Molecules failed: 0" in report
 
 
 
@@ -287,3 +374,31 @@ def test_optional_crest_validation_writes_separate_outputs(tmp_path: Path, monke
     assert manifest["optional_validation"]["selected_count"] == 1
     assert manifest["optional_validation"]["ranking_overwritten"] is False
     assert (outdir / "ranked_variants.csv").exists()
+
+
+def test_extract_energy_prefers_total_energy_and_converts_hartree():
+    """Regression test: Auto3D v3 writes absolute energy as E_tot/E_tot(Hartree)
+    in Hartree, while E_rel(kcal/mol) is 0.0 for the selected best-of-k
+    conformer. The extractor must return the converted absolute energy so
+    variant ranking keeps discrimination."""
+    from rdkit import Chem
+
+    from dsvr.chemistry.final3d import _HARTREE_TO_KCAL_MOL, _extract_energy
+
+    mol = Chem.MolFromSmiles("CCO")
+    mol.SetProp("E_rel(kcal/mol)", "0.0")
+    mol.SetProp("E_tot(Hartree)", "-1360.1065899630466")
+
+    energy, prop = _extract_energy(mol)
+    assert prop == "E_tot(Hartree)"
+    assert energy == pytest.approx(-1360.1065899630466 * _HARTREE_TO_KCAL_MOL)
+
+    mol2 = Chem.MolFromSmiles("CCO")
+    mol2.SetProp("E_tot(kcal/mol)", "-42.5")
+    energy2, prop2 = _extract_energy(mol2)
+    assert prop2 == "E_tot(kcal/mol)"
+    assert energy2 == pytest.approx(-42.5)
+
+    mol3 = Chem.MolFromSmiles("CCO")
+    energy3, prop3 = _extract_energy(mol3)
+    assert (energy3, prop3) == (None, None)

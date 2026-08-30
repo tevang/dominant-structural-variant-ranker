@@ -15,6 +15,7 @@ from rdkit.Chem.MolStandardize import rdMolStandardize
 from dsvr.config import RunConfig
 from dsvr.models import ProtomerRecord, TautomerRecord, make_tautomer_id
 from dsvr.runners.auto3d_runner import Auto3DExecutionError, Auto3DUnavailableError, run_auto3d
+from dsvr.utils.units import HARTREE_TO_KCAL_MOL
 
 
 class Auto3DTautomerFilteringError(RuntimeError):
@@ -569,6 +570,22 @@ def _energy_from_mol(molecule: Chem.Mol) -> float | None:
                 return float(molecule.GetProp(key))
             except ValueError:
                 continue
+    # Auto3D v3 writes the absolute total electronic energy as
+    # "E_tot"/"E_tot(Hartree)" in Hartree. Tautomers must be compared by
+    # absolute energy: "E_rel(kcal/mol)" is relative to each molecule's own
+    # best conformer and is ~0 for the selected one, so it carries almost no
+    # signal for ranking tautomers against each other.
+    for key in ("E_tot(Hartree)", "E_tot"):
+        if molecule.HasProp(key):
+            try:
+                return float(molecule.GetProp(key)) * HARTREE_TO_KCAL_MOL
+            except ValueError:
+                continue
+    if molecule.HasProp("E_rel(kcal/mol)"):
+        try:
+            return float(molecule.GetProp("E_rel(kcal/mol)"))
+        except ValueError:
+            pass
     return None
 
 

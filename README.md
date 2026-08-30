@@ -73,12 +73,19 @@ CREST/xTB, xTB thermo, CREST entropy estimates, CENSO, and Psi4/PySCF rescoring 
 
 ## Quick Start
 
+The default `prepare-ligands` workflow requires RDKit, molscrub (protomer
+generation), and Auto3D (tautomer energy triage and final 3D conformer
+generation). Install all three together:
+
 ```bash
-uv sync --extra dev
+uv sync --extra dev --extra auto3d --extra molscrub
 source .venv/bin/activate
 dsvr doctor
 dsvr prepare-ligands examples/test_molecules_minimal.smi --config configs/ligprep_like_default.yaml --out runs/smoke
 ```
+
+For an RDKit-only dry run or CI-safe smoke check that does not need Auto3D or
+molscrub, use `--dry-run` or the minimal install below.
 
 For direct source-tree smoke checks:
 
@@ -94,10 +101,12 @@ PYTHONPATH=src python -m pytest
 - Install external binaries via official binaries or user-managed modules.
 - Use `dsvr doctor` to verify the environment before running optional physics-heavy workflows.
 
-Optional Python tools:
+The `auto3d` and `molscrub` extras are required for the default
+`prepare-ligands` workflow. They are only optional for RDKit-only dry runs,
+`dsvr inspect`, and CI-safe smoke tests:
 
 ```bash
-uv sync --extra auto3d --extra molscrub
+uv sync --extra dev --extra auto3d --extra molscrub
 ```
 
 ## CLI

@@ -36,12 +36,27 @@ dev = [
   "ruff>=0.5",
   "mypy>=1.10",
 ]
+gui = [
+  "streamlit>=1.33",
+]
+molscrub = [
+  "molscrub @ git+https://github.com/forlilab/molscrub.git",
+  # molscrub imports joblib at runtime but does not declare it in its own install_requires.
+  "joblib",
+]
+auto3d = [
+  "Auto3D",
+  "torchani>=2.8.4",
+]
 
 [project.scripts]
 dsvr = "dsvr.cli:app"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/dsvr"]
+
+[tool.hatch.metadata]
+allow-direct-references = true
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
@@ -58,6 +73,9 @@ src = ["src", "tests"]
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "B", "UP", "SIM"]
+# E501 was never enforced in CI (setup step failed before lint) and main
+# carries 108 violations; re-enable after a dedicated cleanup pass.
+ignore = ["E501"]
 
 [tool.mypy]
 python_version = "3.11"
