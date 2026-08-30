@@ -2,13 +2,54 @@ from __future__ import annotations
 
 import importlib.metadata
 import importlib.util
+import logging
+import re
 import shutil
+import subprocess
 import sys
 import uuid
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 
-from dsvr.runners.subprocess_utils import run_command
+from rdkit import Chem
+
+from dsvr.runners.subprocess_utils import ExternalToolError, run_command
+
+_LOGGER = logging.getLogger("dsvr.auto3d")
+
+# Error classes shared by stage-level failure bookkeeping (auto3d-failure-reporting).
+CLASS_ENGINE_INCOMPATIBLE = "ENGINE_INCOMPATIBLE"
+CLASS_INFRA_MULTIPROCESSING = "INFRA_MULTIPROCESSING"
+CLASS_CUDA_UNAVAILABLE = "CUDA_UNAVAILABLE"
+CLASS_TIMEOUT = "TIMEOUT"
+CLASS_EXECUTION = "EXECUTION_ERROR"
+
+def classify_auto3d_failure(text: str) -> str:
+    """Classify an Auto3D failure text into a stable error class."""
+
+    folded = text.casefold()
+    if any(
+        f"only {engine.casefold()} can handle" in folded
+        for engine in ("AIMNET", "AIMNet2", "ANI2x", "ANI2xt")
+    ):
+        # Auto3D validation message, e.g. "Only AIMNET can handle: [...]"
+        return CLASS_ENGINE_INCOMPATIBLE
+    if "SemLock" in text and "fork context" in text:
+        return CLASS_INFRA_MULTIPROCESSING
+    cuda_signatures = (
+        "no CUDA-capable device",
+        "CUDA initialization",
+        "CUDA driver",
+        "Found no NVIDIA driver",
+        "cuInit",
+    )
+    if any(signature in text for signature in cuda_signatures):
+        return CLASS_CUDA_UNAVAILABLE
+    if "timed out after" in text:
+        return CLASS_TIMEOUT
+    return CLASS_EXECUTION
 
 
 class Auto3DUnavailableError(RuntimeError):
@@ -26,6 +67,31 @@ class _Auto3DCachePaths:
     aimnet_cache_dir: Path
 
 
+def output_line_id(molecule: Chem.Mol, prop_keys: tuple[str, ...]) -> str | None:
+    """Recover the Auto3D input line id from an output molecule.
+
+    Auto3D v3 restores ``_Name`` to the exact input line id while ``ID``
+    gains conformer suffixes (``lineid_0_0``) — so ``_Name`` and the DSVR
+    props win, and ``ID`` is only a suffix-stripped fallback.
+    """
+
+    for key in prop_keys:
+        if molecule.HasProp(key):
+            value = molecule.GetProp(key).strip()
+            token = value.split()[0] if value else ""
+            if token:
+                return token
+    if molecule.HasProp("ID"):
+        token = molecule.GetProp("ID").strip().split()[0]
+        while True:
+            stripped = re.sub(r"_\d+$", "", token)
+            if stripped == token:
+                break
+            token = stripped
+        return token or None
+    return None
+
+
 def inspect_auto3d() -> dict[str, str | bool | None]:
     return {
         "python_api_available": importlib.util.find_spec("Auto3D") is not None,
@@ -33,6 +99,93 @@ def inspect_auto3d() -> dict[str, str | bool | None]:
         "auto3D_executable": shutil.which("auto3D"),
         "Auto3D_executable": shutil.which("Auto3D"),
     }
+
+
+# --------------------------------------------------------------------------
+# Engine capability awareness
+#
+# Static engine→capability table derived from Auto3D's own validation:
+# ANI2x/ANI2xt handle neutral, closed-shell molecules over their training
+# elements; AIMNET/AIMNet2 accept a broader main-group set plus charged and
+# open-shell species ("Only AIMNET can handle" otherwise). The table can be
+# overridden via ``config.auto3d.engine_element_overrides`` if Auto3D's real
+# validation drifts from it.
+# --------------------------------------------------------------------------
+
+_AUTO3D_ENGINE_ELEMENTS: dict[str, frozenset[str]] = {
+    "ANI2x": frozenset({"H", "C", "N", "O", "F", "S", "Cl"}),
+    "ANI2xt": frozenset({"H", "C", "N", "O", "F", "S", "Cl"}),
+    "AIMNET": frozenset({"H", "B", "C", "N", "O", "F", "Si", "P", "S", "Cl", "As", "Se", "Br", "I"}),
+    "AIMNet2": frozenset({"H", "B", "C", "N", "O", "F", "Si", "P", "S", "Cl", "As", "Se", "Br", "I"}),
+}
+
+_ENGINES_ALLOWING_NONNEUTRAL: frozenset[str] = frozenset({"AIMNET", "AIMNet2", "auto"})
+
+
+def engine_supports_molecule(
+    engine: str,
+    mol: Chem.Mol,
+    *,
+    element_overrides: dict[str, list[str]] | None = None,
+) -> bool:
+    """Return True when ``engine`` can handle ``mol``'s composition.
+
+    Unknown engines are assumed capable (Auto3D's own validation remains the
+    fallback arbiter). ``auto`` routes internally inside Auto3D.
+    """
+
+    if engine == "auto":
+        return True
+    allowed: frozenset[str] | None
+    if element_overrides and engine in element_overrides:
+        allowed = frozenset(element_overrides[engine])
+    else:
+        allowed = _AUTO3D_ENGINE_ELEMENTS.get(engine)
+    if allowed is None:
+        return True
+    symbols = {atom.GetSymbol() for atom in mol.GetAtoms()}
+    if not symbols <= allowed:
+        return False
+    if engine not in _ENGINES_ALLOWING_NONNEUTRAL:
+        if Chem.GetFormalCharge(mol) != 0:
+            return False
+        if any(atom.GetNumRadicalElectrons() > 0 for atom in mol.GetAtoms()):
+            return False
+    return True
+
+
+def partition_by_engine(
+    items: list[tuple[Any, Chem.Mol]],
+    engines: list[str],
+    *,
+    element_overrides: dict[str, list[str]] | None = None,
+) -> tuple[dict[str, list[Any]], list[Any]]:
+    """Route every item to the first configured engine that supports its molecule.
+
+    ``items`` are ``(payload, mol)`` pairs (payload is typically a record id).
+    ``engines`` is the ordered preference list. Returns ``(assignments,
+    incompatible)``: assignments maps each engine to its payloads in input
+    order; incompatible lists payloads no configured engine supports — those
+    must go straight to the recorded RDKit fallback instead of being offered
+    to Auto3D repeatedly.
+    """
+
+    assignments: dict[str, list[Any]] = {}
+    incompatible: list[Any] = []
+    for payload, mol in items:
+        engine = next(
+            (
+                candidate
+                for candidate in engines
+                if engine_supports_molecule(candidate, mol, element_overrides=element_overrides)
+            ),
+            None,
+        )
+        if engine is None:
+            incompatible.append(payload)
+        else:
+            assignments.setdefault(engine, []).append(payload)
+    return assignments, incompatible
 
 
 def run_auto3d(
@@ -53,6 +206,7 @@ def run_auto3d(
     use_gpu: bool = False,
     stream_output: bool = False,
     timeout_s: int | None = None,
+    isomer_enum_only: bool = False,
 ) -> tuple[Path, list[str]]:
     executable = _find_executable()
     python_api_available = importlib.util.find_spec("Auto3D") is not None
@@ -90,6 +244,7 @@ def run_auto3d(
         k=k,
         model=model,
         internal_tautomer_stereo_enum=internal_tautomer_stereo_enum,
+        isomer_enum_only=isomer_enum_only,
         mpi_np=mpi_np,
         cpu_workers=cpu_workers,
         memory_gb=memory_gb,
@@ -100,21 +255,32 @@ def run_auto3d(
         opt_steps=opt_steps,
         use_gpu=use_gpu,
     ):
-        completed = run_command(
-            command,
-            cwd=output_dir,
-            timeout_s=timeout_s,
-            log_dir=output_dir / "logs",
-            command_name="auto3d",
-            env=_auto3d_env(
-                cache_paths,
-                mpi_np=mpi_np,
-                cpu_workers=cpu_workers,
-                use_gpu=use_gpu,
-            ),
-            stream_output=stream_output,
-            check=False,
-        )
+        try:
+            completed = run_command(
+                command,
+                cwd=output_dir,
+                timeout_s=timeout_s,
+                log_dir=output_dir / "logs",
+                command_name="auto3d",
+                env=_auto3d_env(
+                    cache_paths,
+                    mpi_np=mpi_np,
+                    cpu_workers=cpu_workers,
+                    use_gpu=use_gpu,
+                ),
+                stream_output=stream_output,
+                check=False,
+            )
+        except ExternalToolError as exc:
+            if not (exc.metadata or {}).get("timed_out"):
+                raise
+            # A timeout is a property of the workload and the limit, not of
+            # the command form — retrying every command candidate would burn
+            # the same limit again. Fail the invocation once; the caller's
+            # smaller-batch retry path decides what to do next.
+            raise Auto3DExecutionError(
+                f"Auto3D timed out after {timeout_s} s: {' '.join(command)}"
+            ) from exc
         if completed.returncode != 0:
             guessed = _find_output_sdf(
                 output_dir, input_path=input_path, job_name=job_name_base
@@ -164,6 +330,12 @@ def _completed_output_tail(
 def _is_terminal_auto3d_selection_failure(text: str) -> bool:
     """Return True when retrying a legacy Auto3D invocation is unlikely to help."""
 
+    # Engine-incompatibility validation ("Only AIMNET can handle: ...") and
+    # CUDA-absence errors cannot disappear across command forms; the caller
+    # must switch engine or mode instead of retrying.
+    error_class = classify_auto3d_failure(text)
+    if error_class in {CLASS_ENGINE_INCOMPATIBLE, CLASS_CUDA_UNAVAILABLE}:
+        return True
     if "Dropped(Oscillating)" in text and "Converged: 0" in text:
         return True
     return "reorder_sdf" in text and "Invalid input file" in text and "_out.sdf" in text
@@ -188,6 +360,7 @@ def _command_candidates(
     k: int,
     model: str,
     internal_tautomer_stereo_enum: bool,
+    isomer_enum_only: bool,
     mpi_np: int | None,
     cpu_workers: int | None,
     memory_gb: int | None,
@@ -224,7 +397,11 @@ def _command_candidates(
             "--isomer-engine",
             "rdkit",
         ]
-        if internal_tautomer_stereo_enum:
+        if isomer_enum_only:
+            # Isomer enumeration without tautomer re-enumeration: used by the
+            # auto3d_enumerate stereo policy for unspecified-stereo sub-batches.
+            v3.extend(["--no-enumerate-tautomer", "--enumerate-isomer"])
+        elif internal_tautomer_stereo_enum:
             v3.extend(["--enumerate-tautomer", "--enumerate-isomer"])
         else:
             v3.extend(["--no-enumerate-tautomer", "--no-enumerate-isomer"])
@@ -247,14 +424,12 @@ def _command_candidates(
             "--tauto_engine",
             "rdkit",
             "--enumerate_tautomer",
-            "True" if internal_tautomer_stereo_enum else "False",
+            "False" if isomer_enum_only else ("True" if internal_tautomer_stereo_enum else "False"),
             "--enumerate_isomer",
-            "True" if internal_tautomer_stereo_enum else "False",
+            "True" if (internal_tautomer_stereo_enum or isomer_enum_only) else "False",
         ]
         if mpi_np is not None:
             wrapper.extend(["--mpi_np", str(mpi_np)])
-        if cpu_workers is not None and cpu_workers > 1:
-            wrapper.extend(["--gpu_idx", "0"])
         if memory_gb is not None:
             wrapper.extend(["--memory", str(memory_gb)])
         if capacity is not None:
@@ -286,9 +461,9 @@ def _command_candidates(
                     "--job_name",
                     f"{job_name_base}_legacy2",
                     "--enumerate_tautomer",
-                    "True" if internal_tautomer_stereo_enum else "False",
+                    "False" if isomer_enum_only else ("True" if internal_tautomer_stereo_enum else "False"),
                     "--enumerate_isomer",
-                    "True" if internal_tautomer_stereo_enum else "False",
+                    "True" if (internal_tautomer_stereo_enum or isomer_enum_only) else "False",
                     "--optimizing_engine",
                     model,
                     "--isomer_engine",
@@ -305,8 +480,6 @@ def _command_candidates(
                 continue
             if mpi_np is not None:
                 command.extend(["--mpi_np", str(mpi_np)])
-            if cpu_workers is not None and cpu_workers > 1:
-                command.extend(["--gpu_idx", "0"])
             if memory_gb is not None:
                 command.extend(["--memory", str(memory_gb)])
             if capacity is not None:
@@ -342,7 +515,14 @@ def _auto3d_env(
     cpu_workers: int | None,
     use_gpu: bool,
 ) -> dict[str, str]:
-    """Environment overrides to keep Auto3D/AIMNET/Warp caches repo-local."""
+    """Environment overrides to keep Auto3D/AIMNET/Warp caches repo-local.
+
+    CPU mode hides CUDA devices (``CUDA_VISIBLE_DEVICES=""``). Warp may still
+    emit a one-line CUDA-related notice at import even with devices hidden —
+    recent Warp versions treat an empty device list as a clean CPU fallback,
+    so the residual line is informational and not an initialization error.
+    No GPU-related command-line flags are passed in CPU mode.
+    """
 
     env: dict[str, str] = {
         "XDG_CACHE_HOME": str(cache_paths.xdg_cache_home),
@@ -438,10 +618,96 @@ def _auto3d_cache_paths() -> _Auto3DCachePaths:
     return paths
 
 
+_AUTO3D_WARNING_OBSERVERS: list[Callable[[str], None]] = []
+_GPU_PROBE_CACHE: dict[str, bool] = {}
+_EMITTED_ONCE_KEYS: set[str] = set()
+
+
+def register_auto3d_warning_observer(observer: Callable[[str], None]) -> None:
+    """Register a sink receiving one-time Auto3D environment notices.
+
+    The workflow engine registers ``ProgressRecorder.warning`` here so that
+    environment degradations (e.g. GPU unusable) land in ``warnings.jsonl``
+    exactly once per run instead of once per molecule.
+    """
+
+    _AUTO3D_WARNING_OBSERVERS.append(observer)
+
+
+def _emit_auto3d_notice_once(key: str, message: str) -> None:
+    if key in _EMITTED_ONCE_KEYS:
+        return
+    _EMITTED_ONCE_KEYS.add(key)
+    _LOGGER.warning(message)
+    for observer in _AUTO3D_WARNING_OBSERVERS:
+        observer(message)
+
+
 def _should_use_gpu(requested: bool) -> bool:
     if not requested:
         return False
-    return Path("/dev/nvidia0").exists() or Path("/dev/nvidiactl").exists()
+    if _probe_gpu_usable():
+        return True
+    _emit_auto3d_notice_once(
+        "gpu-unusable",
+        "Auto3D GPU use was requested, but the runtime GPU probe failed "
+        f"({_GPU_PROBE_CACHE.get('reason', 'no usable CUDA device')}); "
+        "degrading to CPU mode for all Auto3D stages of this run.",
+    )
+    return False
+
+
+def _probe_gpu_usable() -> bool:
+    """Runtime GPU usability verdict, cached per process (one probe per run).
+
+    Replaces the previous ``/dev/nvidia*`` device-node check: device nodes
+    can be present while the driver/userspace stack is broken, so usability
+    is verified by actually initializing CUDA in a probe subprocess.
+    """
+
+    if "verdict" in _GPU_PROBE_CACHE:
+        return _GPU_PROBE_CACHE["verdict"]
+
+    verdict = False
+    reason = "no usable CUDA device"
+    smi = shutil.which("nvidia-smi")
+    smi_ok = False
+    if smi is not None:
+        try:
+            smi_ok = (
+                subprocess.run(
+                    [smi],
+                    check=False,
+                    capture_output=True,
+                    timeout=30,
+                ).returncode
+                == 0
+            )
+        except (OSError, subprocess.TimeoutExpired):
+            smi_ok = False
+    if smi is None or not smi_ok:
+        reason = "nvidia-smi missing or failed; driver stack unusable"
+    else:
+        try:
+            probe = subprocess.run(
+                [
+                    sys.executable,
+                    "-c",
+                    "import sys, torch; sys.exit(0 if torch.cuda.is_available() else 3)",
+                ],
+                check=False,
+                capture_output=True,
+                timeout=180,
+            )
+            verdict = probe.returncode == 0
+            if not verdict:
+                reason = "torch.cuda.is_available() is False in the Auto3D interpreter"
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            reason = f"CUDA probe subprocess failed: {exc}"
+
+    _GPU_PROBE_CACHE["verdict"] = verdict
+    _GPU_PROBE_CACHE["reason"] = "" if verdict else reason
+    return verdict
 
 
 def _auto3d_major_version() -> int | None:

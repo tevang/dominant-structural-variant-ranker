@@ -61,9 +61,14 @@ from dsvr.models import (
 )
 from dsvr.ranking.population import compute_delta_g_and_populations, write_ranked_outputs
 from dsvr.reporting.audit import write_audit_tables
+from dsvr.reporting.auto3d_diagnostics import failure_book_for
 from dsvr.reporting.markdown import write_run_report, write_summary_markdown
 from dsvr.reporting.progress import ProgressRecorder
-from dsvr.runners.auto3d_runner import Auto3DExecutionError, Auto3DUnavailableError
+from dsvr.runners.auto3d_runner import (
+    Auto3DExecutionError,
+    Auto3DUnavailableError,
+    register_auto3d_warning_observer,
+)
 from dsvr.runners.censo_runner import refine_top_ranked_with_censo
 from dsvr.runners.crest_runner import read_seed_sdf, run_crest_for_seed
 from dsvr.runners.molscrub_runner import MolscrubUnavailableError
@@ -104,6 +109,9 @@ def run_workflow(config: RunConfig) -> WorkflowResult:
         progress_interval=config.logging.progress_interval_seconds,
     )
     recovery = WorkflowRecoveryRecorder(outdir)
+    register_auto3d_warning_observer(
+        lambda message: progress.warning("Auto3D environment", message)
+    )
     progress.record("Input validation", "started")
 
     if config.dry_run:
@@ -1591,7 +1599,7 @@ def _run_step_list(
         if progress is not None and progress_stage is not None:
             progress.record(progress_stage, "skipped")
         return []
-    outputs = []
+    outputs: list[AnyLineageRecord] = []
     for index, item in enumerate(inputs, start=1):
         item_id = getattr(item, "id", None) or getattr(item, "input_id", None) or str(index)
         item_name = getattr(item, "molname", None) or str(item_id)
@@ -1688,6 +1696,8 @@ def _generate_auto3d_seeds_with_retries(
             )
         return seeds
     except (Auto3DExecutionError, Auto3DUnavailableError) as exc:
+        book = failure_book_for(config.output_dir)
+        cause = book.record_failure("3D seeding", str(config.seeding.auto3d_model), exc)
         if config.seeding.auto3d_use_gpu and config.error_handling.retry_auto3d_cpu_on_gpu_failure:
             retry_data = config.model_dump(mode="python")
             retry_data["seeding"]["auto3d_use_gpu"] = False
@@ -1706,12 +1716,34 @@ def _generate_auto3d_seeds_with_retries(
                 return seeds
             except (Auto3DExecutionError, Auto3DUnavailableError) as cpu_exc:
                 exc = cpu_exc
+                book.record_failure("3D seeding", str(config.seeding.auto3d_model), cpu_exc)
+        if cause.error_class in {"INFRA_MULTIPROCESSING", "UNAVAILABLE"}:
+            # Infra-global crash (or missing binary): per-molecule retries
+            # deterministically reproduce the same failure — skip them.
+            raise exc
         if (
             config.error_handling.retry_auto3d_smaller_batch_on_batch_failure
             and len(stereos) > 1
         ):
             recovered: list[SeedConformerRecord] = []
             for index, stereo in enumerate(stereos, start=1):
+                blocker = book.terminal_reference("3D seeding", str(config.seeding.auto3d_model))
+                if blocker is not None:
+                    # Terminal infra failure already proven for this stage:
+                    # use the declared fallback instead of paying another
+                    # full failing invocation per molecule.
+                    _record_item_failure(
+                        recovery,
+                        progress,
+                        config,
+                        stage="3D seeding",
+                        item_id=stereo.id,
+                        item_name=stereo.molname,
+                        exc=Auto3DExecutionError(
+                            f"Auto3D seeding skipped per failure memory; {blocker.short_note}"
+                        ),
+                    )
+                    continue
                 try:
                     recovered.extend(generate_auto3d_seeds([stereo], config))
                     recovery.molecule(
@@ -1722,6 +1754,7 @@ def _generate_auto3d_seeds_with_retries(
                         action="retry_auto3d_smaller_batch_after_batch_failure",
                     )
                 except (Auto3DExecutionError, Auto3DUnavailableError) as item_exc:
+                    book.record_failure("3D seeding", str(config.seeding.auto3d_model), item_exc)
                     _record_item_failure(
                         recovery,
                         progress,

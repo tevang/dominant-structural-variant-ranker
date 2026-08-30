@@ -314,6 +314,18 @@ def render_logs(run_dir: Path) -> None:
     st.caption(f"Showing last {min(20000, len(text))} of {len(text)} characters.")
 
 
+def _resolve_artifact_path(run_dir: Path, artifact_path: str) -> Path | None:
+    """Resolve an artifact path, refusing anything outside the run dir.
+
+    Artifact paths are read from CSVs inside the inspected directory, so a
+    tampered run dir could otherwise make the GUI read arbitrary files.
+    Returns ``None`` when the resolved path escapes ``run_dir``.
+    """
+
+    resolved = (run_dir / artifact_path).resolve()
+    return resolved if resolved.is_relative_to(Path(run_dir).resolve()) else None
+
+
 def render_artifacts(run_dir: Path) -> None:
     st.subheader("Artifacts")
     inventory = load_inventory(run_dir)
@@ -347,7 +359,13 @@ def render_artifacts(run_dir: Path) -> None:
     artifact = inventory.get(selected)
     if artifact is None:
         return
-    path = run_dir / artifact.path
+    path = _resolve_artifact_path(run_dir, artifact.path)
+    if path is None:
+        st.warning("Artifact path escapes the run directory; refusing to open it.")
+        return
+    if not path.is_file():
+        st.warning("Artifact path is missing or not a file.")
+        return
     if not path.exists():
         st.warning("Artifact is recorded but missing on disk.")
         return

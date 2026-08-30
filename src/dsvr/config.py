@@ -11,6 +11,9 @@ InputFormat = Literal["auto", "smi", "smiles", "sdf"]
 SolventModel = Literal["alpb", "gbsa", "none"]
 SeederMethod = Literal["etkdg", "auto3d", "both"]
 RdkitForcefield = Literal["uff", "mmff", "none"]
+# NOTE: "auto" has no Auto3D v3 equivalent (v3 accepts only named engines);
+# with a v3 install it fails once per batch and the chain advances to named
+# engines. Prefer naming the engine explicitly.
 Auto3dModel = Literal["AIMNET", "AIMNet2", "ANI2x", "ANI2xt", "auto"]
 WorkflowMode = Literal["ligprep_like", "physics_validation", "exhaustive_debug"]
 WorkflowProtocol = Literal["default", "auto3d_entropy"]
@@ -23,6 +26,7 @@ CleanupPolicy = Literal["compact", "keep_selected", "debug_all"]
 TautomerStrategy = Literal["safe", "normal", "exhaustive"]
 TautomerTimeoutFallback = Literal["keep_input_and_canonical"]
 OptionalValidationSelection = Literal["top_auto3d_energy"]
+Auto3dUnspecifiedStereoPolicy = Literal["enumerate", "auto3d_enumerate"]
 
 KNOWN_SOLVENTS = {
     "acetone",
@@ -131,6 +135,23 @@ class ProtonationConfig(StrictModel):
         if value <= 0:
             raise ValueError("protonation limits must be positive")
         return value
+
+
+class Auto3dConfig(StrictModel):
+    """Cross-stage Auto3D behavior shared by all Auto3D invocations.
+
+    on_unspecified_stereo:
+      - ``enumerate``: enumerate unspecified stereochemistry with RDKit
+        before Auto3D receives the molecule (default; matches the pipeline's
+        deterministic stereo enumeration).
+      - ``auto3d_enumerate``: invoke Auto3D with isomer enumeration enabled
+        for the affected molecules only.
+    engine_element_overrides: optional engine → element-symbol list replacing
+      the built-in compatibility table when Auto3D's real validation drifts.
+    """
+
+    on_unspecified_stereo: Auto3dUnspecifiedStereoPolicy = "enumerate"
+    engine_element_overrides: dict[str, list[str]] = Field(default_factory=dict)
 
 
 class TautomerFilteringConfig(StrictModel):
@@ -621,6 +642,7 @@ class RunConfig(StrictModel):
     overwrite: bool = False
     resume: bool = True
     chemistry: ChemistryConfig = Field(default_factory=ChemistryConfig)
+    auto3d: Auto3dConfig = Field(default_factory=Auto3dConfig)
     enumeration: EnumerationConfig = Field(default_factory=EnumerationConfig)
     protonation: ProtonationConfig = Field(default_factory=ProtonationConfig)
     tautomer_filtering: TautomerFilteringConfig = Field(default_factory=TautomerFilteringConfig)
