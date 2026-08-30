@@ -23,11 +23,15 @@ def read_sdf(
         input_id = f"mol_{record_number:06d}"
         molecule = supplier[record_number - 1] if record_number - 1 < len(supplier) else None
         if molecule is None:
+            record_lines = record.splitlines()
+            title_line = record_lines[0].strip() if record_lines else ""
             invalid_records.append(
                 {
                     "input_id": input_id,
                     "source_format": "sdf",
                     "line_number": "",
+                    "name": title_line,
+                    "smiles": "",
                     "raw_record": record,
                     "error": "RDKit failed to parse or sanitize SDF record",
                 }

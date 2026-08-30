@@ -10,8 +10,18 @@ from dsvr.models import MoleculeInput
 
 InputFormat = Literal["auto", "smi", "smiles", "sdf"]
 
-SMILES_SUFFIXES = {".smi", ".smiles", ".txt"}
+SMILES_SUFFIXES = {".smi", ".smiles", ".txt", ".csv"}
 SDF_SUFFIXES = {".sdf", ".sd"}
+
+INVALID_INPUT_COLUMNS = [
+    "input_id",
+    "source_format",
+    "line_number",
+    "name",
+    "smiles",
+    "raw_record",
+    "error",
+]
 
 
 def read_molecules(
@@ -21,17 +31,12 @@ def read_molecules(
     deduplicate: bool = True,
     invalid_output_path: Path | None = None,
 ) -> list[MoleculeInput]:
-    source_format = resolve_input_format(path, input_format)
-    if source_format == "sdf":
-        molecules, invalid_records = read_sdf(path, deduplicate=deduplicate)
-    else:
-        molecules, invalid_records = read_smiles(path, deduplicate=deduplicate)
-
-    if invalid_records:
-        write_invalid_inputs_csv(
-            invalid_output_path or path.parent / "invalid_inputs.csv",
-            invalid_records,
-        )
+    molecules, _invalid_records = validate_input_file(
+        path,
+        input_format=input_format,
+        deduplicate=deduplicate,
+        invalid_output_path=invalid_output_path,
+    )
     return molecules
 
 
@@ -42,17 +47,28 @@ def validate_input_file(
     deduplicate: bool = True,
     invalid_output_path: Path | None = None,
 ) -> tuple[list[MoleculeInput], list[dict[str, str]]]:
+    molecules, invalid_records = _read_by_format(
+        path,
+        input_format=input_format,
+        deduplicate=deduplicate,
+    )
+    write_invalid_inputs_csv(
+        invalid_output_path or path.parent / "invalid_inputs.csv",
+        invalid_records,
+    )
+    return molecules, invalid_records
+
+
+def _read_by_format(
+    path: Path,
+    *,
+    input_format: InputFormat,
+    deduplicate: bool,
+) -> tuple[list[MoleculeInput], list[dict[str, str]]]:
     source_format = resolve_input_format(path, input_format)
     if source_format == "sdf":
-        molecules, invalid_records = read_sdf(path, deduplicate=deduplicate)
-    else:
-        molecules, invalid_records = read_smiles(path, deduplicate=deduplicate)
-    if invalid_records:
-        write_invalid_inputs_csv(
-            invalid_output_path or path.parent / "invalid_inputs.csv",
-            invalid_records,
-        )
-    return molecules, invalid_records
+        return read_sdf(path, deduplicate=deduplicate)
+    return read_smiles(path, deduplicate=deduplicate)
 
 
 def resolve_input_format(
@@ -77,8 +93,7 @@ def resolve_input_format(
 
 def write_invalid_inputs_csv(path: Path, invalid_records: list[dict[str, str]]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    columns = ["input_id", "source_format", "line_number", "raw_record", "error"]
     with path.open("w", encoding="utf-8", newline="") as handle:
-        writer = csv.DictWriter(handle, fieldnames=columns, extrasaction="ignore")
+        writer = csv.DictWriter(handle, fieldnames=INVALID_INPUT_COLUMNS, extrasaction="ignore")
         writer.writeheader()
         writer.writerows(invalid_records)

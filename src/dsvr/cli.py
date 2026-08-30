@@ -496,7 +496,7 @@ def validate_input(
         "deduplicate": deduplicate,
         "valid_count": len(molecules),
         "invalid_count": len(invalid_records),
-        "invalid_inputs_csv": str(invalid_path) if invalid_records else None,
+        "invalid_inputs_csv": str(invalid_path),
         "molecules": [
             {
                 "input_id": molecule.input_id,

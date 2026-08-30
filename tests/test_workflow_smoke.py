@@ -25,6 +25,8 @@ def test_workflow_smoke_writes_outputs(tmp_path: Path) -> None:
     assert (outdir / "logs" / "workflow.log").exists()
     assert (outdir / "ranking" / "ranked_variants.csv").exists()
     assert (outdir / "inputs.csv").exists()
+    inputs_rows = (outdir / "inputs.csv").read_text(encoding="utf-8").strip().splitlines()
+    assert len(inputs_rows) == 2  # header + one accepted molecule
     assert (outdir / "summary.md").exists()
     assert (outdir / "filtering" / "filtering_decisions.csv").exists()
     assert (outdir / "filtering" / "variant_penalties.csv").exists()
