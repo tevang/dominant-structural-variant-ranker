@@ -19,6 +19,7 @@ from dsvr.chemistry.auto3d_stereo_policy import (
     policy_metadata,
     treatment_note,
 )
+from dsvr.chemistry.tautomers import TautomerSelectionResult
 from dsvr.config import RunConfig
 from dsvr.models import ProtomerRecord, TautomerRecord, make_tautomer_id
 from dsvr.reporting.auto3d_diagnostics import bounded, failure_book_for
@@ -79,10 +80,11 @@ class _RankedCandidate:
 def filter_tautomers_with_auto3d(
     protomer_records: list[ProtomerRecord],
     config: RunConfig,
-) -> list[TautomerRecord]:
+) -> TautomerSelectionResult:
     output_dir = config.output_dir / "enumeration" / "tautomers"
     output_dir.mkdir(parents=True, exist_ok=True)
     selected_records: list[TautomerRecord] = []
+    pool_records: list[TautomerRecord] = []
     all_rows: list[dict[str, Any]] = []
     ranked_rows: list[dict[str, Any]] = []
     selected_rows: list[dict[str, Any]] = []
@@ -99,6 +101,20 @@ def filter_tautomers_with_auto3d(
             stereo_plan=stereo_plan,
         )
         selected_records.extend(records)
+        # Ranked-but-rejected candidates are materialized as records so the
+        # engine can refill branches after cross-branch deduplication without
+        # re-running Auto3D.
+        pool_records.extend(
+            _records_from_ranked(
+                protomer,
+                [item for item in ranked if not item.selected],
+                config,
+                output_dir,
+                selected=False,
+                stereo_plan=stereo_plan,
+                tautomer_index_offset=len(records),
+            )
+        )
         _write_tautomer_sdf(output_dir / f"{protomer.id}_tautomers.sdf", records)
         _write_tautomer_csv(output_dir / f"{protomer.id}_tautomers.csv", records)
         all_rows.extend(_candidate_row(protomer, item, candidate_warning) for item in candidates)
@@ -110,7 +126,10 @@ def filter_tautomers_with_auto3d(
     _write_rows(output_dir / "tautomers_auto3d_ranked.csv", ranked_rows)
     _write_rows(output_dir / "tautomers_selected.csv", selected_rows)
     _write_rows(output_dir / "tautomers_rejected.csv", rejected_rows)
-    return selected_records
+    return TautomerSelectionResult(
+        selected_records=selected_records,
+        pool_records=pool_records,
+    )
 
 
 def _enumerate_candidates(
@@ -847,21 +866,26 @@ def _records_from_ranked(
     config: RunConfig,
     output_dir: Path,
     *,
+    selected: bool = True,
     stereo_plan: StereoPolicyPlan | None = None,
+    tautomer_index_offset: int = 0,
 ) -> list[TautomerRecord]:
     records: list[TautomerRecord] = []
-    selected = sorted(
+    ordered = sorted(
         ranked,
         key=lambda item: (
             float("inf") if item.relative_energy_kcal_mol is None else item.relative_energy_kcal_mol,
+            float("inf") if item.auto3d_rank is None else item.auto3d_rank,
             item.candidate.isomeric_smiles,
+            item.candidate.tautomer_id,
         ),
     )
-    for index, item in enumerate(selected, start=1):
+    for offset, item in enumerate(ordered, start=1):
+        index = tautomer_index_offset + offset
         candidate = item.candidate
         metadata = {
             "auto3d_tautomer_filtering": {
-                "selected": True,
+                "selected": selected,
                 "source": item.source,
                 "reason": item.reason,
                 "rank": item.auto3d_rank,
@@ -888,12 +912,19 @@ def _records_from_ranked(
                 explicit_proton_count=_explicit_proton_count(candidate.molecule),
                 source_software=item.source,
                 source_python_function="dsvr.chemistry.tautomer_auto3d_filter.filter_tautomers_with_auto3d",
-                output_paths=[
-                    output_dir / f"{protomer.id}_tautomers.sdf",
-                    output_dir / f"{protomer.id}_tautomers.csv",
-                    output_dir / "tautomers_selected.csv",
-                    output_dir / "tautomers_rejected.csv",
-                ],
+                # Pool (=not selected) records appear on disk only in
+                # tautomers_rejected.csv; the per-branch outputs and
+                # tautomers_selected.csv contain selected records.
+                output_paths=(
+                    [
+                        output_dir / f"{protomer.id}_tautomers.sdf",
+                        output_dir / f"{protomer.id}_tautomers.csv",
+                        output_dir / "tautomers_selected.csv",
+                        output_dir / "tautomers_rejected.csv",
+                    ]
+                    if selected
+                    else [output_dir / "tautomers_rejected.csv"]
+                ),
                 warnings=[
                     "Auto3D tautomer filtering is a fast potential-energy triage step, not a solution abundance estimate.",
                     *item.warnings,

@@ -22,6 +22,21 @@ class TautomerEnumerationTimeout(RuntimeError):
 
 
 @dataclass(frozen=True)
+class TautomerSelectionResult:
+    """Selected tautomer records plus the ranked pool of unused candidates.
+
+    ``pool_records`` carries the branch's ranked unique candidates that were
+    not selected, best-first, materialized as ``TautomerRecord`` payloads so
+    the engine can refill branches after cross-branch deduplication without
+    re-running enumeration tools. Pool records are marked with
+    ``metadata["selected"] = False`` and the reason they were not selected.
+    """
+
+    selected_records: list[TautomerRecord]
+    pool_records: list[TautomerRecord]
+
+
+@dataclass(frozen=True)
 class _TautomerEnumerationResult:
     molblocks: list[str]
     hit_cap: bool
@@ -29,9 +44,18 @@ class _TautomerEnumerationResult:
     worker_warnings: list[str]
 
 
+# Bounded over-enumeration factor for the plain-RDKit tautomer path: the
+# enumerator is allowed to generate up to ``cap * factor`` candidates so the
+# branch keeps a ranked unused pool for post-dedupe refill, while the selected
+# set is still capped at ``max_tautomers_per_protomer``. Mirrors the
+# stereoisomer enumeration ceiling multiplier; deliberately not a public knob.
+TAUTOMER_ENUMERATION_OVERCAP_FACTOR = 4
+
+
 @dataclass(frozen=True)
 class _TautomerSettings:
     max_tautomers: int
+    enumeration_max_tautomers: int
     max_transforms: int
     timeout_seconds: int
     strategy: str
@@ -52,7 +76,7 @@ class _TautomerScoringRecord:
 def enumerate_tautomers(
     protomer_record: ProtomerRecord,
     config: RunConfig,
-) -> list[TautomerRecord]:
+) -> TautomerSelectionResult:
     input_mol = Chem.Mol(protomer_record.rdkit_mol)
     original_isomeric = Chem.MolToSmiles(input_mol, canonical=True, isomericSmiles=True)
     original_chiral_centers = _chiral_centers(input_mol)
@@ -83,7 +107,7 @@ def enumerate_tautomers(
 
     output_dir = config.output_dir / "enumeration" / "tautomers"
     output_dir.mkdir(parents=True, exist_ok=True)
-    records = _records_from_tautomers(
+    selection = _records_from_tautomers(
         protomer_record,
         raw_tautomers,
         config=config,
@@ -100,11 +124,19 @@ def enumerate_tautomers(
     if timeout_warning is not None:
         records = [
             record.model_copy(update={"warnings": [*record.warnings, timeout_warning]})
-            for record in records
+            for record in selection.selected_records
         ]
-    _write_tautomer_sdf(output_dir / f"{protomer_record.id}_tautomers.sdf", records)
-    _write_tautomer_csv(output_dir / f"{protomer_record.id}_tautomers.csv", records)
-    return records
+        selection = TautomerSelectionResult(
+            selected_records=records,
+            pool_records=selection.pool_records,
+        )
+    _write_tautomer_sdf(
+        output_dir / f"{protomer_record.id}_tautomers.sdf", selection.selected_records
+    )
+    _write_tautomer_csv(
+        output_dir / f"{protomer_record.id}_tautomers.csv", selection.selected_records
+    )
+    return selection
 
 
 def _records_from_tautomers(
@@ -121,7 +153,7 @@ def _records_from_tautomers(
     worker_warnings: list[str],
     elapsed_seconds: float,
     fallback: bool,
-) -> list[TautomerRecord]:
+) -> TautomerSelectionResult:
     seen: set[tuple[str, str]] = set()
     unique_tautomers: list[Chem.Mol] = []
     for tautomer in tautomers:
@@ -136,9 +168,66 @@ def _records_from_tautomers(
     cap = settings.max_tautomers
     if len(unique_tautomers) > cap:
         hit_cap = True
-    limited_tautomers = _select_tautomer_subset(unique_tautomers, cap, protomer_record)
+    ordered_tautomers = _rank_tautomers(unique_tautomers, protomer_record, cap)
+    limited_tautomers = ordered_tautomers[:cap]
+    pool_tautomers = ordered_tautomers[cap:]
+    records = _build_tautomer_records(
+        protomer_record,
+        limited_tautomers,
+        config=config,
+        enumerator=enumerator,
+        settings=settings,
+        original_isomeric=original_isomeric,
+        original_chiral_centers=original_chiral_centers,
+        output_dir=output_dir,
+        hit_cap=hit_cap,
+        worker_warnings=worker_warnings,
+        elapsed_seconds=elapsed_seconds,
+        fallback=fallback,
+        selected=True,
+    )
+    pool_records = _build_tautomer_records(
+        protomer_record,
+        pool_tautomers,
+        config=config,
+        enumerator=enumerator,
+        settings=settings,
+        original_isomeric=original_isomeric,
+        original_chiral_centers=original_chiral_centers,
+        output_dir=output_dir,
+        hit_cap=hit_cap,
+        worker_warnings=worker_warnings,
+        elapsed_seconds=elapsed_seconds,
+        fallback=fallback,
+        selected=False,
+        tautomer_index_offset=len(records),
+        fallback_rank_offset=len(records),
+    )
+    return TautomerSelectionResult(selected_records=records, pool_records=pool_records)
+
+
+def _build_tautomer_records(
+    protomer_record: ProtomerRecord,
+    tautomers: list[Chem.Mol],
+    *,
+    config: RunConfig,
+    enumerator: rdMolStandardize.TautomerEnumerator,
+    settings: _TautomerSettings,
+    original_isomeric: str,
+    original_chiral_centers: list[tuple[int, str]],
+    output_dir: Path,
+    hit_cap: bool,
+    worker_warnings: list[str],
+    elapsed_seconds: float,
+    fallback: bool,
+    selected: bool,
+    tautomer_index_offset: int = 0,
+    fallback_rank_offset: int = 0,
+) -> list[TautomerRecord]:
     records: list[TautomerRecord] = []
-    for index, tautomer in enumerate(limited_tautomers, start=1):
+    for offset, tautomer in enumerate(tautomers, start=1):
+        index = tautomer_index_offset + offset
+        fallback_rank = fallback_rank_offset + offset
         canonical_smiles = Chem.MolToSmiles(tautomer, canonical=True, isomericSmiles=False)
         isomeric_smiles = Chem.MolToSmiles(tautomer, canonical=True, isomericSmiles=True)
         formula = _formula(tautomer)
@@ -154,7 +243,13 @@ def _records_from_tautomers(
                 "isomeric_smiles": isomeric_smiles,
             },
             "not_stability_ranking": True,
+            "selected": selected,
+            "tautomer_fallback_rank": fallback_rank,
         }
+        if not selected:
+            metadata["rejection_reason"] = (
+                "beyond_max_tautomers_per_protomer_by_svp_heuristic"
+            )
         if fallback:
             metadata["fallback"] = True
             metadata["fallback_reason"] = "tautomer enumeration timeout or worker failure"
@@ -172,7 +267,8 @@ def _records_from_tautomers(
         if hit_cap:
             warnings.append(
                 "tautomer candidate count reached max_tautomers_per_protomer; candidates "
-                f"were limited to {cap} using SVPScore/RDKit tautomer heuristic priority"
+                f"were limited to {settings.max_tautomers} using SVPScore/RDKit tautomer "
+                "heuristic priority"
             )
         if fallback:
             warnings.append("fallback tautomer candidate is the parent protomer itself")
@@ -195,10 +291,16 @@ def _records_from_tautomers(
                 explicit_proton_count=proton_count,
                 source_software="rdkit",
                 source_python_function="dsvr.chemistry.tautomers.enumerate_tautomers",
-                output_paths=[
-                    output_dir / f"{protomer_record.id}_tautomers.sdf",
-                    output_dir / f"{protomer_record.id}_tautomers.csv",
-                ],
+                # Unused pool records are not written to the per-branch outputs;
+                # only selected records appear there.
+                output_paths=(
+                    [
+                        output_dir / f"{protomer_record.id}_tautomers.sdf",
+                        output_dir / f"{protomer_record.id}_tautomers.csv",
+                    ]
+                    if selected
+                    else []
+                ),
                 warnings=warnings,
                 metadata=metadata,
                 tautomer_index=index,
@@ -298,8 +400,10 @@ def _tautomer_parameters(enumerator: rdMolStandardize.TautomerEnumerator) -> dic
 
 
 def _settings_from_config(config: RunConfig) -> _TautomerSettings:
+    max_tautomers = config.enumeration.max_tautomers_per_protomer
     return _TautomerSettings(
-        max_tautomers=config.enumeration.max_tautomers_per_protomer,
+        max_tautomers=max_tautomers,
+        enumeration_max_tautomers=max_tautomers * TAUTOMER_ENUMERATION_OVERCAP_FACTOR,
         max_transforms=config.enumeration.max_tautomer_transforms,
         timeout_seconds=config.enumeration.tautomer_timeout_seconds,
         strategy=config.enumeration.tautomer_strategy,
@@ -311,7 +415,7 @@ def _settings_from_config(config: RunConfig) -> _TautomerSettings:
 
 def _cleanup_parameters(settings: _TautomerSettings) -> rdMolStandardize.CleanupParameters:
     params = rdMolStandardize.CleanupParameters()
-    params.maxTautomers = settings.max_tautomers
+    params.maxTautomers = settings.enumeration_max_tautomers
     params.maxTransforms = settings.max_transforms
     params.tautomerRemoveBondStereo = settings.remove_bond_stereo
     params.tautomerRemoveSp3Stereo = settings.remove_sp3_stereo
@@ -365,7 +469,7 @@ def _tautomer_worker(molblock: str, settings: _TautomerSettings, output_queue: A
             {
                 "status": "ok",
                 "molblocks": [Chem.MolToMolBlock(tautomer) for tautomer in tautomers],
-                "hit_cap": len(tautomers) >= settings.max_tautomers,
+                "hit_cap": len(tautomers) >= settings.enumeration_max_tautomers,
                 "warnings": [],
             }
         )
@@ -382,11 +486,17 @@ def _mols_from_molblocks(molblocks: list[str]) -> list[Chem.Mol]:
     return molecules
 
 
-def _select_tautomer_subset(
+def _rank_tautomers(
     tautomers: list[Chem.Mol],
-    cap: int,
     protomer_record: ProtomerRecord,
+    cap: int,
 ) -> list[Chem.Mol]:
+    """Best-first ordering of unique tautomers (SVPScore/RDKit heuristic).
+
+    When the candidate count is within the cap the enumeration order is
+    preserved (no re-scoring), matching the historical selection behavior.
+    """
+
     if len(tautomers) <= cap:
         return tautomers
     parent_aromatic = sum(
@@ -405,7 +515,7 @@ def _select_tautomer_subset(
         )
         penalty, _ = score_tautomer(record)
         scored.append((penalty, isomeric, index, tautomer))
-    return [tautomer for _, _, _, tautomer in sorted(scored)[:cap]]
+    return [tautomer for _, _, _, tautomer in sorted(scored)]
 
 
 def _stereo_warnings(

@@ -15,6 +15,7 @@ from dsvr.chemistry.auto3d_stereo_policy import (
     policy_metadata,
     treatment_note,
 )
+from dsvr.chemistry.identity import ExactDuplicateKey, exact_duplicate_key_with_warning
 from dsvr.config import RunConfig
 from dsvr.models import SeedConformerRecord, StereoRecord, make_seed_id
 from dsvr.reporting.auto3d_diagnostics import bounded, failure_book_for
@@ -49,6 +50,7 @@ def generate_final_3d_variants(
     output_dir = config.output_dir / "final_3d"
     output_dir.mkdir(parents=True, exist_ok=True)
     if not stereo_records:
+        _write_final_dedupe_audit(config.output_dir / "final_dedupe_audit.csv", [])
         _write_final_outputs(config.output_dir, [], config)
         return Final3DResult(records=[], used_fallback=False, warnings=[])
 
@@ -92,6 +94,14 @@ def generate_final_3d_variants(
             bounded(f"Auto3D final 3D generation failed; used RDKit one-conformer fallback: {note}")
         ]
 
+    # Safety net: no exact-duplicate structural variants per input molecule in
+    # the final outputs, even for resumed or mixed-generation runs.
+    if config.final_3d.dedupe_final_variants:
+        records, dedupe_audit_rows, dedupe_warnings = _dedupe_final_variants(records)
+        warnings = [*warnings, *dedupe_warnings]
+    else:
+        dedupe_audit_rows = []
+    _write_final_dedupe_audit(config.output_dir / "final_dedupe_audit.csv", dedupe_audit_rows)
     _write_final_outputs(config.output_dir, records, config)
     return Final3DResult(records=records, used_fallback=used_fallback, warnings=warnings)
 
@@ -506,6 +516,96 @@ def _dedupe_one_conformer_per_variant(records: list[SeedConformerRecord]) -> lis
         if current is None or _energy_sort_key(record) < _energy_sort_key(current):
             best[parent_id] = record
     return [best[key] for key in sorted(best)]
+
+
+def _dedupe_final_variants(
+    records: list[SeedConformerRecord],
+) -> tuple[list[SeedConformerRecord], list[dict[str, object]], list[str]]:
+    """Remove exact-duplicate final variants per input molecule.
+
+    Groups records per ``(input_molecule_id, exact_duplicate_key)`` and keeps
+    the lowest-energy record (``None`` energy sorts last; ties break by record
+    ID), attaching ``merged_from`` provenance to the retained record. Returns
+    the deduplicated records, audit rows for ``final_dedupe_audit.csv``, and
+    any identity-standardization warnings encountered.
+    """
+
+    key_by_id: dict[str, ExactDuplicateKey] = {}
+    identity_warnings: list[str] = []
+
+    def key_of(record: SeedConformerRecord) -> ExactDuplicateKey:
+        key = key_by_id.get(record.id)
+        if key is None:
+            mol = record.rdkit_mol
+            if mol is None:
+                mol = Chem.MolFromSmiles(record.isomeric_smiles or record.canonical_smiles or "")
+            if mol is None:
+                key = ExactDuplicateKey("__unparseable__", 0, record.id)
+            else:
+                key, warning = exact_duplicate_key_with_warning(mol)
+                if warning:
+                    identity_warnings.append(f"{record.id}: {warning}")
+            key_by_id[record.id] = key
+        return key
+
+    by_input: dict[str, list[SeedConformerRecord]] = {}
+    for record in records:
+        by_input.setdefault(record.input_molecule_id, []).append(record)
+
+    retained: list[SeedConformerRecord] = []
+    audit_rows: list[dict[str, object]] = []
+    for input_id, group_records in by_input.items():
+        groups: dict[ExactDuplicateKey, list[SeedConformerRecord]] = {}
+        for record in group_records:
+            groups.setdefault(key_of(record), []).append(record)
+        for key, group in groups.items():
+            ordered = sorted(group, key=_energy_sort_key)
+            kept = ordered[0]
+            eliminated = ordered[1:]
+            if eliminated:
+                metadata = dict(kept.metadata)
+                metadata["merged_from"] = [
+                    {
+                        "final_variant_id": item.id,
+                        "stereo_id": item.parent_id,
+                        "input_molecule_id": item.input_molecule_id,
+                    }
+                    for item in eliminated
+                ]
+                kept = kept.model_copy(update={"metadata": metadata})
+                audit_rows.append(
+                    {
+                        "input_molecule_id": input_id,
+                        "action": "merge",
+                        "exact_formula": key.formula,
+                        "exact_net_charge": key.net_charge,
+                        "exact_canonical_isomeric_smiles": key.canonical_isomeric_smiles,
+                        "retained_final_variant_id": kept.id,
+                        "eliminated_final_variant_ids": " | ".join(item.id for item in eliminated),
+                        "detail": "kept lowest-energy record per exact-duplicate key",
+                    }
+                )
+            retained.append(kept)
+    return retained, audit_rows, identity_warnings
+
+
+def _write_final_dedupe_audit(path: Path, rows: list[dict[str, object]]) -> None:
+    columns = [
+        "input_molecule_id",
+        "action",
+        "exact_formula",
+        "exact_net_charge",
+        "exact_canonical_isomeric_smiles",
+        "retained_final_variant_id",
+        "eliminated_final_variant_ids",
+        "detail",
+    ]
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", encoding="utf-8", newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=columns)
+        writer.writeheader()
+        for row in rows:
+            writer.writerow(row)
 
 
 def _fill_missing_with_rdkit(

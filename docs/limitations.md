@@ -36,6 +36,45 @@ CREST/xTB conformer searches, xTB thermo, CREST entropy estimates, and CENSO are
 
 Psi4/PySCF rescoring is outside the default workflow and should remain an optional legacy/advanced module unless explicitly enabled.
 
+## Molecular Identity and Deduplication
+
+"Same structure" is decided by a toolkit-local exact-duplicate key — molecular
+formula, net formal charge, and canonical isomeric SMILES after RDKit
+`rdMolStandardize.Cleanup` (ChEMBL-style normalization; never uncharged, never
+a tautomer or charge parent). The key is valid only inside this RDKit-based
+pipeline under this policy; it is not a global identifier and does not
+interoperate with other toolkits' canonicalization.
+
+Standard InChI/InChIKey is deliberately not used as a dedupe key: its
+normalization collapses mobile-hydrogen tautomers into one identifier, which
+would over-merge distinct tautomers at exactly the stages that must keep them
+apart. IUPAC names and raw, unstandardized SMILES strings are likewise never
+used for identity.
+
+Exact-duplicate elimination runs after every expansion step (tautomer
+selection, stereoisomer selection, and a final safety net before
+`final_variants` is written), because dedupe that is only branch-local leaves
+duplicates when protomer branches converge on the same structures (for
+example protomers that are tautomers of one another). After dedupe, branches
+are refilled to their configured caps only from already-ranked unused unique
+candidates: the refill pool is bounded (stereoisomer enumeration is
+over-enumerated by `stereoisomer_filtering.enumeration_ceiling_multiplier`,
+default 4), so a branch can remain below cap when its candidate space is
+exhausted; that shortfall is recorded rather than padded with duplicates.
+Resumed runs re-execute the tautomer-and-later stages because the deduped
+record sets change downstream input hashes; refill pools are in-memory only,
+so resume-loaded branches can dedupe but cannot refill. Rank metadata is not
+persisted to the per-branch SDFs, so on a tautomers-step resume the
+representative of a duplicate group falls back to record-ID order instead of
+best-ranked provenance; the final structures still converge because any
+representative has the same identity key and the final safety net holds.
+
+Per-branch artifacts (`enumeration/tautomers/*_tautomers.sdf`,
+`enumeration/stereoisomers/*_stereoisomers.sdf`) are branch-local snapshots
+written before cross-branch deduplication; the deduplicated view lives in
+`all_tautomers.sdf`, `all_stereoisomers.sdf`, the `*_dedupe.csv` audit files,
+and downstream artifacts.
+
 ## Enumeration Bias
 
 Missing candidate states cannot be recovered by downstream ranking. If molscrub, RDKit, or Auto3D omits a relevant protomer, tautomer, stereoisomer, or conformer, DSVR can only rank the candidates it receives.

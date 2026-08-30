@@ -19,6 +19,7 @@ from dsvr.chemistry.tautomer_auto3d_filter import (
     RdkitTautomerFilteringTimeout,
     filter_tautomers_with_auto3d,
 )
+from dsvr.chemistry.tautomers import TautomerSelectionResult
 from dsvr.config import AgentConfig, RunConfig, load_config
 from dsvr.models import (
     MoleculeInput,
@@ -118,7 +119,7 @@ def test_rdkit_tautomer_timeout_fallback_is_bounded(tmp_path: Path, monkeypatch)
 
     monkeypatch.setattr(tautomer_filter, "_enumerate_molblocks_with_timeout", timeout)
     monkeypatch.setattr(tautomer_filter, "run_auto3d", fail_auto3d)
-    records = filter_tautomers_with_auto3d([_protomer_record("CCO")], RunConfig(output_dir=tmp_path / "run"))
+    records = filter_tautomers_with_auto3d([_protomer_record("CCO")], RunConfig(output_dir=tmp_path / "run")).selected_records
 
     assert len(records) == 1
     assert any("TAUTOMER_TIMEOUT_FALLBACK" in warning for warning in records[0].warnings)
@@ -168,7 +169,12 @@ def test_final_auto3d_batch_failure_retries_smaller_batches(tmp_path: Path, monk
     protomer = _protomer_record("CCO")
     tautomer = _tautomer_record(protomer, 1)
     stereos = [_stereo_record(tautomer, 1), _stereo_record(tautomer, 2)]
-    config = RunConfig(output_dir=tmp_path / "run", final_3d={"use_gpu": False})
+    # Both mock stereoisomers share one structure; the final safety-net dedupe
+    # (unrelated to batch-retry mechanics) is disabled to keep two records.
+    config = RunConfig(
+        output_dir=tmp_path / "run",
+        final_3d={"use_gpu": False, "dedupe_final_variants": False},
+    )
 
     result = generate_final_3d_variants(stereos, config)
 
@@ -204,7 +210,7 @@ def test_local_agent_default_disabled_and_mocked_enabled_path(monkeypatch) -> No
     assert result.decision.valid is True
 
 
-def _mock_tautomer_filter(protomers: list[ProtomerRecord], config: RunConfig) -> list[TautomerRecord]:
+def _mock_tautomer_filter(protomers: list[ProtomerRecord], config: RunConfig) -> TautomerSelectionResult:
     outdir = config.output_dir / "enumeration" / "tautomers"
     outdir.mkdir(parents=True, exist_ok=True)
     selected_records: list[TautomerRecord] = []
@@ -239,7 +245,7 @@ def _mock_tautomer_filter(protomers: list[ProtomerRecord], config: RunConfig) ->
     _write_csv(outdir / "tautomers_auto3d_ranked.csv", selected_rows + rejected_rows)
     _write_csv(outdir / "tautomers_selected.csv", selected_rows)
     _write_csv(outdir / "tautomers_rejected.csv", rejected_rows)
-    return selected_records
+    return TautomerSelectionResult(selected_records=selected_records, pool_records=[])
 
 
 def _mock_stereo_enumeration(tautomer: TautomerRecord, config: RunConfig) -> list[StereoRecord]:
