@@ -8,14 +8,30 @@ from pathlib import Path
 from rdkit import Chem
 from rdkit.Chem import AllChem, rdMolDescriptors
 
+from dsvr.chemistry.auto3d_stereo_policy import (
+    ISOMER_SUFFIX_SEPARATOR,
+    StereoPolicyPlan,
+    apply_stereo_policy,
+    policy_metadata,
+    treatment_note,
+)
 from dsvr.config import RunConfig
 from dsvr.models import SeedConformerRecord, StereoRecord, make_seed_id
-from dsvr.runners.auto3d_runner import Auto3DExecutionError, Auto3DUnavailableError, run_auto3d
+from dsvr.reporting.auto3d_diagnostics import bounded, failure_book_for
+from dsvr.runners.auto3d_runner import (
+    Auto3DExecutionError,
+    Auto3DUnavailableError,
+    engine_supports_molecule,
+    partition_by_engine,
+    run_auto3d,
+)
 from dsvr.utils.units import HARTREE_TO_KCAL_MOL as _HARTREE_TO_KCAL_MOL
 
 FINAL_3D_WARNING = (
     "Final Auto3D energies are approximate gas-phase/neural-potential conformer energies; "
-    "they are not solvated free energies unless an optional validation stage is run."
+    "they are not solvated free energies unless an optional validation stage is run. "
+    "Absolute energies are not comparable across different molecular formulas or protonation "
+    "states; compare variants only within the same formula."
 )
 
 
@@ -36,11 +52,19 @@ def generate_final_3d_variants(
         _write_final_outputs(config.output_dir, [], config)
         return Final3DResult(records=[], used_fallback=False, warnings=[])
 
+    stereo_plan = apply_stereo_policy(
+        [(record.id, record.rdkit_mol) for record in stereo_records],
+        config,
+    )
     input_sdf = output_dir / "final_3d_input.sdf"
-    _write_final_auto3d_input(input_sdf, stereo_records)
+    _write_final_auto3d_input(input_sdf, stereo_records, stereo_plan)
     try:
-        output_sdf, command = _run_final_auto3d(input_sdf, output_dir, config)
-        records = _records_from_final_auto3d_output(output_sdf, stereo_records, config, command)
+        output_sdf, command, incompatible_ids = _run_final_auto3d(
+            input_sdf, output_dir, config, enumerate_isomer_for=stereo_plan.enumerate_isomer_for
+        )
+        records = _records_from_final_auto3d_output(
+            output_sdf, stereo_records, config, command, stereo_plan=stereo_plan
+        )
         records = _dedupe_one_conformer_per_variant(records)
         records, fallback_warnings = _fill_missing_with_rdkit(
             stereo_records,
@@ -49,43 +73,174 @@ def generate_final_3d_variants(
             command=command,
             output_sdf=output_sdf,
             reason="Auto3D returned no final conformer for this selected variant",
+            reason_by_id={stereo_id: ENGINE_INCOMPATIBLE_FALLBACK_REASON for stereo_id in incompatible_ids},
+            stereo_plan=stereo_plan,
         )
         used_fallback = bool(fallback_warnings)
         warnings = fallback_warnings
     except (Auto3DExecutionError, Auto3DUnavailableError) as exc:
         command = ["auto3d", "unavailable_or_failed", str(input_sdf)]
-        records = [_rdkit_final_record(record, config, command, input_sdf, str(exc)) for record in stereo_records]
+        note = failure_book_for(config.output_dir).note_for_exception(
+            FINAL3D_STAGE, str(config.final_3d.optimizing_engine), exc
+        )
+        records = [
+            _rdkit_final_record(record, config, command, input_sdf, note, stereo_plan=stereo_plan)
+            for record in stereo_records
+        ]
         used_fallback = True
-        warnings = [f"Auto3D final 3D generation failed; used RDKit one-conformer fallback: {exc}"]
+        warnings = [
+            bounded(f"Auto3D final 3D generation failed; used RDKit one-conformer fallback: {note}")
+        ]
 
     _write_final_outputs(config.output_dir, records, config)
     return Final3DResult(records=records, used_fallback=used_fallback, warnings=warnings)
+
+
+FINAL3D_STAGE = "final_3d"
+
+ENGINE_INCOMPATIBLE_FALLBACK_REASON = (
+    "auto3d_failed:ENGINE_INCOMPATIBLE (no configured engine supports this "
+    "structure; RDKit fallback used)"
+)
+
+
+def _final_engine_order(config: RunConfig) -> list[str]:
+    seen: list[str] = []
+    for engine in (
+        config.final_3d.optimizing_engine,
+        config.final_3d.fallback_optimizing_engine,
+    ):
+        name = str(engine)
+        if name not in seen:
+            seen.append(name)
+    return seen
 
 
 def _run_final_auto3d(
     input_sdf: Path,
     output_dir: Path,
     config: RunConfig,
+    *,
+    enumerate_isomer_for: frozenset[str] = frozenset(),
+) -> tuple[Path, list[str], set[str]]:
+    molecules = [
+        mol
+        for mol in Chem.SDMolSupplier(str(input_sdf), sanitize=True, removeHs=False)
+        if mol is not None
+    ]
+    overrides = config.auto3d.engine_element_overrides
+    engines = _final_engine_order(config)
+    assignments, incompatible = partition_by_engine(
+        [(index, mol) for index, mol in enumerate(molecules)],
+        engines,
+        element_overrides=overrides,
+    )
+    incompatible_ids = {
+        str(molecules[index].GetProp("DSVR_STEREO_ID"))
+        for index in incompatible
+        if molecules[index].HasProp("DSVR_STEREO_ID")
+    }
+    combined_sdf = output_dir / "auto3d_engines_combined.sdf"
+    combined_writer = Chem.SDWriter(str(combined_sdf))
+    commands: list[list[str]] = []
+    errors: list[str] = []
+    written = 0
+
+    def _wants_isomer_enum(index: int) -> bool:
+        mol = molecules[index]
+        return mol.HasProp("DSVR_STEREO_ID") and mol.GetProp("DSVR_STEREO_ID") in enumerate_isomer_for
+
+    for engine, indices in assignments.items():
+        group_dir = output_dir / f"engine_{engine}"
+        for wants_isomer_enum in (False, True):
+            subset = [index for index in indices if _wants_isomer_enum(index) == wants_isomer_enum]
+            if not subset:
+                continue
+            sub_dir = group_dir / ("isomer_enum" if wants_isomer_enum else "plain")
+            sub_dir.mkdir(parents=True, exist_ok=True)
+            group_input = sub_dir / "final_3d_input.sdf"
+            writer = Chem.SDWriter(str(group_input))
+            for index in subset:
+                writer.write(molecules[index])
+            writer.close()
+            try:
+                group_sdf, command = _run_final_auto3d_for_engine(
+                    group_input, sub_dir, config, engine, isomer_enum_only=wants_isomer_enum
+                )
+            except (Auto3DExecutionError, Auto3DUnavailableError) as exc:
+                cause = failure_book_for(config.output_dir).record_failure(
+                    FINAL3D_STAGE, engine, exc
+                )
+                errors.append(f"{engine}: {cause.short_note}")
+                continue
+            commands.append(command)
+            for output_mol in Chem.SDMolSupplier(str(group_sdf), sanitize=True, removeHs=False):
+                if output_mol is None:
+                    continue
+                combined_writer.write(output_mol)
+                written += 1
+    combined_writer.close()
+    if written == 0:
+        raise Auto3DExecutionError(
+            "Auto3D final 3D generation failed for all engine groups:\n" + "\n".join(errors)
+        )
+    if errors:
+        (output_dir / "auto3d_engine_group_warnings.txt").write_text(
+            "\n".join(errors) + "\n",
+            encoding="utf-8",
+        )
+    return combined_sdf, [part for command in commands for part in command], incompatible_ids
+
+
+def _run_final_auto3d_for_engine(
+    input_sdf: Path,
+    group_dir: Path,
+    config: RunConfig,
+    engine: str,
+    *,
+    isomer_enum_only: bool = False,
 ) -> tuple[Path, list[str]]:
     errors: list[str] = []
-    for use_gpu in _final_auto3d_gpu_attempts(config):
-        try:
-            return _run_final_auto3d_with_model_fallback(
-                input_sdf,
-                output_dir,
-                config,
-                use_gpu=use_gpu,
-            )
-        except (Auto3DExecutionError, Auto3DUnavailableError) as exc:
-            mode = "gpu" if use_gpu else "cpu"
-            errors.append(f"{mode}: {exc}")
+    overrides = config.auto3d.engine_element_overrides
+    molecules = [
+        mol
+        for mol in Chem.SDMolSupplier(str(input_sdf), sanitize=True, removeHs=False)
+        if mol is not None
+    ]
+    chain = [engine, *[other for other in _final_engine_order(config) if other != engine]]
+    for attempt in chain:
+        supported = [
+            mol
+            for mol in molecules
+            if engine_supports_molecule(attempt, mol, element_overrides=overrides)
+        ]
+        if not supported:
+            continue
+        for use_gpu in _final_auto3d_gpu_attempts(config):
+            try:
+                return run_auto3d(
+                    input_sdf,
+                    group_dir,
+                    k=config.final_3d.k,
+                    model=attempt,
+                    internal_tautomer_stereo_enum=False,
+                    max_confs=config.final_3d.max_confs,
+                    patience=config.final_3d.patience,
+                    use_gpu=use_gpu,
+                    stream_output=False,
+                    timeout_s=config.final_3d.timeout_seconds_per_batch,
+                    isomer_enum_only=isomer_enum_only,
+                )
+            except (Auto3DExecutionError, Auto3DUnavailableError) as exc:
+                mode = "gpu" if use_gpu else "cpu"
+                cause = failure_book_for(config.output_dir).record_failure(
+                    FINAL3D_STAGE, attempt, exc
+                )
+                errors.append(f"{attempt} ({mode}): {cause.short_note}")
     if _sdf_record_count(input_sdf) > 1:
         try:
-            return _run_final_auto3d_smaller_batches(
-                input_sdf,
-                output_dir,
-                config,
-            )
+            out_sdf, cmds = _run_final_auto3d_smaller_batches(input_sdf, group_dir, config, engine, isomer_enum_only=isomer_enum_only)
+            return out_sdf, cmds
         except (Auto3DExecutionError, Auto3DUnavailableError) as exc:
             errors.append(f"smaller_batches: {exc}")
     raise Auto3DExecutionError(
@@ -94,48 +249,13 @@ def _run_final_auto3d(
     )
 
 
-def _run_final_auto3d_with_model_fallback(
-    input_sdf: Path,
-    output_dir: Path,
-    config: RunConfig,
-    *,
-    use_gpu: bool,
-) -> tuple[Path, list[str]]:
-    try:
-        return run_auto3d(
-            input_sdf,
-            output_dir,
-            k=config.final_3d.k,
-            model=config.final_3d.optimizing_engine,
-            internal_tautomer_stereo_enum=False,
-            max_confs=config.final_3d.max_confs,
-            patience=config.final_3d.patience,
-            use_gpu=use_gpu,
-            stream_output=False,
-            timeout_s=config.final_3d.timeout_seconds_per_batch,
-        )
-    except (Auto3DExecutionError, Auto3DUnavailableError):
-        fallback = config.final_3d.fallback_optimizing_engine
-        if fallback == config.final_3d.optimizing_engine:
-            raise
-        return run_auto3d(
-            input_sdf,
-            output_dir,
-            k=config.final_3d.k,
-            model=fallback,
-            internal_tautomer_stereo_enum=False,
-            max_confs=config.final_3d.max_confs,
-            patience=config.final_3d.patience,
-            use_gpu=use_gpu,
-            stream_output=False,
-            timeout_s=config.final_3d.timeout_seconds_per_batch,
-        )
-
-
 def _run_final_auto3d_smaller_batches(
     input_sdf: Path,
     output_dir: Path,
     config: RunConfig,
+    primary_engine: str,
+    *,
+    isomer_enum_only: bool = False,
 ) -> tuple[Path, list[str]]:
     molecules = [
         mol
@@ -144,6 +264,8 @@ def _run_final_auto3d_smaller_batches(
     ]
     if len(molecules) <= 1:
         raise Auto3DExecutionError("smaller-batch retry requires at least two input variants")
+    overrides = config.auto3d.engine_element_overrides
+    chain = [primary_engine, *[other for other in _final_engine_order(config) if other != primary_engine]]
     split_dir = output_dir / "smaller_batches"
     split_dir.mkdir(parents=True, exist_ok=True)
     combined_sdf = split_dir / "auto3d_smaller_batches_combined.sdf"
@@ -158,21 +280,50 @@ def _run_final_auto3d_smaller_batches(
         writer = Chem.SDWriter(str(batch_input))
         writer.write(molecule)
         writer.close()
-        try:
-            output_sdf, command = _run_final_auto3d_with_model_fallback(
-                batch_input,
-                batch_dir,
-                config,
-                use_gpu=False,
+        done = False
+        for attempt in chain:
+            if not engine_supports_molecule(attempt, molecule, element_overrides=overrides):
+                continue
+            blocker = failure_book_for(config.output_dir).terminal_reference(
+                FINAL3D_STAGE, attempt
             )
-            commands.extend(str(part) for part in command)
-            for output_mol in Chem.SDMolSupplier(str(output_sdf), sanitize=True, removeHs=False):
-                if output_mol is None:
-                    continue
-                combined_writer.write(output_mol)
-                written += 1
-        except (Auto3DExecutionError, Auto3DUnavailableError) as exc:
-            errors.append(f"batch_{index:03d}: {exc}")
+            if blocker is not None:
+                errors.append(
+                    f"batch_{index:03d} ({attempt}): skipped per failure memory; {blocker.short_note}"
+                )
+                continue
+            try:
+                output_sdf, command = run_auto3d(
+                    batch_input,
+                    batch_dir,
+                    k=config.final_3d.k,
+                    model=attempt,
+                    internal_tautomer_stereo_enum=False,
+                    max_confs=config.final_3d.max_confs,
+                    patience=config.final_3d.patience,
+                    use_gpu=False,
+                    stream_output=False,
+                    timeout_s=config.final_3d.timeout_seconds_per_batch,
+                    isomer_enum_only=isomer_enum_only,
+                )
+                commands.extend(str(part) for part in command)
+                for output_mol in Chem.SDMolSupplier(str(output_sdf), sanitize=True, removeHs=False):
+                    if output_mol is None:
+                        continue
+                    combined_writer.write(output_mol)
+                    written += 1
+                done = True
+                break
+            except (Auto3DExecutionError, Auto3DUnavailableError) as exc:
+                cause = failure_book_for(config.output_dir).record_failure(
+                    FINAL3D_STAGE, attempt, exc
+                )
+                errors.append(f"batch_{index:03d} ({attempt}): {cause.short_note}")
+        if not done and all(
+            not engine_supports_molecule(attempt, molecule, element_overrides=overrides)
+            for attempt in chain
+        ):
+            errors.append(f"batch_{index:03d}: no configured engine supports this structure")
     combined_writer.close()
     if written == 0:
         raise Auto3DExecutionError(
@@ -200,11 +351,22 @@ def _sdf_record_count(path: Path) -> int:
     )
 
 
-def _write_final_auto3d_input(path: Path, records: list[StereoRecord]) -> None:
+def _write_final_auto3d_input(
+    path: Path,
+    records: list[StereoRecord],
+    stereo_plan: StereoPolicyPlan | None = None,
+) -> None:
+    by_id = {record.id: record for record in records}
     writer = Chem.SDWriter(str(path))
-    for record in records:
-        mol = Chem.Mol(record.rdkit_mol)
-        mol.SetProp("_Name", record.id)
+    if stereo_plan is not None:
+        # Policy-expanded entries; DSVR_STEREO_ID always carries the base id so
+        # outputs map back to the originating variant.
+        entries = [(by_id[base_id], mol, line_id) for base_id, mol, line_id in stereo_plan.expanded]
+    else:
+        entries = [(record, record.rdkit_mol, record.id) for record in records]
+    for record, source_mol, line_id in entries:
+        mol = Chem.Mol(source_mol)
+        mol.SetProp("_Name", line_id)
         mol.SetProp("DSVR_STEREO_ID", record.id)
         mol.SetProp("DSVR_INPUT_ID", record.input_molecule_id)
         mol.SetProp("DSVR_PARENT_TAUTOMER_ID", record.parent_id or "")
@@ -220,6 +382,8 @@ def _records_from_final_auto3d_output(
     stereo_records: list[StereoRecord],
     config: RunConfig,
     command: list[str],
+    *,
+    stereo_plan: StereoPolicyPlan | None = None,
 ) -> list[SeedConformerRecord]:
     stereo_by_id = {record.id: record for record in stereo_records}
     fallback = stereo_records[0] if len(stereo_records) == 1 else None
@@ -230,6 +394,9 @@ def _records_from_final_auto3d_output(
             continue
         stereo_id = _source_stereo_id(molecule)
         parent = stereo_by_id.get(stereo_id or "") or fallback
+        if parent is None and stereo_id and ISOMER_SUFFIX_SEPARATOR in stereo_id:
+            # Output from a policy-enumerated isomer line (<base_id>__st<n>).
+            parent = stereo_by_id.get(stereo_id.split(ISOMER_SUFFIX_SEPARATOR)[0]) or fallback
         if parent is None:
             continue
         energy, energy_prop = _extract_energy(molecule)
@@ -244,6 +411,7 @@ def _records_from_final_auto3d_output(
                 energy=energy,
                 energy_property=energy_prop,
                 fallback_reason=None,
+                stereo_plan=stereo_plan,
             )
         )
     return records
@@ -260,6 +428,7 @@ def _final_record_from_mol(
     energy: float | None,
     energy_property: str | None,
     fallback_reason: str | None,
+    stereo_plan: StereoPolicyPlan | None = None,
 ) -> SeedConformerRecord:
     canonical_smiles = Chem.MolToSmiles(molecule, canonical=True, isomericSmiles=False)
     isomeric_smiles = Chem.MolToSmiles(molecule, canonical=True, isomericSmiles=True)
@@ -281,6 +450,10 @@ def _final_record_from_mol(
     warnings = [FINAL_3D_WARNING]
     if fallback_reason:
         warnings.append(f"RDKit fallback final 3D conformer used: {fallback_reason}")
+    if stereo_plan is not None and stereo_plan.unspecified_ids:
+        metadata["final_3d"]["stereo_policy"] = policy_metadata(config, stereo_plan)
+        if parent.id in stereo_plan.unspecified_ids:
+            warnings.append(treatment_note(config, stereo_plan.treatment))
     return SeedConformerRecord(
         id=make_seed_id(parent.id, 1, canonical_smiles, isomeric_smiles, metadata),
         parent_id=parent.id,
@@ -326,11 +499,17 @@ def _fill_missing_with_rdkit(
     command: list[str],
     output_sdf: Path,
     reason: str,
+    reason_by_id: dict[str, str] | None = None,
+    stereo_plan: StereoPolicyPlan | None = None,
 ) -> tuple[list[SeedConformerRecord], list[str]]:
     observed = {record.parent_id for record in records if record.parent_id}
     missing = [record for record in stereo_records if record.id not in observed]
+    reasons = reason_by_id or {}
     fallback_records = [
-        _rdkit_final_record(record, config, command, output_sdf, reason) for record in missing
+        _rdkit_final_record(
+            record, config, command, output_sdf, reasons.get(record.id, reason), stereo_plan=stereo_plan
+        )
+        for record in missing
     ]
     warnings = [
         f"Auto3D produced no final conformer for {record.id}; used RDKit fallback."
@@ -345,6 +524,8 @@ def _rdkit_final_record(
     command: list[str],
     source_sdf: Path,
     reason: str,
+    *,
+    stereo_plan: StereoPolicyPlan | None = None,
 ) -> SeedConformerRecord:
     mol = Chem.AddHs(Chem.Mol(parent.rdkit_mol))
     params = AllChem.ETKDGv3() if hasattr(AllChem, "ETKDGv3") else AllChem.ETKDG()
@@ -365,6 +546,7 @@ def _rdkit_final_record(
         energy=energy,
         energy_property="rdkit_fallback_forcefield",
         fallback_reason=reason,
+        stereo_plan=stereo_plan,
     )
 
 

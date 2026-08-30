@@ -12,10 +12,26 @@ from rdkit import Chem
 from rdkit.Chem import rdMolDescriptors
 from rdkit.Chem.MolStandardize import rdMolStandardize
 
+from dsvr.chemistry.auto3d_stereo_policy import (
+    ISOMER_SUFFIX_SEPARATOR,
+    StereoPolicyPlan,
+    apply_stereo_policy,
+    policy_metadata,
+    treatment_note,
+)
 from dsvr.config import RunConfig
 from dsvr.models import ProtomerRecord, TautomerRecord, make_tautomer_id
-from dsvr.runners.auto3d_runner import Auto3DExecutionError, Auto3DUnavailableError, run_auto3d
+from dsvr.reporting.auto3d_diagnostics import bounded, failure_book_for
+from dsvr.runners.auto3d_runner import (
+    Auto3DExecutionError,
+    Auto3DUnavailableError,
+    engine_supports_molecule,
+    partition_by_engine,
+    run_auto3d,
+)
 from dsvr.utils.units import HARTREE_TO_KCAL_MOL
+
+TAUTOMER_STAGE = "tautomer_filtering"
 
 
 class Auto3DTautomerFilteringError(RuntimeError):
@@ -73,12 +89,13 @@ def filter_tautomers_with_auto3d(
 
     for protomer in protomer_records:
         candidates, candidate_warning = _enumerate_candidates(protomer, config)
-        ranked = _rank_or_fallback(protomer, candidates, config, output_dir, candidate_warning)
+        ranked, stereo_plan = _rank_or_fallback(protomer, candidates, config, output_dir, candidate_warning)
         records = _records_from_ranked(
             protomer,
             [item for item in ranked if item.selected],
             config,
             output_dir,
+            stereo_plan=stereo_plan,
         )
         selected_records.extend(records)
         _write_tautomer_sdf(output_dir / f"{protomer.id}_tautomers.sdf", records)
@@ -410,13 +427,13 @@ def _rank_or_fallback(
     config: RunConfig,
     output_dir: Path,
     candidate_warning: str | None,
-) -> list[_RankedCandidate]:
+) -> tuple[list[_RankedCandidate], StereoPolicyPlan | None]:
     if not candidates:
-        return []
+        return [], None
     if len(candidates) == 1:
-        return _single_candidate_rank(candidates[0], candidate_warning or "single RDKit tautomer candidate")
+        return _single_candidate_rank(candidates[0], candidate_warning or "single RDKit tautomer candidate"), None
     if not config.tautomer_filtering.enabled:
-        return _fallback_rank(candidates, "tautomer_filtering.enabled=false", config)
+        return _fallback_rank(candidates, "tautomer_filtering.enabled=false", config), None
     try:
         return _rank_with_auto3d(
             protomer,
@@ -426,10 +443,27 @@ def _rank_or_fallback(
             candidate_warning,
         )
     except (Auto3DExecutionError, Auto3DUnavailableError, Auto3DTautomerFilteringError) as exc:
-        reason = f"Auto3D tautomer filtering failed; RDKit fallback used: {exc}"
+        note = failure_book_for(config.output_dir).note_for_exception(
+            TAUTOMER_STAGE, str(config.tautomer_filtering.optimizing_engine), exc
+        )
+        reason = f"Auto3D tautomer filtering failed; RDKit fallback used: {note}"
         if candidate_warning:
             reason = f"{candidate_warning}; {reason}"
-        return _fallback_rank(candidates, reason, config)
+        return _fallback_rank(candidates, bounded(reason), config), None
+
+
+def _tautomer_engine_order(config: RunConfig) -> list[str]:
+    seen: list[str] = []
+    for engine in (
+        config.tautomer_filtering.optimizing_engine,
+        config.tautomer_filtering.fallback_optimizing_engine,
+        "AIMNet2",
+        "AIMNET",
+    ):
+        name = str(engine)
+        if name not in seen:
+            seen.append(name)
+    return seen
 
 
 def _rank_with_auto3d(
@@ -438,38 +472,147 @@ def _rank_with_auto3d(
     config: RunConfig,
     output_dir: Path,
     candidate_warning: str | None = None,
-) -> list[_RankedCandidate]:
+) -> tuple[list[_RankedCandidate], StereoPolicyPlan]:
+    overrides = config.auto3d.engine_element_overrides
+    engines = _tautomer_engine_order(config)
+    by_id = {candidate.tautomer_id: candidate for candidate in candidates}
+    plan = apply_stereo_policy(
+        [(candidate.tautomer_id, candidate.molecule) for candidate in candidates],
+        config,
+    )
+    assignments, incompatible_ids = partition_by_engine(
+        [(candidate.tautomer_id, candidate.molecule) for candidate in candidates],
+        engines,
+        element_overrides=overrides,
+    )
+    expanded_by_base: dict[str, list[tuple[str, Chem.Mol, str]]] = {}
+    for base_id, mol, line_id in plan.expanded:
+        expanded_by_base.setdefault(base_id, []).append((base_id, mol, line_id))
+    energies: dict[str, float] = {}
+    engine_by_id: dict[str, str] = {}
+    used_commands: list[list[str]] = []
+    errors: list[str] = []
+    used_engines: set[str] = set()
     with TemporaryDirectory(prefix=f"{protomer.id}_auto3d_tautomers_", dir=output_dir) as temp:
         workdir = Path(temp)
-        input_smi = workdir / "tautomer_candidates.smi"
-        input_smi.write_text(
-            "".join(f"{candidate.isomeric_smiles} {candidate.tautomer_id}\n" for candidate in candidates),
-            encoding="utf-8",
-        )
-        output_sdf, command = _run_auto3d_for_tautomers(input_smi, workdir, config)
-        energies = _read_auto3d_energies(output_sdf, candidates)
-        if not energies:
-            raise Auto3DTautomerFilteringError("Auto3D output SDF did not contain usable tautomer energies")
+        for engine, ids in assignments.items():
+            for wants_isomer_enum in (False, True):
+                subset_ids = [
+                    tautomer_id
+                    for tautomer_id in ids
+                    if (tautomer_id in plan.enumerate_isomer_for) == wants_isomer_enum
+                ]
+                if not subset_ids:
+                    continue
+                for attempt in [engine, *[other for other in engines if other != engine]]:
+                    supported = [
+                        by_id[tautomer_id]
+                        for tautomer_id in subset_ids
+                        if engine_supports_molecule(
+                            attempt, by_id[tautomer_id].molecule, element_overrides=overrides
+                        )
+                    ]
+                    if not supported:
+                        continue
+                    blocker = failure_book_for(config.output_dir).terminal_reference(
+                        TAUTOMER_STAGE, attempt
+                    )
+                    if blocker is not None:
+                        errors.append(
+                            f"{attempt}: skipped per failure memory; {blocker.short_note}"
+                        )
+                        continue
+                    try:
+                        output_sdf, command = _run_auto3d_for_group(
+                            workdir,
+                            attempt,
+                            supported,
+                            config,
+                            isomer_enum_only=wants_isomer_enum,
+                            expanded_by_base=expanded_by_base,
+                        )
+                    except (Auto3DExecutionError, Auto3DUnavailableError) as exc:
+                        # One invocation per engine per group; a proven-incompatible
+                        # engine is never retried for those structures (the attempt
+                        # chain simply advances to the next supporting engine).
+                        cause = failure_book_for(config.output_dir).record_failure(
+                            TAUTOMER_STAGE, attempt, exc
+                        )
+                        errors.append(f"{attempt}: {cause.short_note}")
+                        continue
+                    # Energies of policy-enumerated isomers aggregate back to
+                    # their base tautomer (minimum energy).
+                    for base_id, energy in _read_auto3d_energies_by_line_id(output_sdf).items():
+                        base_id = base_id.split(ISOMER_SUFFIX_SEPARATOR)[0]
+                        previous = energies.get(base_id)
+                        if previous is None or energy < previous:
+                            energies[base_id] = energy
+                    used_commands.append(command)
+                    used_engines.add(attempt)
+                    engine_by_id.update({candidate.tautomer_id: attempt for candidate in supported})
+                    break
     ranked = sorted(
         ((energy, candidate.isomeric_smiles, candidate) for candidate in candidates if (energy := energies.get(candidate.tautomer_id)) is not None),
         key=lambda item: (item[0], item[1]),
     )
     if not ranked:
-        raise Auto3DTautomerFilteringError("Auto3D did not emit energies for any RDKit tautomer candidate")
+        detail = "Auto3D did not emit energies for any RDKit tautomer candidate"
+        if errors:
+            detail += ". " + _summarize_attempt_errors(errors)
+        raise Auto3DTautomerFilteringError(detail)
     minimum = ranked[0][0]
     selected_ids = _selected_candidate_ids(ranked, config)
     selected_ids = _rescue_input_tautomer(selected_ids, ranked, candidates, config)
+    # Candidates no configured engine supports never reached Auto3D; they are
+    # retained via the RDKit fallback rule instead of being energy-rejected.
+    incompatible_candidates = [by_id[tautomer_id] for tautomer_id in incompatible_ids]
+    incompatible_selected = (
+        _fallback_selected_ids(incompatible_candidates, config) if incompatible_candidates else set()
+    )
+    budget = max(config.tautomer_filtering.tauto_k - len(incompatible_selected), 0)
+    if len(selected_ids) > budget:
+        ordered = [
+            candidate.tautomer_id
+            for _energy, _smiles, candidate in sorted(ranked, key=lambda item: (item[0], item[1]))
+            if candidate.tautomer_id in selected_ids
+        ]
+        selected_ids = set(ordered[:budget])
     rank_by_id = {candidate.tautomer_id: rank for rank, (_energy, _smiles, candidate) in enumerate(ranked, start=1)}
-    command_text = " ".join(str(part) for part in command)
+    command_text = " ;; ".join(" ".join(str(part) for part in command) for command in used_commands)
     warning_items = tuple(
         item
-        for item in (candidate_warning, f"Auto3D command: {command_text}")
+        for item in (candidate_warning, f"Auto3D command: {command_text}" if command_text else None)
         if item
+    )
+    if len(used_engines) > 1:
+        warning_items = (
+            *warning_items,
+            "Tautomer energies span multiple Auto3D engines "
+            f"({', '.join(sorted(used_engines))}); cross-engine energy comparison is approximate.",
+        )
+    incompatible_note = "auto3d_failed:ENGINE_INCOMPATIBLE (no configured engine supports this structure; RDKit fallback used)"
+    treated_note = (
+        treatment_note(config, plan.treatment) if plan.unspecified_ids else None
     )
     results: list[_RankedCandidate] = []
     for candidate in candidates:
         energy = energies.get(candidate.tautomer_id)
         relative = None if energy is None else energy - minimum
+        if candidate.tautomer_id in incompatible_ids:
+            selected = candidate.tautomer_id in incompatible_selected
+            results.append(
+                _RankedCandidate(
+                    candidate=candidate,
+                    energy_kcal_mol=None,
+                    relative_energy_kcal_mol=None,
+                    auto3d_rank=None,
+                    selected=selected,
+                    reason="selected_by_rdkit_fallback" if selected else "rejected_by_rdkit_fallback",
+                    source="rdkit_fallback",
+                    warnings=(*warning_items, incompatible_note),
+                )
+            )
+            continue
         selected = candidate.tautomer_id in selected_ids
         if energy is None:
             reason = "rejected_missing_auto3d_energy"
@@ -477,6 +620,9 @@ def _rank_with_auto3d(
             reason = "selected_by_auto3d_energy_filter"
         else:
             reason = "rejected_by_auto3d_energy_filter"
+        candidate_warnings = warning_items
+        if treated_note and candidate.tautomer_id in plan.unspecified_ids:
+            candidate_warnings = (*warning_items, treated_note)
         results.append(
             _RankedCandidate(
                 candidate=candidate,
@@ -486,73 +632,75 @@ def _rank_with_auto3d(
                 selected=selected,
                 reason=reason,
                 source="auto3d",
-                warnings=warning_items,
+                warnings=candidate_warnings,
             )
         )
-    return results
+    return results, plan
 
 
-def _run_auto3d_for_tautomers(input_smi: Path, workdir: Path, config: RunConfig) -> tuple[Path, list[str]]:
-    errors: list[str] = []
-    engines = [
-        config.tautomer_filtering.optimizing_engine,
-        config.tautomer_filtering.fallback_optimizing_engine,
-        "AIMNet2",
-        "AIMNET",
-    ]
-    seen: set[str] = set()
-    for engine in engines:
-        engine_name = str(engine)
-        if engine_name in seen:
-            continue
-        seen.add(engine_name)
-        try:
-            return run_auto3d(
-                input_smi,
-                workdir / f"auto3d_{engine_name}",
-                k=config.tautomer_filtering.auto3d_max_confs_per_tautomer,
-                model=engine_name,
-                internal_tautomer_stereo_enum=False,
-                max_confs=config.tautomer_filtering.auto3d_max_confs_per_tautomer,
-                patience=config.tautomer_filtering.auto3d_patience,
-                use_gpu=config.tautomer_filtering.use_gpu,
-            )
-        except (Auto3DExecutionError, Auto3DUnavailableError) as exc:
-            errors.append(f"{engine_name}: {exc}")
-    raise Auto3DExecutionError("Auto3D tautomer ranking failed. Tried engines:\n" + "\n".join(errors))
+def _summarize_attempt_errors(errors: list[str]) -> str:
+    heads = [error.splitlines()[0] for error in errors if error.strip()]
+    return "Attempts: " + " | ".join(heads)
 
 
-def _read_auto3d_energies(output_sdf: Path, candidates: list[_Candidate]) -> dict[str, float]:
-    by_id = {candidate.tautomer_id: candidate for candidate in candidates}
-    by_smiles = {candidate.isomeric_smiles: candidate for candidate in candidates}
+def _run_auto3d_for_group(
+    workdir: Path,
+    engine_name: str,
+    group: list[_Candidate],
+    config: RunConfig,
+    *,
+    isomer_enum_only: bool = False,
+    expanded_by_base: dict[str, list[tuple[str, Chem.Mol, str]]] | None = None,
+) -> tuple[Path, list[str]]:
+    suffix = "_isomerenum" if isomer_enum_only else ""
+    input_smi = workdir / f"tautomer_candidates_{engine_name}{suffix}.smi"
+    lines: list[str] = []
+    for candidate in group:
+        entries = (expanded_by_base or {}).get(candidate.tautomer_id) or [
+            (candidate.tautomer_id, candidate.molecule, candidate.tautomer_id)
+        ]
+        for _base_id, mol, line_id in entries:
+            smiles = Chem.MolToSmiles(mol, canonical=True, isomericSmiles=True)
+            lines.append(f"{smiles} {line_id}\n")
+    input_smi.write_text("".join(lines), encoding="utf-8")
+    return run_auto3d(
+        input_smi,
+        workdir / f"auto3d_{engine_name}{suffix}",
+        k=config.tautomer_filtering.auto3d_max_confs_per_tautomer,
+        model=engine_name,
+        internal_tautomer_stereo_enum=False,
+        max_confs=config.tautomer_filtering.auto3d_max_confs_per_tautomer,
+        patience=config.tautomer_filtering.auto3d_patience,
+        use_gpu=config.tautomer_filtering.use_gpu,
+        timeout_s=config.tautomer_filtering.timeout_seconds_per_protomer,
+        isomer_enum_only=isomer_enum_only,
+    )
+
+
+def _read_auto3d_energies_by_line_id(output_sdf: Path) -> dict[str, float]:
+    """Energy per Auto3D input line id (names preserved from the .smi input)."""
+
     energies: dict[str, float] = {}
     supplier = Chem.SDMolSupplier(str(output_sdf), sanitize=True, removeHs=False)
     for molecule in supplier:
         if molecule is None:
             continue
-        candidate = _match_candidate(molecule, by_id, by_smiles)
-        if candidate is None:
+        line_id = None
+        for key in ("DSVR_TAUTOMER_ID", "tautomer_id", "ID", "_Name"):
+            if molecule.HasProp(key):
+                value = molecule.GetProp(key).strip()
+                line_id = value.split()[0] if value else ""
+                if line_id:
+                    break
+        if not line_id:
             continue
         energy = _energy_from_mol(molecule)
         if energy is None:
             continue
-        previous = energies.get(candidate.tautomer_id)
+        previous = energies.get(line_id)
         if previous is None or energy < previous:
-            energies[candidate.tautomer_id] = energy
+            energies[line_id] = energy
     return energies
-
-
-def _match_candidate(molecule: Chem.Mol, by_id: dict[str, _Candidate], by_smiles: dict[str, _Candidate]) -> _Candidate | None:
-    for key in ("DSVR_TAUTOMER_ID", "tautomer_id", "ID", "_Name"):
-        if molecule.HasProp(key):
-            value = molecule.GetProp(key).strip()
-            if value in by_id:
-                return by_id[value]
-            token = value.split()[0] if value else ""
-            if token in by_id:
-                return by_id[token]
-    smiles = Chem.MolToSmiles(Chem.RemoveHs(molecule), canonical=True, isomericSmiles=True)
-    return by_smiles.get(smiles)
 
 
 def _energy_from_mol(molecule: Chem.Mol) -> float | None:
@@ -691,7 +839,14 @@ def _fallback_selected_ids(candidates: list[_Candidate], config: RunConfig) -> s
     return selected
 
 
-def _records_from_ranked(protomer: ProtomerRecord, ranked: list[_RankedCandidate], config: RunConfig, output_dir: Path) -> list[TautomerRecord]:
+def _records_from_ranked(
+    protomer: ProtomerRecord,
+    ranked: list[_RankedCandidate],
+    config: RunConfig,
+    output_dir: Path,
+    *,
+    stereo_plan: StereoPolicyPlan | None = None,
+) -> list[TautomerRecord]:
     records: list[TautomerRecord] = []
     selected = sorted(
         ranked,
@@ -716,6 +871,8 @@ def _records_from_ranked(protomer: ProtomerRecord, ranked: list[_RankedCandidate
                 "optimizing_engine": config.tautomer_filtering.optimizing_engine,
             }
         }
+        if stereo_plan is not None and stereo_plan.unspecified_ids:
+            metadata["auto3d_tautomer_filtering"]["stereo_policy"] = policy_metadata(config, stereo_plan)
         records.append(
             TautomerRecord(
                 id=candidate.tautomer_id,

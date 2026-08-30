@@ -200,3 +200,113 @@ def test_energy_from_mol_reads_auto3d_v3_total_energy():
     assert _energy_from_mol(mol3) == pytest.approx(1.5)
 
     assert _energy_from_mol(Chem.MolFromSmiles("CCO")) is None
+
+
+def _candidate(protomer: ProtomerRecord, index: int, smiles: str):
+    from dsvr.chemistry.tautomer_auto3d_filter import _Candidate
+    from dsvr.models import make_tautomer_id
+
+    mol = Chem.MolFromSmiles(smiles)
+    canonical = Chem.MolToSmiles(mol, canonical=True, isomericSmiles=False)
+    isomeric = Chem.MolToSmiles(mol, canonical=True, isomericSmiles=True)
+    metadata = {"auto3d_tautomer_filtering": True, "tautomer_filtering_stage": "pre_stereo"}
+    return _Candidate(
+        index=index,
+        tautomer_id=make_tautomer_id(protomer.id, index, canonical, isomeric, metadata),
+        molecule=mol,
+        canonical_smiles=canonical,
+        isomeric_smiles=isomeric,
+        rdkit_score=0.0,
+        is_input_tautomer=index == 1,
+        is_canonical_tautomer=index == 1,
+    )
+
+
+def test_mixed_engine_batch_is_split_per_engine(tmp_path, monkeypatch) -> None:
+    """Task 2.3: an ANI2xt-configured batch containing an AIMNET-only
+    (charged) candidate runs one sub-batch per engine."""
+
+    protomer = _protomer("CC(=O)O")
+    neutral = _candidate(protomer, 2, "C=C(O)O")
+    charged = _candidate(protomer, 3, "CC(=O)[O-]")
+    input_form = _candidate(protomer, 1, "CC(=O)O")
+    candidates = [input_form, neutral, charged]
+    monkeypatch.setattr(
+        tautomer_filter, "_enumerate_candidates", lambda *a, **k: (candidates, None)
+    )
+    calls: list[tuple[str, list[str]]] = []
+
+    def fake_auto3d(input_path: Path, output_dir: Path, **kwargs):
+        lines = input_path.read_text(encoding="utf-8").splitlines()
+        calls.append((kwargs["model"], [line.split()[0] for line in lines]))
+        output_dir.mkdir(parents=True, exist_ok=True)
+        output_sdf = output_dir / "mock.sdf"
+        writer = Chem.SDWriter(str(output_sdf))
+        for line in lines:
+            smiles, tautomer_id = line.split(maxsplit=1)
+            mol = Chem.MolFromSmiles(smiles)
+            mol.SetProp("_Name", tautomer_id)
+            mol.SetProp("E_kcal_mol", "0.0")
+            writer.write(mol)
+        writer.close()
+        return output_sdf, ["auto3d", "run", "--engine", kwargs["model"]]
+
+    monkeypatch.setattr(tautomer_filter, "run_auto3d", fake_auto3d)
+    config = RunConfig(output_dir=tmp_path / "run")
+
+    records = filter_tautomers_with_auto3d([protomer], config)
+
+    engines_used = [model for model, _smiles in calls]
+    assert engines_used == ["ANI2xt", "AIMNET"]
+    assert len(calls[0][1]) == 2  # neutral sub-batch
+    assert calls[1][1] == ["CC(=O)[O-]"]  # charged sub-batch only
+    assert len(records) >= 1
+    ranked_csv = (tmp_path / "run" / "enumeration" / "tautomers" / "tautomers_auto3d_ranked.csv").read_text(
+        encoding="utf-8"
+    )
+    assert "cross-engine energy comparison is approximate" in ranked_csv
+
+
+def test_candidate_unsupported_by_all_engines_uses_rdkit_fallback(tmp_path, monkeypatch) -> None:
+    """Task 2.1/2.2: a molecule no configured engine supports is never offered
+    to Auto3D and is retained via the recorded RDKit fallback."""
+
+    protomer = _protomer("CC(=O)O")
+    neutral = _candidate(protomer, 1, "CC(=O)O")
+    # Lithium keeps the structure outside every engine's element set.
+    lithium = _candidate(protomer, 2, "[Li+].[O-]C=C")
+    candidates = [neutral, lithium]
+    monkeypatch.setattr(
+        tautomer_filter, "_enumerate_candidates", lambda *a, **k: (candidates, None)
+    )
+    models_seen: list[str] = []
+
+    def fake_auto3d(input_path: Path, output_dir: Path, **kwargs):
+        models_seen.append(kwargs["model"])
+        lines = input_path.read_text(encoding="utf-8").splitlines()
+        output_dir.mkdir(parents=True, exist_ok=True)
+        output_sdf = output_dir / "mock.sdf"
+        writer = Chem.SDWriter(str(output_sdf))
+        for line in lines:
+            smiles, tautomer_id = line.split(maxsplit=1)
+            mol = Chem.MolFromSmiles(smiles)
+            mol.SetProp("_Name", tautomer_id)
+            mol.SetProp("E_kcal_mol", "0.0")
+            writer.write(mol)
+        writer.close()
+        return output_sdf, ["auto3d", "run"]
+
+    monkeypatch.setattr(tautomer_filter, "run_auto3d", fake_auto3d)
+    config = RunConfig(output_dir=tmp_path / "run")
+
+    records = filter_tautomers_with_auto3d([protomer], config)
+
+    lithium_record = next((r for r in records if "Li" in r.isomeric_smiles), None)
+    assert lithium_record is not None, records
+    assert lithium_record.source_software == "rdkit_fallback"
+    assert any("ENGINE_INCOMPATIBLE" in warning for warning in lithium_record.warnings)
+    for model in models_seen:
+        for smiles_line in ("[Li+]",):
+            assert smiles_line not in model  # lithium never offered to any engine
+    # One real invocation for the neutral candidate only
+    assert len(models_seen) == 1

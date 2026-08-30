@@ -110,3 +110,22 @@ def _stereo(smiles: str, suffix: str, stereo_index: int) -> StereoRecord:
         stereo_index=stereo_index,
         rdkit_mol=mol,
     )
+
+
+def test_stereo_energy_from_mol_reads_auto3d_v3_total_energy():
+    """Regression test: Auto3D v3 provides only E_tot(Hartree) — the stereo
+    stage must convert it, not fall back to no usable energies."""
+
+    from rdkit import Chem
+
+    from dsvr.chemistry.stereo_auto3d_filter import _energy_from_mol
+    from dsvr.utils.units import HARTREE_TO_KCAL_MOL
+
+    mol = Chem.MolFromSmiles("CCO")
+    mol.SetProp("E_tot(Hartree)", "-154.0")
+    assert _energy_from_mol(mol) == -154.0 * HARTREE_TO_KCAL_MOL
+
+    mol2 = Chem.MolFromSmiles("CCO")
+    mol2.SetProp("E_kcal_mol", "-96000.0")
+    mol2.SetProp("E_tot(Hartree)", "-154.0")
+    assert _energy_from_mol(mol2) == -96000.0  # explicit kcal/mol wins

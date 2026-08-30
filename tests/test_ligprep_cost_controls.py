@@ -147,8 +147,9 @@ def test_final_auto3d_gpu_failure_retries_cpu(tmp_path: Path, monkeypatch) -> No
     monkeypatch.setattr("dsvr.chemistry.final3d.run_auto3d", fake_run_auto3d)
     result = generate_final_3d_variants([_stereo_record(_tautomer_record(_protomer_record("CCO"), 1), 1)], RunConfig(output_dir=tmp_path / "run"))
 
-    assert calls[:2] == [True, True]
-    assert calls[-1] is False
+    # CUDA failure on GPU retries the same engine on CPU immediately; no
+    # pointless second engine attempt on the already-failed GPU mode.
+    assert calls == [True, False]
     assert result.used_fallback is False
     assert result.records[0].source_software == "auto3d"
 
@@ -174,7 +175,7 @@ def test_final_auto3d_batch_failure_retries_smaller_batches(tmp_path: Path, monk
     assert batch_sizes[:2] == [2, 2]
     assert batch_sizes[-2:] == [1, 1]
     assert len(result.records) == 2
-    assert (tmp_path / "run" / "final_3d" / "smaller_batches").exists()
+    assert (tmp_path / "run" / "final_3d" / "engine_AIMNET" / "plain" / "smaller_batches").exists()
 
 
 def test_local_agent_default_disabled_and_mocked_enabled_path(monkeypatch) -> None:

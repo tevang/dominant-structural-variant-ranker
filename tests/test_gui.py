@@ -291,6 +291,21 @@ def test_smiles_to_svg_valid_and_invalid() -> None:
     assert smiles_to_svg("") is None
 
 
+def test_artifact_path_resolution_refuses_run_dir_escape(tmp_path: Path) -> None:
+    """S1 regression test: tampered artifact paths must not escape the run dir."""
+
+    from dsvr.gui.ui.views import _resolve_artifact_path
+
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    inside = run_dir / "progress.jsonl"
+    inside.write_text("{}\n", encoding="utf-8")
+    assert _resolve_artifact_path(run_dir, "progress.jsonl") == inside
+    assert _resolve_artifact_path(run_dir, "sub/../progress.jsonl") == inside
+    assert _resolve_artifact_path(run_dir, "../../etc/passwd") is None
+    assert _resolve_artifact_path(run_dir, "/etc/passwd") is None
+
+
 # --- streamlit views (skip when streamlit not installed) ---
 
 pytest.importorskip("streamlit", reason="streamlit is not installed")

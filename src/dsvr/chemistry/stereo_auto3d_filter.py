@@ -9,9 +9,26 @@ from typing import Any
 
 from rdkit import Chem
 
+from dsvr.chemistry.auto3d_stereo_policy import (
+    ISOMER_SUFFIX_SEPARATOR,
+    StereoPolicyPlan,
+    apply_stereo_policy,
+    policy_metadata,
+    treatment_note,
+)
 from dsvr.config import RunConfig
 from dsvr.models import StereoRecord
-from dsvr.runners.auto3d_runner import Auto3DExecutionError, Auto3DUnavailableError, run_auto3d
+from dsvr.reporting.auto3d_diagnostics import bounded, failure_book_for
+from dsvr.runners.auto3d_runner import (
+    Auto3DExecutionError,
+    Auto3DUnavailableError,
+    engine_supports_molecule,
+    partition_by_engine,
+    run_auto3d,
+)
+from dsvr.utils.units import HARTREE_TO_KCAL_MOL
+
+STEREO_STAGE = "stereo_filtering"
 
 
 @dataclass(frozen=True)
@@ -54,19 +71,22 @@ def filter_stereoisomers_with_auto3d(
 
     representative_by_id = _enantiomer_representatives(records, config)
     representatives = _representative_records(records, representative_by_id)
-    energies, command, warning = _rank_representatives_with_auto3d(representatives, config, output_dir)
+    energies, command, warning, incompatible_ids, stereo_plan = _rank_representatives_with_auto3d(
+        representatives, config, output_dir
+    )
     decisions = _decisions_from_energies(
         records,
         representative_by_id,
         energies,
         command=command,
         fallback_warning=warning,
+        incompatible_ids=incompatible_ids,
         config=config,
     )
     selected_ids = {decision.stereo_id for decision in decisions if decision.selected}
     rejected_ids = {decision.stereo_id for decision in decisions if not decision.selected}
-    selected = [_annotated_record(record, _decision_for(record.id, decisions)) for record in records if record.id in selected_ids]
-    rejected = [_annotated_record(record, _decision_for(record.id, decisions)) for record in records if record.id in rejected_ids]
+    selected = [_annotated_record(record, _decision_for(record.id, decisions), config, stereo_plan) for record in records if record.id in selected_ids]
+    rejected = [_annotated_record(record, _decision_for(record.id, decisions), config, stereo_plan) for record in records if record.id in rejected_ids]
     selected_by_id = {record.id: record for record in selected}
     rejected_by_id = {record.id: record for record in rejected}
     all_records = [selected_by_id.get(record.id) or rejected_by_id.get(record.id) or record for record in records]
@@ -101,39 +121,153 @@ def write_stereo_energy_outputs(path: Path, result: StereoEnergyFilteringResult)
         _copy_text(path / name, path.parent / name)
 
 
+def _stereo_engine_order(config: RunConfig) -> list[str]:
+    seen: list[str] = []
+    for engine in (
+        config.final_3d.optimizing_engine,
+        config.final_3d.fallback_optimizing_engine,
+        "AIMNet2",
+        "AIMNET",
+    ):
+        name = str(engine)
+        if name not in seen:
+            seen.append(name)
+    return seen
+
+
 def _rank_representatives_with_auto3d(
     records: list[StereoRecord],
     config: RunConfig,
     output_dir: Path,
-) -> tuple[dict[str, float], list[str], str | None]:
+) -> tuple[dict[str, float], list[str], str | None, set[str], StereoPolicyPlan]:
+    valid_items = [
+        (record.id, mol) for record, mol in zip(records, (_mol(record) for record in records), strict=True) if mol is not None
+    ]
+    plan = apply_stereo_policy(valid_items, config)
     if not config.stereoisomer_filtering.enabled:
-        return {}, [], "stereoisomer_filtering.enabled=false; retained all stereoisomers"
+        return {}, [], "stereoisomer_filtering.enabled=false; retained all stereoisomers", set(), plan
     if not records:
-        return {}, [], None
+        return {}, [], None, set(), plan
+    overrides = config.auto3d.engine_element_overrides
+    engines = _stereo_engine_order(config)
+    mol_by_id = {record.id: _mol(record) for record in records}
+    expanded_by_base: dict[str, list[tuple[str, Chem.Mol, str]]] = {}
+    for base_id, mol, line_id in plan.expanded:
+        expanded_by_base.setdefault(base_id, []).append((base_id, mol, line_id))
+    assignments, incompatible = partition_by_engine(
+        valid_items,
+        engines,
+        element_overrides=overrides,
+    )
+    incompatible_ids = set(incompatible)
+    energies: dict[str, float] = {}
+    commands: list[list[str]] = []
+    errors: list[str] = []
     try:
         with TemporaryDirectory(prefix="auto3d_stereo_", dir=output_dir) as temp:
             workdir = Path(temp)
-            input_smi = workdir / "stereo_representatives.smi"
-            input_smi.write_text(
-                "".join(f"{record.isomeric_smiles or record.canonical_smiles} {record.id}\n" for record in records),
-                encoding="utf-8",
-            )
-            output_sdf, command = run_auto3d(
-                input_smi,
-                workdir / "auto3d",
-                k=1,
-                model=str(config.final_3d.optimizing_engine),
-                internal_tautomer_stereo_enum=False,
-                max_confs=1,
-                patience=config.final_3d.patience,
-                use_gpu=config.final_3d.use_gpu,
-            )
-            energies = _read_auto3d_energies(output_sdf, records)
-            if not energies:
-                raise Auto3DExecutionError("Auto3D stereo filtering emitted no usable energies")
-            return energies, command, None
+            for engine, ids in assignments.items():
+                for wants_isomer_enum in (False, True):
+                    subset_ids = [
+                        record_id
+                        for record_id in ids
+                        if (record_id in plan.enumerate_isomer_for) == wants_isomer_enum
+                    ]
+                    if not subset_ids:
+                        continue
+                    for attempt in [engine, *[other for other in engines if other != engine]]:
+                        supported = [
+                            record_id
+                            for record_id in subset_ids
+                            if engine_supports_molecule(
+                                attempt, mol_by_id[record_id], element_overrides=overrides
+                            )
+                        ]
+                        if not supported:
+                            continue
+                        blocker = failure_book_for(config.output_dir).terminal_reference(
+                            STEREO_STAGE, attempt
+                        )
+                        if blocker is not None:
+                            errors.append(
+                                f"{attempt}: skipped per failure memory; {blocker.short_note}"
+                            )
+                            continue
+                        suffix = "_isomerenum" if wants_isomer_enum else ""
+                        input_smi = workdir / f"stereo_representatives_{attempt}{suffix}.smi"
+                        lines: list[str] = []
+                        for record_id in supported:
+                            for _base, mol, line_id in expanded_by_base.get(record_id, []):
+                                smiles = Chem.MolToSmiles(mol, canonical=True, isomericSmiles=True)
+                                lines.append(f"{smiles} {line_id}\n")
+                        input_smi.write_text("".join(lines), encoding="utf-8")
+                        try:
+                            output_sdf, command = run_auto3d(
+                                input_smi,
+                                workdir / f"auto3d_{attempt}{suffix}",
+                                k=1,
+                                model=attempt,
+                                internal_tautomer_stereo_enum=False,
+                                max_confs=1,
+                                patience=config.final_3d.patience,
+                                use_gpu=config.final_3d.use_gpu,
+                                isomer_enum_only=wants_isomer_enum,
+                            )
+                        except (Auto3DExecutionError, Auto3DUnavailableError) as exc:
+                            cause = failure_book_for(config.output_dir).record_failure(
+                                STEREO_STAGE, attempt, exc
+                            )
+                            errors.append(f"{attempt}: {cause.short_note}")
+                            continue
+                        # Policy-enumerated isomers aggregate back to their base
+                        # stereoisomer record (minimum energy).
+                        for line_id, energy in _read_auto3d_energies_by_line_id(output_sdf).items():
+                            base_id = line_id.split(ISOMER_SUFFIX_SEPARATOR)[0]
+                            previous = energies.get(base_id)
+                            if previous is None or energy < previous:
+                                energies[base_id] = energy
+                        commands.append(command)
+                        break
+        if not energies:
+            detail = "Auto3D stereo filtering emitted no usable energies"
+            if errors:
+                detail += ": " + " | ".join(error.splitlines()[0] for error in errors)
+            raise Auto3DExecutionError(detail)
+        command_line = [part for command in commands for part in command] if commands else []
+        return energies, command_line, None, incompatible_ids, plan
     except (Auto3DExecutionError, Auto3DUnavailableError) as exc:
-        return {}, [], f"Auto3D stereoisomer energy filtering failed; retained all stereoisomers: {exc}"
+        note = failure_book_for(config.output_dir).note_for_exception(
+            STEREO_STAGE, str(config.final_3d.optimizing_engine), exc
+        )
+        return {}, [], bounded(
+            f"Auto3D stereoisomer energy filtering failed; retained all stereoisomers: {note}"
+        ), incompatible_ids, plan
+
+
+def _read_auto3d_energies_by_line_id(output_sdf: Path) -> dict[str, float]:
+    """Energy per Auto3D input line id (names preserved from the .smi input)."""
+
+    energies: dict[str, float] = {}
+    supplier = Chem.SDMolSupplier(str(output_sdf), sanitize=True, removeHs=False)
+    for molecule in supplier:
+        if molecule is None:
+            continue
+        line_id = None
+        for key in ("DSVR_STEREO_ID", "stereo_id", "ID", "_Name"):
+            if molecule.HasProp(key):
+                value = molecule.GetProp(key).strip()
+                line_id = value.split()[0] if value else ""
+                if line_id:
+                    break
+        if not line_id:
+            continue
+        energy = _energy_from_mol(molecule)
+        if energy is None:
+            continue
+        previous = energies.get(line_id)
+        if previous is None or energy < previous:
+            energies[line_id] = energy
+    return energies
 
 
 def _decisions_from_energies(
@@ -143,12 +277,14 @@ def _decisions_from_energies(
     *,
     command: list[str],
     fallback_warning: str | None,
+    incompatible_ids: set[str] | None = None,
     config: RunConfig,
 ) -> list[StereoEnergyDecision]:
     grouped: dict[str | None, list[StereoRecord]] = defaultdict(list)
     for record in records:
         grouped[record.parent_id].append(record)
 
+    incompatible = incompatible_ids or set()
     selected_ids: set[str] = set()
     rank_by_id: dict[str, int] = {}
     relative_by_id: dict[str, float | None] = {}
@@ -162,7 +298,9 @@ def _decisions_from_energies(
         )
         finite = [energies[rid] for rid in ranked_reps if energies.get(rid) is not None]
         minimum = min(finite) if finite else None
-        selected_reps: set[str] = set()
+        # Engine-incompatible representatives never reached Auto3D; they are
+        # retained via the declared fallback instead of energy-rejected.
+        selected_reps: set[str] = {rid for rid in ranked_reps if rid in incompatible}
         if fallback_warning or minimum is None:
             selected_reps = set(ranked_reps)
         else:
@@ -188,9 +326,12 @@ def _decisions_from_energies(
                 relative_by_id[record.id] = relative
                 if representative_id in selected_reps:
                     selected_ids.add(record.id)
-                    reason_by_id[record.id] = (
-                        "selected_without_auto3d_energy" if fallback_warning else "selected_by_auto3d_stereo_energy"
-                    )
+                    if representative_id in incompatible and not fallback_warning:
+                        reason_by_id[record.id] = "retained_engine_incompatible_rdkit_fallback"
+                    else:
+                        reason_by_id[record.id] = (
+                            "selected_without_auto3d_energy" if fallback_warning else "selected_by_auto3d_stereo_energy"
+                        )
                 elif energy is None:
                     reason_by_id[record.id] = "rejected_missing_auto3d_stereo_energy"
                 else:
@@ -298,43 +439,6 @@ def _mol(record: StereoRecord) -> Chem.Mol | None:
     return None
 
 
-def _read_auto3d_energies(output_sdf: Path, records: list[StereoRecord]) -> dict[str, float]:
-    by_id = {record.id: record for record in records}
-    by_smiles = {record.isomeric_smiles: record for record in records if record.isomeric_smiles}
-    energies: dict[str, float] = {}
-    supplier = Chem.SDMolSupplier(str(output_sdf), sanitize=True, removeHs=False)
-    for molecule in supplier:
-        if molecule is None:
-            continue
-        record = _match_record(molecule, by_id, by_smiles)
-        if record is None:
-            continue
-        energy = _energy_from_mol(molecule)
-        if energy is None:
-            continue
-        previous = energies.get(record.id)
-        if previous is None or energy < previous:
-            energies[record.id] = energy
-    return energies
-
-
-def _match_record(
-    molecule: Chem.Mol,
-    by_id: dict[str, StereoRecord],
-    by_smiles: dict[str, StereoRecord],
-) -> StereoRecord | None:
-    for key in ("DSVR_STEREO_ID", "stereo_id", "ID", "_Name"):
-        if molecule.HasProp(key):
-            value = molecule.GetProp(key).strip()
-            if value in by_id:
-                return by_id[value]
-            token = value.split()[0] if value else ""
-            if token in by_id:
-                return by_id[token]
-    smiles = Chem.MolToSmiles(Chem.RemoveHs(molecule), canonical=True, isomericSmiles=True)
-    return by_smiles.get(smiles)
-
-
 def _energy_from_mol(molecule: Chem.Mol) -> float | None:
     for key in (
         "E_kcal_mol",
@@ -350,10 +454,31 @@ def _energy_from_mol(molecule: Chem.Mol) -> float | None:
                 return float(molecule.GetProp(key))
             except ValueError:
                 continue
+    # Auto3D v3 writes the absolute total electronic energy as
+    # "E_tot"/"E_tot(Hartree)" in Hartree. Representatives ranked here belong
+    # to the same tautomer (same formula), so absolute energies are
+    # comparable; "E_rel(kcal/mol)" is relative to each molecule's own best
+    # conformer and carries almost no signal across structures.
+    for key in ("E_tot(Hartree)", "E_tot"):
+        if molecule.HasProp(key):
+            try:
+                return float(molecule.GetProp(key)) * HARTREE_TO_KCAL_MOL
+            except ValueError:
+                continue
+    if molecule.HasProp("E_rel(kcal/mol)"):
+        try:
+            return float(molecule.GetProp("E_rel(kcal/mol)"))
+        except ValueError:
+            pass
     return None
 
 
-def _annotated_record(record: StereoRecord, decision: StereoEnergyDecision) -> StereoRecord:
+def _annotated_record(
+    record: StereoRecord,
+    decision: StereoEnergyDecision,
+    config: RunConfig | None = None,
+    stereo_plan: StereoPolicyPlan | None = None,
+) -> StereoRecord:
     metadata = dict(record.metadata)
     metadata["stereo_energy_filtering"] = {
         "representative_stereo_id": decision.representative_stereo_id,
@@ -366,6 +491,10 @@ def _annotated_record(record: StereoRecord, decision: StereoEnergyDecision) -> S
         "reason": decision.reason,
     }
     warnings = sorted({*record.warnings, *decision.warnings})
+    if config is not None and stereo_plan is not None and stereo_plan.unspecified_ids:
+        metadata["stereo_energy_filtering"]["stereo_policy"] = policy_metadata(config, stereo_plan)
+        if record.id in stereo_plan.unspecified_ids:
+            warnings.append(treatment_note(config, stereo_plan.treatment))
     if decision.relationship == "enantiomer_mapped":
         warnings.append(
             "Auto3D stereo energy was mapped from an enantiomeric representative in achiral solvent."
