@@ -51,6 +51,9 @@ MAX_CANDIDATE_NOTE_CHARS = 300
 _VOLATILE_PATTERNS = (
     re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}"),
     re.compile(r"/[^\s:]+"),
+    # uuid4-hex job-name suffixes and other long volatile hex tokens
+    # (underscore-bounded tokens like ``job_aaaa1111`` need lookarounds, not \b)
+    re.compile(r"(?<![0-9a-fA-F])[0-9a-f]{8,}(?![0-9a-fA-F])"),
 )
 
 
@@ -83,8 +86,9 @@ class Auto3DFailureBook:
         """Return the terminal root cause blocking ``(stage, engine)``, if any.
 
         Infra failures (SemLock, CUDA absence, missing binary) block the
-        whole stage regardless of engine; timeouts and engine-incompatibility
-        rejections block only the same engine within the stage.
+        whole stage regardless of engine; engine-incompatibility rejections
+        block only the same engine within the stage. Timeouts are workload-
+        dependent: they are recorded but never block (smaller batches can succeed).
         """
 
         for cause in self.root_causes.values():
@@ -121,6 +125,7 @@ class Auto3DFailureBook:
                 count=existing.count + 1,
             )
             self.root_causes[existing.root_cause_id] = updated
+            self._write_root_cause(updated)
             return updated
         excerpt = _normalize_excerpt(text)
         root_cause_id = hashlib.sha1(
@@ -137,6 +142,7 @@ class Auto3DFailureBook:
                 count=existing.count + 1,
             )
             self.root_causes[root_cause_id] = updated
+            self._write_root_cause(updated)
             return updated
         cause = RootCause(
             root_cause_id=root_cause_id,
@@ -210,12 +216,12 @@ def bounded(text: str, max_chars: int = MAX_CANDIDATE_NOTE_CHARS) -> str:
 
 
 def _normalize_excerpt(text: str) -> str:
-    head = text.strip().splitlines()[0] if text.strip() else ""
+    # Normalize BEFORE hashing: volatile values (UUIDs, tmp paths, hex job
+    # names) appear throughout multi-line Auto3D error text, not just on the
+    # first line, and would otherwise defeat root-cause deduplication.
+    excerpt = " ".join(text.split())
     for pattern in _VOLATILE_PATTERNS:
-        head = pattern.sub("<x>", head)
-    head = " ".join(head.split())
-    excerpt = (head + "\n" + text.strip()) if len(text.strip()) > len(head) else head
-    excerpt = " ".join(excerpt.split())
+        excerpt = pattern.sub("<x>", excerpt)
     return excerpt[:MAX_ROOT_EXCERPT_CHARS]
 
 

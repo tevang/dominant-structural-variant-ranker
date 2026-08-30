@@ -489,7 +489,6 @@ def _rank_with_auto3d(
     for base_id, mol, line_id in plan.expanded:
         expanded_by_base.setdefault(base_id, []).append((base_id, mol, line_id))
     energies: dict[str, float] = {}
-    engine_by_id: dict[str, str] = {}
     used_commands: list[list[str]] = []
     errors: list[str] = []
     used_engines: set[str] = set()
@@ -549,12 +548,12 @@ def _rank_with_auto3d(
                             energies[base_id] = energy
                     used_commands.append(command)
                     used_engines.add(attempt)
-                    engine_by_id.update({candidate.tautomer_id: attempt for candidate in supported})
                     break
     ranked = sorted(
         ((energy, candidate.isomeric_smiles, candidate) for candidate in candidates if (energy := energies.get(candidate.tautomer_id)) is not None),
         key=lambda item: (item[0], item[1]),
     )
+    incompatible_id_set = set(incompatible_ids)
     if not ranked:
         detail = "Auto3D did not emit energies for any RDKit tautomer candidate"
         if errors:
@@ -571,12 +570,20 @@ def _rank_with_auto3d(
     )
     budget = max(config.tautomer_filtering.tauto_k - len(incompatible_selected), 0)
     if len(selected_ids) > budget:
+        # The keep_input_tautomer rescue must survive the budget trim:
+        # trim the worst non-input candidates first.
+        rescued = (
+            {candidate.tautomer_id for candidate in candidates if candidate.is_input_tautomer}
+            & selected_ids
+            if config.tautomer_filtering.keep_input_tautomer
+            else set()
+        )
         ordered = [
             candidate.tautomer_id
             for _energy, _smiles, candidate in sorted(ranked, key=lambda item: (item[0], item[1]))
-            if candidate.tautomer_id in selected_ids
+            if candidate.tautomer_id in selected_ids and candidate.tautomer_id not in rescued
         ]
-        selected_ids = set(ordered[:budget])
+        selected_ids = rescued | set(ordered[: max(budget - len(rescued), 0)])
     rank_by_id = {candidate.tautomer_id: rank for rank, (_energy, _smiles, candidate) in enumerate(ranked, start=1)}
     command_text = " ;; ".join(" ".join(str(part) for part in command) for command in used_commands)
     warning_items = tuple(
@@ -598,7 +605,7 @@ def _rank_with_auto3d(
     for candidate in candidates:
         energy = energies.get(candidate.tautomer_id)
         relative = None if energy is None else energy - minimum
-        if candidate.tautomer_id in incompatible_ids:
+        if candidate.tautomer_id in incompatible_id_set:
             selected = candidate.tautomer_id in incompatible_selected
             results.append(
                 _RankedCandidate(

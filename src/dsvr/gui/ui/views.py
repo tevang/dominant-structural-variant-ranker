@@ -363,6 +363,9 @@ def render_artifacts(run_dir: Path) -> None:
     if path is None:
         st.warning("Artifact path escapes the run directory; refusing to open it.")
         return
+    if not path.is_file():
+        st.warning("Artifact path is missing or not a file.")
+        return
     if not path.exists():
         st.warning("Artifact is recorded but missing on disk.")
         return

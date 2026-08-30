@@ -402,3 +402,62 @@ def test_extract_energy_prefers_total_energy_and_converts_hartree():
     mol3 = Chem.MolFromSmiles("CCO")
     energy3, prop3 = _extract_energy(mol3)
     assert (energy3, prop3) == (None, None)
+
+
+def test_final3d_fallback_engine_receives_only_supported_molecules(tmp_path, monkeypatch):
+    """Escalation-review must-fix: when the primary engine fails and the
+    chain advances, the fallback engine must get ONLY the molecules it
+    supports, not the full group SDF (this prevents the 'Only AIMNET can
+    handle' retry storm)."""
+
+    from dsvr.chemistry import final3d
+    from dsvr.chemistry.final3d import _run_final_auto3d_for_engine
+    from dsvr.runners.auto3d_runner import Auto3DExecutionError
+
+    primary = "AIMNET"
+    fallback_engine = "ANI2xt"
+    config = RunConfig(
+        output_dir=tmp_path,
+        final_3d={
+            "optimizing_engine": primary,
+            "fallback_optimizing_engine": fallback_engine,
+            "use_gpu": False,
+        },
+    )
+
+    group_dir = tmp_path / "group"
+    group_dir.mkdir(parents=True)
+    writer = Chem.SDWriter(str(group_dir / "input.sdf"))
+    for smiles in ("CCO", "c1ccc([O-])cc1"):
+        mol = Chem.MolFromSmiles(smiles)
+        writer.write(mol)
+    writer.close()
+
+    calls: list[tuple[str, list[str]]] = []
+
+    def fake_run_auto3d(input_path, output_dir, **kwargs):
+        size = sum(
+            1
+            for mol in Chem.SDMolSupplier(str(input_path), sanitize=True, removeHs=False)
+            if mol is not None
+        )
+        calls.append((kwargs["model"], [input_path.name] * size + [f"n={size}"]))
+        if kwargs["model"] == primary:
+            raise Auto3DExecutionError("mock primary failure")
+        output_sdf = Path(output_dir) / "out.sdf"
+        writer2 = Chem.SDWriter(str(output_sdf))
+        for mol in Chem.SDMolSupplier(str(input_path), sanitize=True, removeHs=False):
+            if mol is not None:
+                mol.SetProp("E_kcal_mol", "-1.0")
+                writer2.write(mol)
+        writer2.close()
+        return output_sdf, ["auto3d", "run"]
+
+    monkeypatch.setattr(final3d, "run_auto3d", fake_run_auto3d)
+
+    sdf, _command = _run_final_auto3d_for_engine(group_dir / "input.sdf", group_dir, config, primary)
+
+    assert calls[1][0] == fallback_engine
+    # Only the neutral molecule is supported by ANI2xt; the phenolate is not offered.
+    assert calls[1][1] == ["final_3d_input_ANI2xt.sdf", "n=1"]
+    assert sdf.exists()

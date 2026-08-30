@@ -97,9 +97,10 @@ def test_distinct_failure_written_once_with_short_candidate_refs(tmp_path, monke
         for line in jsonl.read_text(encoding="utf-8").splitlines()
         if line.strip()
     ]
+    # One distinct root cause; occurrences are appended with running counts.
     distinct = {record["root_cause_id"] for record in records}
-    written_ids = [record["root_cause_id"] for record in records]
-    assert len(written_ids) == len(distinct), "root causes written more than once"
+    assert len(distinct) == 1
+    assert records[-1]["occurrences"] > 1
 
     selected_csv = tmp_path / "run" / "enumeration" / "tautomers" / "tautomers_selected.csv"
     rows = list(csv.DictReader(selected_csv.open()))
@@ -169,3 +170,31 @@ def test_bounded_note_truncates_long_text() -> None:
     result = bounded(long_text, max_chars=300)
     assert len(result) == 300
     assert result.endswith("…")
+
+
+def test_failures_differing_only_in_uuid_and_paths_dedup_to_one_cause(tmp_path) -> None:
+    """Escalation-review regression: normalization must cover every line of
+    the excerpt, not just the first."""
+
+    _BOOKS.clear()
+    book = failure_book_for(tmp_path / "run")
+    base = (
+        "Auto3D failed. Tried commands:\n"
+        "python /tmp/{pid}_auto3d_tautomers_{uid}/auto3d_ANI2xt/_auto3d_v3_wrapper.py run "
+        "--job-name final_{uid} exited 1: boom"
+    )
+    first = book.record_failure(
+        "stage", "ANI2xt", base.format(pid="mol_a", uid="aaaa1111")
+    )
+    second = book.record_failure(
+        "stage", "ANI2xt", base.format(pid="mol_b", uid="bbbb2222")
+    )
+    assert first.root_cause_id == second.root_cause_id
+    assert second.count == 2
+    lines = [
+        json.loads(line)
+        for line in (tmp_path / "run" / "auto3d_root_causes.jsonl").read_text().splitlines()
+    ]
+    assert lines[-1]["occurrences"] == 2
+    open_ids = {line["root_cause_id"] for line in lines}
+    assert len(open_ids) == 1

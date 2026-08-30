@@ -216,3 +216,27 @@ def test_final3d_enumerate_policy_expands_input_and_records_provenance(tmp_path,
     assert input_text.count(record.id) >= 2
     assert result.records[0].metadata["final_3d"]["stereo_policy"]["treatment"] == "enumerated_upfront"
     assert any("unspecified stereochemistry treated" in w for w in result.records[0].warnings)
+
+
+def test_enumerate_failure_routes_residue_to_isomer_enum_with_honest_provenance(tmp_path, monkeypatch) -> None:
+    """Review fix: when RDKit enumeration cannot resolve an unspecified-
+    stereo molecule, it must reach Auto3D with isomer enumeration enabled,
+    and provenance must show the residue rather than over-claim."""
+
+    from dsvr.config import RunConfig
+
+    def boom(*args, **kwargs):
+        raise TimeoutError("mock enumeration failure")
+
+    monkeypatch.setattr(
+        "dsvr.chemistry.auto3d_stereo_policy._enumerate_with_timeout", boom
+    )
+    config = RunConfig(output_dir=tmp_path / "run")  # default enumerate policy
+    mol = Chem.MolFromSmiles(UNSPECIFIED_CHIRAL)
+    plan = apply_stereo_policy([("x", mol)], config)
+    assert "x" in plan.enumerate_isomer_for
+    from dsvr.chemistry.auto3d_stereo_policy import policy_metadata
+
+    metadata = policy_metadata(config, plan)
+    assert metadata["treatment"] == "enumerated_upfront"
+    assert metadata["auto3d_enumerate_residue"] == ["x"]

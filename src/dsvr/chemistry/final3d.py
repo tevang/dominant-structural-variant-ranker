@@ -189,7 +189,8 @@ def _run_final_auto3d(
             "\n".join(errors) + "\n",
             encoding="utf-8",
         )
-    return combined_sdf, [part for command in commands for part in command], incompatible_ids
+    joined = [" ;; ".join(" ".join(str(part) for part in command) for command in commands)]
+    return combined_sdf, joined, incompatible_ids
 
 
 def _run_final_auto3d_for_engine(
@@ -216,10 +217,26 @@ def _run_final_auto3d_for_engine(
         ]
         if not supported:
             continue
+        # When the chain advanced past the group's assigned engine, some group
+        # molecules may be unsupported by this attempt — never offer them to it
+        # (this is what prevents "Only AIMNET can handle" retry storms).
+        attempt_sdf = input_sdf
+        if len(supported) < len(molecules):
+            attempt_sdf = group_dir / f"final_3d_input_{attempt}.sdf"
+            writer = Chem.SDWriter(str(attempt_sdf))
+            for mol in supported:
+                writer.write(mol)
+            writer.close()
+        blocker = failure_book_for(config.output_dir).terminal_reference(
+            FINAL3D_STAGE, attempt
+        )
+        if blocker is not None:
+            errors.append(f"{attempt}: skipped per failure memory; {blocker.short_note}")
+            continue
         for use_gpu in _final_auto3d_gpu_attempts(config):
             try:
                 return run_auto3d(
-                    input_sdf,
+                    attempt_sdf,
                     group_dir,
                     k=config.final_3d.k,
                     model=attempt,
