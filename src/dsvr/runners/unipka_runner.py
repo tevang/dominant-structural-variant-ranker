@@ -10,6 +10,7 @@ pH grid. DSVR calls it once per run for the whole protonation batch.
 
 from __future__ import annotations
 
+import math
 import shutil
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -404,6 +405,8 @@ def parse_unipka_outputs(
             occupancy = float(occupancy_raw)
         except ValueError:
             continue
+        if not math.isfinite(occupancy):
+            continue
         forms_by_id[name].append(UnipkaForm(form_smiles=form_smi, occupancy=occupancy))
 
     envelopes: dict[str, UnipkaEnvelope] = {}
@@ -454,7 +457,9 @@ def parse_distribution_file(path: Path, wanted_ids: set[str]) -> dict[str, Unipk
         if microstate_smi in bucket:
             continue
         try:
-            bucket[microstate_smi] = float(dg_raw)
+            dg = float(dg_raw)
         except ValueError:
             continue
+        if math.isfinite(dg):
+            bucket[microstate_smi] = dg
     return {name: UnipkaEnvelope(microstates=states) for name, states in microstates.items()}

@@ -62,7 +62,7 @@ def compute_protonation_summary(
     """Compute all Uni-Pka summary properties for one input molecule.
 
     ``selected_forms`` are the forms that survived selection (SMILES, occupancy
-    at working pH), ordered by decreasing occupancy.
+    at working pH); order is irrelevant.
     """
 
     warnings: list[str] = []
@@ -78,7 +78,10 @@ def compute_protonation_summary(
     charge_population = _charge_population(microstates, working_occupancies)
 
     if len(selected_forms) >= 2:
-        gap: float | None = selected_forms[0][1] - selected_forms[1][1]
+        # caller order is selection priority (keep_input_state first), not
+        # occupancy order, so rank explicitly before taking the top-two gap
+        top_two = sorted((occupancy for _, occupancy in selected_forms), reverse=True)[:2]
+        gap: float | None = top_two[0] - top_two[1]
     elif selected_forms:
         gap = selected_forms[0][1]
     else:

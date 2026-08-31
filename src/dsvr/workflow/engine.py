@@ -198,6 +198,10 @@ def run_workflow(config: RunConfig) -> WorkflowResult:
         # Uni-Pka batch pre-pass: a single container invocation per run for all
         # molecules that still need protomer generation (checkpointed molecules
         # are excluded, so a full-resume re-run issues no call at all).
+        # Retry-after-failure relies on Input validation re-recording every
+        # molecule as completed at its own stage before this loop reads the
+        # per-item checkpoint, so a stale "Protomer generation/failed" state
+        # never matches the stage filter and failed molecules stay pending.
         unipka_results: dict[str, UnipkaMoleculeResult] = {}
         unipka_stage_error: Exception | None = None
         if config.protonation.enabled and config.protonation.tool == "unipka":

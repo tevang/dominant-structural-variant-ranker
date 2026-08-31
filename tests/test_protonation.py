@@ -292,6 +292,11 @@ def test_unipka_selection_keeps_dominant_form_above_threshold(tmp_path: Path) ->
         path = audit_dir / name
         assert path.exists() and path.read_text(encoding="utf-8").strip() != ""
 
+    # the input state is kept first despite low occupancy; the top-two gap must
+    # still be the occupancy-ordered difference, never the selection-order one
+    gap = records[0].metadata["unipka_summary"]["top_two_occupancy_gap"]
+    assert gap == pytest.approx(0.94)
+
 
 def test_unipka_cap_trims_by_occupancy(tmp_path: Path) -> None:
     from dsvr.chemistry.protonation import generate_unipka_protomer_candidates

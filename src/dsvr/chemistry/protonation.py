@@ -165,6 +165,7 @@ def _select_unipka_protomers(
                     "input_molecule_id": mol_record.input_id,
                     "selected": False,
                     "reason": "duplicate_dedupe_key",
+                    "unipka_occupancy": None,
                     "isomeric_smiles": Chem.MolToSmiles(mol, canonical=True, isomericSmiles=True),
                 }
             )

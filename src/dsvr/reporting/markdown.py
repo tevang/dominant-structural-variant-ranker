@@ -272,7 +272,11 @@ def _protonation_section(
         config.output_dir / "enumeration" / "protomers" / "unipka_distribution.tsv"
     )
     if dist_path.exists():
-        lines.append(f"- pH distribution artifact: `{dist_path}`")
+        lines.append(
+            f"- pH distribution artifact: `{dist_path}` "
+            "(covers the latest Uni-Pka batch; after resume runs with a changed "
+            "input set, per-molecule summaries in provenance stay complete)"
+        )
     by_input: dict[str, list[AnyLineageRecord]] = {}
     for record in protomer_records:
         by_input.setdefault(record.input_molecule_id, []).append(record)
