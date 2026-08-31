@@ -283,8 +283,14 @@ def test_unipka_selection_keeps_dominant_form_above_threshold(tmp_path: Path) ->
     assert by_smiles["CC(=O)[O-]"].metadata["unipka_occupancy"] == 0.97
     assert by_smiles["CC(=O)[O-]"].metadata["unipka_dg"] == -6.79
     assert by_smiles["CC(=O)O"].metadata["unipka_occupancy"] == 0.03
-    assert by_smiles["CC(=O)O"].metadata["plausibility"]["selection_reason"] == "unipka_occupancy_ranked"
-    assert by_smiles["CC(=O)[O-]"].metadata["plausibility"]["selection_reason"] == "unipka_occupancy_ranked"
+    assert by_smiles["CC(=O)O"].metadata["plausibility"]["selection_reason"] == "unipka_input_state"
+    assert by_smiles["CC(=O)[O-]"].metadata["plausibility"]["selection_reason"] == "unipka_best_per_charge"
+
+    # audit tables the report/audit consumers rely on must exist on the unipka path
+    audit_dir = tmp_path / "run" / "enumeration" / "protomers"
+    for name in ("protomers_all.csv", "protomers_selected.csv"):
+        path = audit_dir / name
+        assert path.exists() and path.read_text(encoding="utf-8").strip() != ""
 
 
 def test_unipka_cap_trims_by_occupancy(tmp_path: Path) -> None:

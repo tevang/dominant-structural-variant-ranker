@@ -21,7 +21,7 @@ All notable changes to DSVR are documented here. Format loosely follows
   `enumeration/protomers/unipka_distribution.tsv` and referenced by the run
   report; the report gains a "Protonation Properties (Uni-Pka)" section.
 - `dsvr doctor` now checks the Uni-Pka container runtime and image
-  (required) and reports molscrub as optional.
+  (required when the workflow uses Uni-Pka) and reports molscrub as optional.
 - molscrub (`protonation.tool: molscrub`) remains selectable with unchanged
   legacy behavior; `configs/*.yaml` and install docs updated; CI smoke
   configs pin molscrub since no container is available in CI.
@@ -29,8 +29,9 @@ All notable changes to DSVR are documented here. Format loosely follows
 ### Added
 
 - `protonation.unipka` configuration block: `container`, `runtime`
-  (auto/docker/apptainer), `script_path`, `min_occupancy`, `max_forms`,
-  `ph_range_*`, `ph_step`, `timeout_seconds`.
+  (auto/docker/apptainer), `script_path`, `min_occupancy`,
+  `distribution_min_occupancy`, `max_forms`, `ph_range_*`, `ph_step`,
+  `timeout_seconds`.
 - Vendored current EasyDock `unipka.py` at `containers/unipka.py`
   (BSD-3-Clause, see `containers/README.md`). Every published Zenodo
   `unipka.sif` build bakes an outdated script that rejects the occupancy
@@ -38,3 +39,23 @@ All notable changes to DSVR are documented here. Format loosely follows
   unless `script_path` is set to another path or to `""`. The default
   `container: unipka` also resolves to a local `containers/unipka.sif`
   when present, so a downloaded image needs no config change.
+- `dsvr doctor` honors the global `-c/--config` for the Uni-Pka row: it
+  checks the configured container reference and is required only when the
+  configured protonation stage uses Uni-Pka.
+
+### Fixed
+
+- Whole-batch Uni-Pka failures no longer persist degraded input-state
+  protomer artifacts, so `--resume` retries protonation after the cause is
+  fixed instead of silently checkpoint-loading fallback states.
+- `--max-protomers` no longer fails config validation when
+  `unipka.max_forms` was defaulted to the old cap.
+- Namespaced/registry-qualified Docker image names are no longer resolved
+  as filesystem paths.
+- `DSVR_PROTONATION_STAGE` no longer stamps every final variant with a
+  constant `/fallback` suffix; fallback state remains visible via
+  `DSVR_WARNINGS` and record provenance.
+- The distribution TSV keeps low-population microstates
+  (`distribution_min_occupancy`, default 0.001) instead of the container's
+  0.01 cutoff, so ensemble summary properties are computed over the full
+  predicted microspecies set.

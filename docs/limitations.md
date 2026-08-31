@@ -30,7 +30,13 @@ predictions.
 
 Because Uni-Pka selection differs from molscrub's, default runs are not
 comparable to molscrub-era runs; provenance records which tool produced
-each run.
+each run. One semantic difference to note: `keep_input_state: true` under
+molscrub unconditionally injects the input protonation state as a candidate,
+while under Uni-Pka it only prioritizes the input state **if Uni-Pka predicted
+that form at all** (it is never force-injected below the occupancy threshold,
+since a form the model did not predict has no occupancy to rank). When the
+input state was dropped for that reason, no warning is raised; the selected
+forms and the pH-distribution artifact show what was kept.
 
 DSVR does not perform rigorous pH-dependent population calculations unless a micro-pKa/proton chemical-potential correction provider is added. Without that correction, cross-protomer and cross-charge populations are approximate.
 

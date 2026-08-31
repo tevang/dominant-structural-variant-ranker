@@ -119,8 +119,8 @@ def generate_unipka_protomer_candidates(
             continue
         candidates.append((mol, form.occupancy))
 
-    selected_pairs = _select_unipka_protomers(mol_record, candidates, config)
-    selected_forms = [(pair[0], pair[1]) for pair in selected_pairs]
+    selected_pairs, rejected_rows = _select_unipka_protomers(mol_record, candidates, config)
+    selected_forms = [(mol, occ) for mol, occ, _reason in selected_pairs]
     summary = summarize_unipka_result(mol_record, config, result, selected_forms=selected_forms)
 
     return _records_from_unipka_candidates(
@@ -133,6 +133,7 @@ def generate_unipka_protomer_candidates(
         source_software="unipka",
         source_command=command_text,
         output_dir=output_dir,
+        rejected_rows=rejected_rows,
     )
 
 
@@ -140,29 +141,45 @@ def _select_unipka_protomers(
     mol_record: MoleculeInput,
     candidates: list[tuple[Chem.Mol, float]],
     config: RunConfig,
-) -> list[tuple[Chem.Mol, float]]:
+) -> tuple[list[tuple[Chem.Mol, float, str]], list[dict[str, Any]]]:
+    """Select protomers by occupancy, returning (mol, occupancy, reason) and rejected rows.
+
+    Reason mirrors the molscrub audit vocabulary: ``unipka_input_state`` when
+    ``keep_input_state`` matched the input form, ``unipka_best_per_charge`` when
+    the per-charge rule chose it, else ``unipka_occupancy_ranked``.
+    """
+
     cap = config.protonation.max_protomers_per_molecule
     # exact-dedupe by the same identity key used for molscrub candidates
     seen: set[tuple[str, int, str, str]] = set()
     unique: list[tuple[Chem.Mol, float]] = []
+    rejected: list[dict[str, Any]] = []
     for mol, occupancy in candidates:
         try:
             key = _candidate_key(mol)
         except Exception:
             continue
         if key in seen:
+            rejected.append(
+                {
+                    "input_molecule_id": mol_record.input_id,
+                    "selected": False,
+                    "reason": "duplicate_dedupe_key",
+                    "isomeric_smiles": Chem.MolToSmiles(mol, canonical=True, isomericSmiles=True),
+                }
+            )
             continue
         seen.add(key)
         unique.append((mol, occupancy))
 
-    selected: list[tuple[Chem.Mol, float]] = []
+    selected: list[tuple[Chem.Mol, float, str]] = []
     selected_keys: set[tuple[str, int, str, str]] = set()
 
-    def _take(mol: Chem.Mol, occupancy: float) -> bool:
+    def _take(mol: Chem.Mol, occupancy: float, reason: str) -> bool:
         key = _candidate_key(mol)
         if key in selected_keys or len(selected) >= cap:
             return False
-        selected.append((mol, occupancy))
+        selected.append((mol, occupancy, reason))
         selected_keys.add(key)
         return True
 
@@ -170,7 +187,7 @@ def _select_unipka_protomers(
         input_key = _candidate_key(mol_record.rdkit_mol)
         for mol, occupancy in unique:
             if _candidate_key(mol) == input_key:
-                _take(mol, occupancy)
+                _take(mol, occupancy, "unipka_input_state")
                 break
 
     if config.protonation.keep_best_per_charge:
@@ -183,11 +200,23 @@ def _select_unipka_protomers(
         for mol, occupancy in sorted(
             best_by_charge.values(), key=lambda item: (-item[1], abs(Chem.GetFormalCharge(item[0])))
         ):
-            _take(mol, occupancy)
+            _take(mol, occupancy, "unipka_best_per_charge")
 
     for mol, occupancy in sorted(unique, key=lambda item: (-item[1], item[0].GetNumAtoms())):
-        _take(mol, occupancy)
-    return selected
+        _take(mol, occupancy, "unipka_occupancy_ranked")
+
+    for mol, occupancy in unique:
+        if _candidate_key(mol) not in selected_keys:
+            rejected.append(
+                {
+                    "input_molecule_id": mol_record.input_id,
+                    "selected": False,
+                    "reason": "not_selected_within_cap",
+                    "unipka_occupancy": occupancy,
+                    "isomeric_smiles": Chem.MolToSmiles(mol, canonical=True, isomericSmiles=True),
+                }
+            )
+    return selected, rejected
 
 
 def summarize_unipka_result(
@@ -229,7 +258,7 @@ def summarize_unipka_result(
 
 def _records_from_unipka_candidates(
     mol_record: MoleculeInput,
-    selected_pairs: list[tuple[Chem.Mol, float]],
+    selected_pairs: list[tuple[Chem.Mol, float, str]],
     *,
     selected_forms: list[tuple[Chem.Mol, float]],
     unipka_result: UnipkaMoleculeResult,
@@ -239,15 +268,16 @@ def _records_from_unipka_candidates(
     source_command: str,
     output_dir: Path,
     fallback_warning: str | None = None,
+    rejected_rows: list[dict[str, Any]] | None = None,
 ) -> list[ProtomerRecord]:
     pairs = list(selected_pairs)
     if not pairs:
         input_mol = Chem.Mol(mol_record.rdkit_mol)
-        pairs = [(input_mol, 0.0)]
+        pairs = [(input_mol, 0.0, "fallback_input_state")]
         fallback_warning = fallback_warning or "Uni-Pka returned no valid state; retained input molecule"
 
     records: list[ProtomerRecord] = []
-    for index, (mol, occupancy) in enumerate(pairs, start=1):
+    for index, (mol, occupancy, reason) in enumerate(pairs, start=1):
         canonical_smiles = Chem.MolToSmiles(mol, canonical=True, isomericSmiles=False)
         isomeric_smiles = Chem.MolToSmiles(mol, canonical=True, isomericSmiles=True)
         formula = _formula(mol)
@@ -259,13 +289,14 @@ def _records_from_unipka_candidates(
         dg = unipka_result.envelope.microstates.get(isomeric_smiles)
         if dg is None:
             dg = unipka_result.envelope.microstates.get(canonical_smiles)
+        is_fallback = reason == "fallback_input_state"
         metadata = {
             "ph_low": config.chemistry.ph_low,
             "ph_high": config.chemistry.ph_high,
             "target_ph": config.chemistry.ph,
             "solvent": config.chemistry.solvent,
             "tool": "unipka",
-            "unipka_occupancy": occupancy if occupancy else None,
+            "unipka_occupancy": None if is_fallback else occupancy,
             "unipka_dg": dg,
             "unipka_summary": summary,
             "dedupe_key": {
@@ -277,10 +308,10 @@ def _records_from_unipka_candidates(
             "plausibility": asdict(
                 ProtomerPlausibility(
                     score=-occupancy,
-                    reasons=[f"unipka_occupancy={occupancy:g}"] if occupancy else ["input_fallback"],
+                    reasons=["input_fallback"] if is_fallback else [f"unipka_occupancy={occupancy:g}"],
                     warnings=warnings,
                     selected=True,
-                    selection_reason="unipka_occupancy_ranked" if occupancy else "fallback_input_state",
+                    selection_reason=reason,
                 )
             ),
         }
@@ -318,6 +349,44 @@ def _records_from_unipka_candidates(
 
     _write_protomer_sdf(output_dir / f"{mol_record.input_id}_protomers.sdf", records)
     _write_protomer_csv(output_dir / f"{mol_record.input_id}_protomers.csv", records)
+    _append_csv(output_dir / "protomers_selected.csv", [_record_row(record) for record in records])
+    all_rows = []
+    for index, record in enumerate(records, start=1):
+        plausibility = record.metadata.get("plausibility", {})
+        all_rows.append(
+            {
+                "input_molecule_id": record.input_molecule_id,
+                "molname": record.molname,
+                "candidate_index": index,
+                "canonical_smiles": record.canonical_smiles,
+                "isomeric_smiles": record.isomeric_smiles,
+                "molecular_formula": record.molecular_formula,
+                "formal_charge": record.formal_charge,
+                "score": plausibility.get("score"),
+                "selected": True,
+                "selection_reason": plausibility.get("selection_reason"),
+                "reasons": " | ".join(plausibility.get("reasons", [])),
+                "warnings": " | ".join(record.warnings),
+                "score_is_population_estimate": plausibility.get("score") is not None,
+            }
+        )
+    _append_csv(output_dir / "protomers_all.csv", all_rows)
+    if rejected_rows:
+        _append_csv(output_dir / "protomers_rejected.csv", rejected_rows)
+    with (output_dir / "protonation_warnings.jsonl").open("a", encoding="utf-8") as handle:
+        for record in records:
+            for warning in record.warnings:
+                handle.write(
+                    json.dumps(
+                        {
+                            "input_molecule_id": record.input_molecule_id,
+                            "protomer_id": record.id,
+                            "warning": warning,
+                        },
+                        sort_keys=True,
+                    )
+                    + "\n"
+                )
     return records
 
 

@@ -176,7 +176,9 @@ PATH); it runs fully unprivileged via user namespaces.
 
 Either Docker or Apptainer/Singularity may supply the runtime; DSVR picks
 Apptainer for `.sif` paths (else Docker) unless `protonation.unipka.runtime`
-overrides it. Verify with:
+overrides it. Docker bind-mounts use absolute host paths
+(`-v <workdir>:<workdir>`), so on Docker Desktop (macOS/Windows) the run output
+directory must live under a file-sharing-enabled path. Verify with:
 
 ```bash
 dsvr doctor --strict

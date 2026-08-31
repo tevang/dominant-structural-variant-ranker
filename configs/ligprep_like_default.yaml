@@ -25,6 +25,7 @@ protonation:
     # script_path: containers/unipka.py   # vendored default; "" disables the
     #                                      # stale-image script override
     min_occupancy: 0.05
+    distribution_min_occupancy: 0.001   # keep low-population states in the TSV
     # max_forms defaults to max_protomers_per_molecule
     ph_range_low: 2.0
     ph_range_high: 12.0
