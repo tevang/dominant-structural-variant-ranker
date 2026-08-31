@@ -2,7 +2,7 @@
 
 `dominant-structural-variant-ranker` (`dsvr`) is a Python orchestration package for preparing and ranking pH- and solvent-dependent small-molecule structural variants with maintained open-source tools.
 
-This repository is a wrapper/orchestrator. It does **not** vendor, mirror, or clone third-party repositories. RDKit, molscrub, Auto3D, xTB, CREST, CENSO, Psi4, and PySCF remain external tools installed through uv, official binary distributions, or user-managed software modules.
+This repository is a wrapper/orchestrator. It does **not** vendor, mirror, or clone third-party repositories. RDKit, Uni-Pka (container), Auto3D, xTB, CREST, CENSO, Psi4, PySCF, and the optional molscrub remain external tools installed through uv, containers, official binary distributions, or user-managed software modules.
 
 ## Default Workflow
 
@@ -73,19 +73,23 @@ CREST/xTB, xTB thermo, CREST entropy estimates, CENSO, and Psi4/PySCF rescoring 
 
 ## Quick Start
 
-The default `prepare-ligands` workflow requires RDKit, molscrub (protomer
-generation), and Auto3D (tautomer energy triage and final 3D conformer
-generation). Install all three together:
+The default `prepare-ligands` workflow requires RDKit, the Uni-Pka container
+(protomer generation), and Auto3D (tautomer energy triage and final 3D
+conformer generation). Install:
 
 ```bash
-uv sync --extra dev --extra auto3d --extra molscrub
+uv sync --extra dev --extra auto3d
 source .venv/bin/activate
+# acquire the Uni-Pka container (docs/installation.md); placing it at
+# containers/unipka.sif needs no config change, otherwise set
+# protonation.unipka.container to the .sif path or image name
 dsvr doctor
 dsvr prepare-ligands examples/test_molecules_minimal.smi --config configs/ligprep_like_default.yaml --out runs/smoke
 ```
 
 For an RDKit-only dry run or CI-safe smoke check that does not need Auto3D or
-molscrub, use `--dry-run` or the minimal install below.
+Uni-Pka, use `--dry-run` or the minimal install below. molscrub remains an
+optional alternative protonation tool (`protonation.tool: molscrub`).
 
 For direct source-tree smoke checks:
 
@@ -96,17 +100,20 @@ PYTHONPATH=src python -m pytest
 
 ## Dependency Strategy
 
-- Do not vendor Third-party repositories.
+- Do not vendor Third-party repositories. Sole exception: `containers/unipka.py`
+  is a pinned single-file copy of the current EasyDock Uni-Pka script
+  (BSD-3-Clause, see `containers/README.md`) that DSVR bind-mounts into the
+  container because all published pre-built images bake an outdated version.
 - Install Python packages via uv.
 - Install external binaries via official binaries or user-managed modules.
 - Use `dsvr doctor` to verify the environment before running optional physics-heavy workflows.
 
-The `auto3d` and `molscrub` extras are required for the default
-`prepare-ligands` workflow. They are only optional for RDKit-only dry runs,
-`dsvr inspect`, and CI-safe smoke tests:
+The `auto3d` extra and a Uni-Pka container image are required for the
+default `prepare-ligands` workflow. They are only optional for RDKit-only
+dry runs, `dsvr inspect`, and CI-safe smoke tests:
 
 ```bash
-uv sync --extra dev --extra auto3d --extra molscrub
+uv sync --extra dev --extra auto3d
 ```
 
 ## CLI

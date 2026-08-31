@@ -257,3 +257,173 @@ def test_workflow_resume_rejects_failed_crest_checkpoint(tmp_path: Path) -> None
     )
 
     assert should_skip_step(step, input_hash, config)
+
+
+def _fake_unipka_batch_result(molecules):
+    from dsvr.runners.unipka_runner import (
+        UnipkaBatchResult,
+        UnipkaEnvelope,
+        UnipkaForm,
+        UnipkaMoleculeResult,
+    )
+
+    results = {}
+    for mol in molecules:
+        smiles = mol.isomeric_smiles
+        results[mol.input_id] = UnipkaMoleculeResult(
+            input_id=mol.input_id,
+            forms=[UnipkaForm(form_smiles=smiles, occupancy=0.9)],
+            envelope=UnipkaEnvelope(microstates={smiles: -5.0}),
+            source_command="docker run unipka protonate ...",
+        )
+    return UnipkaBatchResult(
+        results=results,
+        distribution_path=molecules[0].input_properties.get("dist") or Path("dist.tsv"),
+        input_path=Path("input.tsv"),
+        command=["docker", "run", "unipka", "protonate"],
+        runtime="docker",
+        container="unipka",
+    )
+
+
+def test_workflow_unipka_single_batch_call(tmp_path: Path, monkeypatch) -> None:
+    input_path = tmp_path / "mols.smi"
+    input_path.write_text("CCO ethanol\nc1ccccc1 benzene\n", encoding="utf-8")
+    outdir = tmp_path / "run_unipka"
+
+    calls: list[int] = []
+
+    def fake_batch(molecules, **kwargs):
+        calls.append(len(molecules))
+        return _fake_unipka_batch_result(molecules)
+
+    monkeypatch.setattr(engine_module, "generate_unipka_batch", fake_batch)
+
+    result = run_workflow(
+        RunConfig(
+            input_path=input_path,
+            output_dir=outdir,
+            protonation={"tool": "unipka"},
+            enumeration={"max_protomers_per_molecule": 1},
+            seeding={"rdkit_num_conformers": 1},
+            crest={"enabled": False},
+            thermo={"enabled": False, "xtb_hessian": False, "xtb_thermo": False},
+            variant_filtering={"enabled": False},
+        )
+    )
+
+    assert result.molecule_count == 2
+    assert calls == [2]  # one batch invocation for the whole stage
+    report = (outdir / "report.md").read_text(encoding="utf-8")
+    assert "Protonation Properties (Uni-Pka)" in report
+    assert "ethanol" in report
+
+
+def test_workflow_unipka_batch_error_falls_back_per_policy(tmp_path: Path, monkeypatch) -> None:
+    input_path = tmp_path / "mols.smi"
+    input_path.write_text("CCO ethanol\n", encoding="utf-8")
+    outdir = tmp_path / "run_unipka_fail"
+
+    def failing_batch(molecules, **kwargs):
+        raise engine_module.UnipkaExecutionError("mock container crash")
+
+    monkeypatch.setattr(engine_module, "generate_unipka_batch", failing_batch)
+
+    result = run_workflow(
+        RunConfig(
+            input_path=input_path,
+            output_dir=outdir,
+            protonation={"tool": "unipka"},
+            enumeration={"max_protomers_per_molecule": 1},
+            seeding={"rdkit_num_conformers": 1},
+            crest={"enabled": False},
+            thermo={"enabled": False, "xtb_hessian": False, "xtb_thermo": False},
+            variant_filtering={"enabled": False},
+            error_handling={"keep_fallback_parent_state": True},
+        )
+    )
+
+    assert result.molecule_count == 1
+    failures = (outdir / "failures.jsonl")
+    assert any(
+        "fallback" in line.lower()
+        for line in (outdir / "warnings.jsonl").read_text(encoding="utf-8").splitlines()
+        + failures.read_text(encoding="utf-8").splitlines()
+    )
+
+
+def test_workflow_unipka_batch_failure_resume_retries_after_fix(
+    tmp_path: Path, monkeypatch
+) -> None:
+    # A whole-batch failure must not persist checkpoint artifacts: after fixing
+    # the cause (here raising the timeout, i.e. a new config), --resume has to
+    # re-invoke the container instead of silently reusing input-state fallbacks.
+    input_path = tmp_path / "mols.smi"
+    input_path.write_text("CCO ethanol\n", encoding="utf-8")
+    outdir = tmp_path / "run_unipka_fail_retry"
+
+    def failing_batch(molecules, **kwargs):
+        raise engine_module.UnipkaExecutionError("mock batch timeout")
+
+    monkeypatch.setattr(engine_module, "generate_unipka_batch", failing_batch)
+
+    def cfg(timeout: int) -> RunConfig:
+        return RunConfig(
+            input_path=input_path,
+            output_dir=outdir,
+            protonation={"tool": "unipka", "unipka": {"timeout_seconds": timeout}},
+            enumeration={"max_protomers_per_molecule": 1},
+            seeding={"rdkit_num_conformers": 1},
+            crest={"enabled": False},
+            thermo={"enabled": False, "xtb_hessian": False, "xtb_thermo": False},
+            variant_filtering={"enabled": False},
+            error_handling={"keep_fallback_parent_state": True},
+        )
+
+    first = run_workflow(cfg(60))
+    assert first.molecule_count == 1  # degraded via fallback
+    assert not (outdir / "enumeration" / "protomers" / "mol_000001_protomers.sdf").exists()
+
+    calls: list[int] = []
+
+    def fixed_batch(molecules, **kwargs):
+        calls.append(len(molecules))
+        return _fake_unipka_batch_result(molecules)
+
+    monkeypatch.setattr(engine_module, "generate_unipka_batch", fixed_batch)
+    second = run_workflow(cfg(7200))
+
+    assert calls == [1]  # protonation retried, not pinned by the failed fallback
+    assert second.molecule_count == 1
+    protomers_csv = (outdir / "protomers.csv").read_text(encoding="utf-8")
+    assert "unipka" in protomers_csv  # provenance now shows the real tool
+
+
+def test_workflow_unipka_resume_all_checkpointed_issues_no_call(
+    tmp_path: Path, monkeypatch
+) -> None:
+    input_path = tmp_path / "mols.smi"
+    input_path.write_text("CCO ethanol\n", encoding="utf-8")
+    outdir = tmp_path / "run_unipka_resume"
+
+    monkeypatch.setattr(
+        engine_module, "generate_unipka_batch", lambda molecules, **kw: _fake_unipka_batch_result(molecules)
+    )
+    config_kwargs = dict(
+        input_path=input_path,
+        output_dir=outdir,
+        protonation={"tool": "unipka"},
+        enumeration={"max_protomers_per_molecule": 1},
+        seeding={"rdkit_num_conformers": 1},
+        crest={"enabled": False},
+        thermo={"enabled": False, "xtb_hessian": False, "xtb_thermo": False},
+        variant_filtering={"enabled": False},
+    )
+    run_workflow(RunConfig(**config_kwargs))
+
+    def banned_batch(molecules, **kwargs):
+        raise AssertionError("batch must not be invoked when every molecule is checkpointed")
+
+    monkeypatch.setattr(engine_module, "generate_unipka_batch", banned_batch)
+    result = run_workflow(RunConfig(**config_kwargs))
+    assert result.molecule_count == 1

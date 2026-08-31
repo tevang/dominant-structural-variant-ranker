@@ -17,14 +17,15 @@ This minimal environment supports input parsing, RDKit enumeration, ETKDG seedin
 
 ## Default `prepare-ligands` Workflow
 
-The default `prepare-ligands` (LigPrep-like) workflow uses molscrub for pH/protomer
-generation, Auto3D for tautomer energy triage, and Auto3D for final 3D conformer
-generation. Both are required for any non-dry-run `prepare-ligands` invocation.
+The default `prepare-ligands` (LigPrep-like) workflow uses Uni-Pka for
+protomer generation (through a Docker or Apptainer container), Auto3D for
+tautomer energy triage, and Auto3D for final 3D conformer generation. All are
+required for any non-dry-run `prepare-ligands` invocation.
 
 With `uv` (recommended):
 
 ```bash
-uv sync --extra dev --extra auto3d --extra molscrub
+uv sync --extra dev --extra auto3d
 source .venv/bin/activate
 dsvr doctor
 ```
@@ -35,12 +36,15 @@ With conda/pip:
 conda activate dsvr
 python -m pip install -e ".[dev]"
 python -m pip install Auto3D
-python -m pip install git+https://github.com/forlilab/molscrub.git
 dsvr doctor
 ```
 
-For RDKit-only `--dry-run` checks or CI-safe smoke tests, the `auto3d` and
-`molscrub` extras are not required.
+Then acquire the Uni-Pka container (see "Uni-Pka container" below) and run
+`dsvr doctor` again: the `unipka` row must report the chosen runtime and
+image.
+
+For RDKit-only `--dry-run` checks or CI-safe smoke tests, the `auto3d` extra
+and the Uni-Pka container are not required.
 
 ## Bootstrap Helpers
 
@@ -137,16 +141,59 @@ uv sync --extra auto3d
 python -m pip install Auto3D
 ```
 
-## molscrub
+## Uni-Pka container
 
-molscrub is optional at install time but required for the default pH/protomer candidate-generation step:
+Uni-Pka is the default protonation tool (`protonation.tool: unipka`) and runs
+only through a container:
+
+```bash
+# Option A: pre-built Apptainer image from the Zenodo record
+# ("Uni-Pka protonation container and model files", record 19627026).
+# Placing it at containers/unipka.sif needs no config change (the default
+# `container: unipka` maps to it); otherwise set the path:
+#   protonation:
+#     tool: unipka
+#     unipka:
+#       container: /path/to/unipka.sif
+wget -O containers/unipka.sif \
+  "https://zenodo.org/records/19627026/files/unipka.sif?download=1"  # ~7.7 GB
+
+# Option B: build from the EasyDock recipe
+git clone https://github.com/ci-lab-cz/easydock.git
+cd easydock/containers/unipka
+apptainer build unipka.sif unipka.def   # Apptainer
+docker build -t unipka .                # or Docker
+```
+
+Every published Zenodo image bakes an outdated `unipka.py` without the
+occupancy flags; DSVR bind-mounts the current EasyDock script (vendored at
+`containers/unipka.py`) over it automatically. Override the path with
+`protonation.unipka.script_path` (empty string disables the override).
+
+Without root access, Apptainer can be installed from conda-forge
+(`conda create -p .apptainer-env -c conda-forge apptainer` + a symlink on
+PATH); it runs fully unprivileged via user namespaces.
+
+Either Docker or Apptainer/Singularity may supply the runtime; DSVR picks
+Apptainer for `.sif` paths (else Docker) unless `protonation.unipka.runtime`
+overrides it. Verify with:
+
+```bash
+dsvr doctor --strict
+```
+
+## molscrub (optional alternative)
+
+molscrub remains available for A/B comparison by setting
+`protonation.tool: molscrub`:
 
 ```bash
 python -m pip install git+https://github.com/forlilab/molscrub.git
 dsvr doctor
 ```
 
-If molscrub is unavailable, fast smoke workflows can use fallback original-molecule candidates, but production pH/protomer enumeration should install molscrub.
+Molscrub uses the legacy heuristic plausibility scoring for protomer
+selection and predicts no occupancy or free energy fields.
 
 ## Verify
 

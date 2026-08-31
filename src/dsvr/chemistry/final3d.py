@@ -760,7 +760,7 @@ def _final_properties(record: SeedConformerRecord, config: RunConfig) -> dict[st
         "DSVR_TAUTOMER_ID": tautomer_id,
         "DSVR_STEREO_ID": stereo_id,
         "DSVR_FINAL_VARIANT_ID": record.id,
-        "DSVR_PROTONATION_STAGE": "molscrub_or_input_state",
+        "DSVR_PROTONATION_STAGE": config.protonation.tool if config.protonation.enabled else "input_state",
         "DSVR_TAUTOMER_RELATIVE_ENERGY_KCAL_MOL": _metadata_energy(record, "tautomer_relative_energy_kcal_mol"),
         "DSVR_STEREO_RELATIVE_ENERGY_KCAL_MOL": _metadata_energy(record, "stereo_relative_energy_kcal_mol"),
         "DSVR_FINAL_AUTO3D_ENERGY_KCAL_MOL": record.energy_kcal_mol,

@@ -18,7 +18,16 @@ chemistry:
 
 protonation:
   enabled: true
-  tool: molscrub
+  tool: unipka
+  unipka:
+    container: unipka
+    runtime: auto
+    min_occupancy: 0.05
+    # max_forms defaults to max_protomers_per_molecule
+    ph_range_low: 2.0
+    ph_range_high: 12.0
+    ph_step: 0.25
+    timeout_seconds: 3600
   mode: plausible
   max_protomers_per_molecule: 8
   keep_input_state: true

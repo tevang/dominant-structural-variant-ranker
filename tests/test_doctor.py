@@ -14,16 +14,22 @@ def test_doctor_returns_default_workflow_and_optional_tool_statuses(
     monkeypatch,
 ) -> None:
     monkeypatch.setattr(tool_check, "executable_version", lambda *args, **kwargs: "mock 1.0")
+    from dsvr.runners import unipka_runner
+
+    # default config: no container runtime on this host → unipka check present but unavailable
+    monkeypatch.setattr(unipka_runner.shutil, "which", lambda _name: None)
 
     statuses = check_tools(output_dir=tmp_path / "out")
 
     names = {status.name for status in statuses}
-    assert {"python", "rdkit", "molscrub", "Auto3D", "xtb", "crest"}.issubset(names)
+    assert {"python", "rdkit", "unipka", "molscrub", "Auto3D", "xtb", "crest"}.issubset(names)
     required = {status.name for status in statuses if status.required}
-    assert {"python", "rdkit", "molscrub", "xtb", "crest", "output-directory"}.issubset(
-        required
-    )
+    assert {"python", "rdkit", "unipka", "xtb", "crest", "output-directory"}.issubset(required)
+    assert "molscrub" not in required
     assert "Auto3D" not in required
+    unipka = next(status for status in statuses if status.name == "unipka")
+    assert not unipka.available
+    assert "container" in unipka.detail or "Apptainer" in unipka.detail or "Uni-Pka" in unipka.detail
 
 
 def test_doctor_groups_tool_interfaces_under_one_usability_row(
@@ -41,11 +47,11 @@ def test_doctor_groups_tool_interfaces_under_one_usability_row(
     statuses = check_tools(output_dir=tmp_path / "out")
 
     groups = [status for status in statuses if status.kind == "tool"]
-    assert [group.name for group in groups] == ["molscrub", "Auto3D", "psi4"]
+    assert [group.name for group in groups] == ["unipka", "molscrub", "Auto3D", "psi4"]
 
     # The summary row reports whether the tool is usable via any interface.
     molscrub = next(status for status in groups if status.name == "molscrub")
-    assert molscrub.required
+    assert not molscrub.required  # optional alternative to the Uni-Pka default
     assert molscrub.available
     assert "CLI" in molscrub.detail
 
@@ -83,18 +89,44 @@ def test_doctor_payload_required_group_satisfied_by_any_interface(
         "which_executable",
         lambda name: "/usr/bin/scrub.py" if name == "scrub.py" else None,
     )
+    from dsvr.runners import unipka_runner
+
+    # pretend docker exists with a pullable image name → Uni-Pka required check satisfied
+    monkeypatch.setattr(unipka_runner.shutil, "which", lambda name: f"/bin/{name}")
+    monkeypatch.setattr(
+        unipka_runner,
+        "check_unipka_image",
+        lambda config: config.container,
+    )
 
     payload = tool_check.doctor_payload(output_dir=tmp_path / "out")
 
     assert "molscrub" not in payload["required_missing"]
+    assert "unipka" not in payload["required_missing"]
     assert {"xtb", "crest"}.issubset(set(payload["required_missing"]))
+
+
+def test_doctor_payload_flags_missing_unipka_image(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    from dsvr.runners import unipka_runner
+
+    monkeypatch.setattr(unipka_runner.shutil, "which", lambda name: f"/bin/{name}")
+    monkeypatch.setattr(unipka_runner, "check_unipka_image", lambda config: None)
+
+    payload = tool_check.doctor_payload(output_dir=tmp_path / "out")
+
+    assert "unipka" in payload["required_missing"]
+    unipka_row = next(c for c in payload["checks"] if c["name"] == "unipka")
+    assert "Zenodo" in unipka_row["detail"]
 
 
 def test_cli_doctor_json_writes_machine_readable_report(
     tmp_path: Path,
     monkeypatch,
 ) -> None:
-    monkeypatch.setattr(cli, "check_tools", lambda output_dir: _mock_statuses())
+    monkeypatch.setattr(cli, "check_tools", lambda output_dir, protonation=None: _mock_statuses())
     json_out = tmp_path / "doctor.json"
 
     result = CliRunner().invoke(
@@ -119,7 +151,7 @@ def test_cli_doctor_strict_fails_only_for_required_missing(monkeypatch) -> None:
     monkeypatch.setattr(
         cli,
         "check_tools",
-        lambda output_dir: [
+        lambda output_dir, protonation=None: [
             ToolStatus(
                 name="xtb",
                 kind="executable",

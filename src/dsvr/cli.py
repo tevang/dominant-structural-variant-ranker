@@ -250,6 +250,7 @@ def version() -> None:
 
 @app.command()
 def doctor(
+    ctx: typer.Context,
     output_dir: Annotated[
         Path,
         typer.Option("--output-dir", help="Directory used for writability and disk checks."),
@@ -267,7 +268,11 @@ def doctor(
         typer.Option("--strict", help="Exit nonzero if required default-workflow checks fail."),
     ] = False,
 ) -> None:
-    """Check optional external tools without importing them at package import time."""
+    """Check optional external tools without importing them at package import time.
+
+    With a global `-c/--config`, the protonation tool/image selection from that
+    config is what the unipka row checks.
+    """
     table = Table(title="DSVR external tool check")
     table.add_column("Tool")
     table.add_column("Kind")
@@ -275,7 +280,11 @@ def doctor(
     table.add_column("Status")
     table.add_column("Version")
     table.add_column("Detail")
-    statuses = check_tools(output_dir=output_dir)
+    protonation_config = None
+    global_config_path = _global_options(ctx).get("config_path")
+    if global_config_path is not None:
+        protonation_config = load_config(Path(global_config_path)).protonation
+    statuses = check_tools(output_dir=output_dir, protonation=protonation_config)
     required_missing = [
         item.name for item in statuses if item.required and not item.available
     ]
@@ -522,7 +531,7 @@ def enumerate_protomers(
     input_path: Annotated[Path, typer.Argument(exists=True, dir_okay=False)],
     ph: Annotated[
         float,
-        typer.Option("--ph", help="Candidate-generation pH for molscrub."),
+        typer.Option("--ph", help="Candidate-generation pH."),
     ] = 7.0,
     solvent: Annotated[
         str,
@@ -537,12 +546,13 @@ def enumerate_protomers(
         typer.Option("--format", help="Input format override."),
     ] = "auto",
 ) -> None:
-    """Generate pH/protomer candidate states with molscrub."""
+    """Generate pH/protomer candidate states (molscrub; Uni-Pka runs via prepare-ligands)."""
     config = RunConfig(
         input_path=input_path,
         input_format=input_format,
         output_dir=out,
         chemistry={"ph": ph, "solvent": solvent},
+        protonation={"tool": "molscrub"},
     )
     molecules = read_molecules(
         input_path,

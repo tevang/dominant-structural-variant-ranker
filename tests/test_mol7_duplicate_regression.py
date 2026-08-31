@@ -66,6 +66,7 @@ def _mol7_protomers(config: RunConfig) -> list:
 
 
 def _config(tmp_path: Path, **overrides) -> RunConfig:
+    overrides.setdefault("protonation", {"tool": "molscrub", "max_protomers_per_molecule": 4})
     tautomer_filtering = {
         "tauto_k": 2,
         "keep_input_tautomer": False,

@@ -5,7 +5,10 @@ import shutil
 import sys
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
+
+if TYPE_CHECKING:  # pragma: no cover
+    from dsvr.config import ProtonationConfig
 
 from dsvr.models import ToolStatus
 from dsvr.runners.subprocess_utils import (
@@ -52,7 +55,7 @@ class _ToolGroup:
 _TOOL_GROUPS = (
     _ToolGroup(
         name="molscrub",
-        required=True,
+        required=False,
         interfaces=(
             _InterfaceCheck(
                 kind="python-module",
@@ -67,7 +70,8 @@ _TOOL_GROUPS = (
             ),
         ),
         install_hint=(
-            "not usable; install with "
+            "optional (legacy protonation tool; only needed when "
+            "protonation.tool=molscrub); install with "
             "pip install git+https://github.com/forlilab/molscrub.git "
             "or provide scrub.py/molscrub on PATH"
         ),
@@ -112,10 +116,20 @@ _TOOL_GROUPS = (
 )
 
 
-def check_tools(output_dir: Path | None = None) -> list[ToolStatus]:
+def check_tools(
+    output_dir: Path | None = None,
+    protonation: ProtonationConfig | None = None,
+) -> list[ToolStatus]:
+    """Tool availability rows; `protonation` reflects a user config when given.
+
+    Without a config, the default protonation selection (unipka, enabled) is
+    assumed, which keeps Uni-Pka a required check.
+    """
+
     statuses = [
         _python_status(),
         *_module_statuses(),
+        _unipka_status(protonation),
         *_tool_group_statuses(),
         *_executable_statuses(),
         _writable_output_status(output_dir or Path("runs/dsvr")),
@@ -125,8 +139,62 @@ def check_tools(output_dir: Path | None = None) -> list[ToolStatus]:
     return statuses
 
 
-def doctor_payload(output_dir: Path | None = None) -> dict[str, Any]:
-    statuses = check_tools(output_dir=output_dir)
+def _unipka_status(protonation: ProtonationConfig | None = None) -> ToolStatus:
+    """Uni-Pka (EasyDock container) availability: runtime + configured image.
+
+    Required only when the (optionally user-selected) protonation stage uses
+    Uni-Pka; with molscrub selected or protonation disabled, Uni-Pka becomes an
+    informational row so `dsvr doctor --strict` reflects the actual workflow.
+    """
+
+    from dsvr.config import ProtonationConfig as _ProtonationConfig
+    from dsvr.runners.unipka_runner import inspect_unipka
+
+    config = protonation or _ProtonationConfig()
+    selected = config.enabled and config.tool == "unipka"
+    if not selected:
+        reason = (
+            "protonation disabled"
+            if not config.enabled
+            else f"protonation.tool={config.tool}; Uni-Pka not used"
+        )
+        return ToolStatus(
+            name="unipka",
+            kind="tool",
+            required=False,
+            available=True,
+            detail=reason,
+        )
+    probe = inspect_unipka(config.unipka)
+    runtime_ok = probe["runtime"] is not None
+    image = probe["image"]
+    available = runtime_ok and image is not None
+    if available:
+        detail = f"container runtime={probe['runtime']}; image={image}"
+        script_override = probe.get("script_override")
+        if script_override:
+            detail += f"; script={script_override}"
+    elif not runtime_ok:
+        detail = str(probe["runtime_error"])
+    else:
+        detail = (
+            f"Uni-Pka image not found: {probe['container']}; download unipka.sif "
+            "from Zenodo or build from the EasyDock recipe (docs/external_tools.md)"
+        )
+    return ToolStatus(
+        name="unipka",
+        kind="tool",
+        required=True,
+        available=available,
+        detail=detail,
+    )
+
+
+def doctor_payload(
+    output_dir: Path | None = None,
+    protonation: ProtonationConfig | None = None,
+) -> dict[str, Any]:
+    statuses = check_tools(output_dir=output_dir, protonation=protonation)
     required_missing = [
         status.name for status in statuses if status.required and not status.available
     ]

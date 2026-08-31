@@ -17,7 +17,12 @@ Usage: scripts/bootstrap_mamba.sh [options]
 Create/update the dsvr conda environment and install this package editable.
 
 Options:
-  --with-molscrub   pip install git+https://github.com/forlilab/molscrub.git
+  --with-molscrub   optional: pip install molscrub (legacy protonation tool)
+    # NOTE: the default protomer generator is the Uni-Pka container;
+    # acquire it per docs/installation.md ("Uni-Pka container"), e.g.:
+    #   wget -O containers/unipka.sif \
+    #     "https://zenodo.org/records/19627026/files/unipka.sif?download=1"
+    # (or build from the EasyDock recipe; verify with `dsvr doctor`).
   --with-auto3d     pip install Auto3D
   --with-pyscf      pip install pyscf
   --with-psi4       mamba install psi4 -c conda-forge

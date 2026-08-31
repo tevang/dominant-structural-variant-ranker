@@ -63,7 +63,7 @@ def _report_text(
     tool_rows = [
         f"- {status.name} ({status.kind}): {'ok' if status.available else 'missing'} "
         f"{status.version or ''} {status.detail}"
-        for status in check_tools(output_dir=config.output_dir)
+        for status in check_tools(output_dir=config.output_dir, protonation=config.protonation)
     ]
     top_rows = []
     for record in sorted(ranked_records, key=lambda item: (item.input_molecule_id, item.rank)):
@@ -110,6 +110,7 @@ def _report_text(
         f"- Population scope: {config.thermo.population_scope}",
         f"- Thermo max variants per molecule: {config.thermo.max_variants_per_molecule}",
         f"- Thermo max conformers per variant: {config.thermo.max_conformers_per_variant}",
+        f"- Protonation tool: {config.protonation.tool}",
         f"- Optional CREST/xTB validation enabled: {config.optional_validation.crest_xtb_enabled}",
         f"- Optional validation selection: {config.optional_validation.selection}",
         f"- Optional validation max variants per molecule: {config.optional_validation.max_variants_per_molecule}",
@@ -158,6 +159,8 @@ def _report_text(
         "",
         *audit_summary_rows,
         "",
+        *_protonation_section(records, config),
+        "",
         "## Top Ranked Variants Per Input",
         "",
         "| Input ID | Rank | Molecule | ΔG kcal/mol | Population | Scope |",
@@ -167,9 +170,14 @@ def _report_text(
         "## Scientific Assumptions and Warnings",
         "",
         (
-            f"- pH {config.chemistry.ph} is used for candidate generation by default; "
-            "molscrub-generated protonation/protomer states are not assigned rigorous "
-            "pH populations."
+            f"- pH {config.chemistry.ph} is used for candidate generation by default. "
+            + (
+                "Uni-Pka occupancies and free energies are model predictions at this pH; "
+                "downstream rankings do not re-weight states by them."
+                if config.protonation.tool == "unipka"
+                else "molscrub-generated protonation/protomer states are not assigned "
+                "rigorous pH populations."
+            )
         ),
         (
             f"- Solvent '{config.chemistry.solvent}' with solvent model "
@@ -244,6 +252,81 @@ def _report_text(
         "",
     ]
     return "\n".join(lines)
+
+
+def _protonation_section(
+    records: list[AnyLineageRecord], config: RunConfig
+) -> list[str]:
+    """Per-molecule Uni-Pka protonation properties (only for unipka runs)."""
+    if config.protonation.tool != "unipka":
+        return []
+    protomer_records = [
+        record
+        for record in records
+        if record.stage_name == "protomer" and record.metadata.get("tool") == "unipka"
+    ]
+    if not protomer_records:
+        return []
+    lines = ["## Protonation Properties (Uni-Pka)", ""]
+    dist_path = (
+        config.output_dir / "enumeration" / "protomers" / "unipka_distribution.tsv"
+    )
+    if dist_path.exists():
+        lines.append(f"- pH distribution artifact: `{dist_path}`")
+    by_input: dict[str, list[AnyLineageRecord]] = {}
+    for record in protomer_records:
+        by_input.setdefault(record.input_molecule_id, []).append(record)
+    for input_id, group in sorted(by_input.items()):
+        first = group[0]
+        summary = first.metadata.get("unipka_summary", {})
+        forms = ", ".join(
+            f"{_short_smiles(r.canonical_smiles)} (q={r.formal_charge},"
+            f" occ={_fmt3(r.metadata.get('unipka_occupancy'))})"
+            for r in group
+        )
+        charge_pop = summary.get("charge_population", {})
+        charge_text = (
+            ", ".join(f"q{q}:{_fmt3(pop)}" for q, pop in sorted(charge_pop.items()))
+            if charge_pop
+            else "n/a"
+        )
+        lines.append(f"- **{first.molname or input_id}** (`{input_id}`)")
+        lines.append(f"  - forms: {forms}")
+        lines.append(
+            "  - occupancies entropy={entropy}; microstates={states}; charge pops [{pops}]".format(
+                entropy=_fmt3(summary.get("occupancy_entropy")),
+                states=summary.get("microstate_count", 0),
+                pops=charge_text,
+            )
+        )
+        lines.append(
+            "  - pI={pi}; nearest pKa transition at pH {trans} (distance {dist})".format(
+                pi=_fmt2(summary.get("isoelectric_point")),
+                trans=_fmt2(summary.get("pka_nearest_transition")),
+                dist=_fmt2(summary.get("pka_nearest_distance")),
+            )
+        )
+    return lines
+
+
+def _short_smiles(smiles: str | None) -> str:
+    if smiles is None:
+        return "?"
+    return smiles if len(smiles) <= 24 else smiles[:21] + "..."
+
+
+def _fmt3(value: Any) -> str:
+    try:
+        return f"{float(value):.3f}"
+    except (TypeError, ValueError):
+        return "n/a"
+
+
+def _fmt2(value: Any) -> str:
+    try:
+        return f"{float(value):.2f}"
+    except (TypeError, ValueError):
+        return "n/a"
 
 
 def _audit_summary_rows(
