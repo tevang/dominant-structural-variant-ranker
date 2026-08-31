@@ -350,6 +350,8 @@ def _records_from_unipka_candidates(
     _write_protomer_sdf(output_dir / f"{mol_record.input_id}_protomers.sdf", records)
     _write_protomer_csv(output_dir / f"{mol_record.input_id}_protomers.csv", records)
     _append_csv(output_dir / "protomers_selected.csv", [_record_row(record) for record in records])
+    # Uni-Pka lists every candidate it accepted; rejected/capped forms appear in
+    # protomers_rejected.csv (molscrub's all-table keeps rejected rows inline).
     all_rows = []
     for index, record in enumerate(records, start=1):
         plausibility = record.metadata.get("plausibility", {})
@@ -367,7 +369,9 @@ def _records_from_unipka_candidates(
                 "selection_reason": plausibility.get("selection_reason"),
                 "reasons": " | ".join(plausibility.get("reasons", [])),
                 "warnings": " | ".join(record.warnings),
-                "score_is_population_estimate": plausibility.get("score") is not None,
+                "score_is_population_estimate": _record_row(record)[
+                    "score_is_population_estimate"
+                ],
             }
         )
     _append_csv(output_dir / "protomers_all.csv", all_rows)
@@ -734,6 +738,11 @@ def _candidate_row(
 
 def _record_row(record: ProtomerRecord) -> dict[str, Any]:
     plausibility = record.metadata.get("plausibility", {})
+    # Uni-Pka scores are negated predicted Boltzmann occupancies; molscrub
+    # heuristic scores and input-state fallbacks are population-free.
+    is_estimate = record.metadata.get("tool") == "unipka" and plausibility.get(
+        "selection_reason"
+    ) not in {"fallback_input_state"}
     return {
         "input_molecule_id": record.input_molecule_id,
         "protomer_id": record.id,
@@ -746,7 +755,7 @@ def _record_row(record: ProtomerRecord) -> dict[str, Any]:
         "selected": True,
         "selection_reason": plausibility.get("selection_reason"),
         "warnings": " | ".join(record.warnings),
-        "score_is_population_estimate": False,
+        "score_is_population_estimate": is_estimate,
     }
 
 
