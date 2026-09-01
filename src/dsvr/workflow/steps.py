@@ -52,9 +52,13 @@ def planned_steps(config: RunConfig) -> list[WorkflowStep]:
         WorkflowStep("standardize", "Standardize RDKit molecules when enabled.", root / "input"),
         WorkflowStep(
             "protonation",
-            "Generate pH/protomer candidates with molscrub.",
+            (
+                "Generate protomer candidates with Uni-Pka (occupancy-ranked)."
+                if config.protonation.tool == "unipka"
+                else "Generate pH/protomer candidates with molscrub."
+            ),
             root / "enumeration" / "protomers",
-            ["molscrub"],
+            ["unipka" if config.protonation.tool == "unipka" else "molscrub"],
         ),
         WorkflowStep(
             "tautomers",

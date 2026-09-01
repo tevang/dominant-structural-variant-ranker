@@ -36,6 +36,16 @@ enumeration:
   stereo_random_seed: 61453
   fail_on_enumeration_cap: false
 
+protonation:
+  enabled: true
+  tool: molscrub
+  mode: plausible
+  max_protomers_per_molecule: 4
+  keep_input_state: true
+  keep_best_per_charge: true
+  skip_gen3d_in_molscrub: true
+  timeout_seconds_per_molecule: 60
+
 seeding:
   method: etkdg
   rdkit_num_conformers: 3

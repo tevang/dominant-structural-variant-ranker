@@ -44,6 +44,7 @@ def test_ligprep_default_bounds_runaway_enumeration_with_mocked_tools(
     input_path.write_text("CCO ethanol\n", encoding="utf-8")
     outdir = tmp_path / "run"
     config_data = load_config(Path("configs/ligprep_like_default.yaml")).model_dump(mode="python")
+    config_data["protonation"]["tool"] = "molscrub"
     config_data.update({"input_path": input_path, "output_dir": outdir, "overwrite": True, "resume": False})
     config = RunConfig.model_validate(config_data)
     assert config.optional_validation.crest_xtb_enabled is False

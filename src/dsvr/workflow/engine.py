@@ -18,7 +18,10 @@ from dsvr.chemistry.conformers_auto3d import (
 from dsvr.chemistry.conformers_rdkit import generate_rdkit_seeds, read_stereo_sdf
 from dsvr.chemistry.final3d import generate_final_3d_variants
 from dsvr.chemistry.identity import ExactDuplicateKey, exact_duplicate_key_with_warning
-from dsvr.chemistry.protonation import generate_protomer_candidates
+from dsvr.chemistry.protonation import (
+    generate_protomer_candidates,
+    generate_unipka_protomer_candidates,
+)
 from dsvr.chemistry.stereo_auto3d_filter import filter_stereoisomers_with_auto3d
 from dsvr.chemistry.stereochemistry import enumerate_stereoisomers, read_tautomers_sdf
 from dsvr.chemistry.tautomer_auto3d_filter import filter_tautomers_with_auto3d
@@ -76,6 +79,12 @@ from dsvr.runners.crest_runner import read_seed_sdf, run_crest_for_seed
 from dsvr.runners.molscrub_runner import MolscrubUnavailableError
 from dsvr.runners.psi4_runner import rescore_top_ranked_with_psi4
 from dsvr.runners.pyscf_runner import rescore_top_ranked_with_pyscf
+from dsvr.runners.unipka_runner import (
+    UnipkaExecutionError,
+    UnipkaMoleculeResult,
+    UnipkaUnavailableError,
+    generate_unipka_batch,
+)
 from dsvr.runners.xtb_runner import run_xtb_thermo
 from dsvr.utils.logging import configure_logging
 from dsvr.workflow.provenance import build_provenance, write_all_provenance_outputs
@@ -186,6 +195,36 @@ def run_workflow(config: RunConfig) -> WorkflowResult:
         protomers = _load_protomers(outdir)
         progress.record("Protomer generation", "skipped", generated_count=len(protomers))
     else:
+        # Uni-Pka batch pre-pass: a single container invocation per run for all
+        # molecules that still need protomer generation (checkpointed molecules
+        # are excluded, so a full-resume re-run issues no call at all).
+        # Retry-after-failure relies on Input validation re-recording every
+        # molecule as completed at its own stage before this loop reads the
+        # per-item checkpoint, so a stale "Protomer generation/failed" state
+        # never matches the stage filter and failed molecules stay pending.
+        unipka_results: dict[str, UnipkaMoleculeResult] = {}
+        unipka_stage_error: Exception | None = None
+        if config.protonation.enabled and config.protonation.tool == "unipka":
+            pending = [
+                molecule
+                for molecule in molecules
+                if not should_skip_item_state(
+                    recovery, molecule.input_id, resume=config.resume, stage="Protomer generation"
+                )
+                and not _load_existing_protomer_outputs(molecule, outdir, config)
+            ]
+            if pending:
+                try:
+                    batch = generate_unipka_batch(
+                        pending,
+                        config=config.protonation.unipka,
+                        ph=config.chemistry.ph,
+                        workdir=outdir / "enumeration" / "protomers",
+                        log_dir=outdir / "logs",
+                    )
+                    unipka_results = batch.results
+                except (UnipkaUnavailableError, UnipkaExecutionError) as exc:
+                    unipka_stage_error = exc
         for index, molecule in enumerate(molecules, start=1):
             if should_skip_item_state(
                 recovery,
@@ -212,6 +251,14 @@ def run_workflow(config: RunConfig) -> WorkflowResult:
                     warning = "protonation.enabled=false; retained input state only"
                     warnings.append(warning)
                     protomers.extend(_fallback_protomer(molecule, config, warning=warning))
+                elif config.protonation.tool == "unipka":
+                    if unipka_stage_error is not None:
+                        raise unipka_stage_error
+                    protomers.extend(
+                        generate_unipka_protomer_candidates(
+                            molecule, config, unipka_results[molecule.input_id]
+                        )
+                    )
                 else:
                     protomers.extend(generate_protomer_candidates(molecule, config))
                 recovery.molecule(
@@ -220,7 +267,7 @@ def run_workflow(config: RunConfig) -> WorkflowResult:
                     stage="Protomer generation",
                     status="completed",
                 )
-            except MolscrubUnavailableError as exc:
+            except (MolscrubUnavailableError, UnipkaUnavailableError, UnipkaExecutionError) as exc:
                 _record_item_failure(
                     recovery,
                     progress,
@@ -233,7 +280,12 @@ def run_workflow(config: RunConfig) -> WorkflowResult:
                 if config.error_handling.keep_fallback_parent_state:
                     warning = f"Protomer generation failed; retained input state fallback: {exc}"
                     warnings.append(warning)
-                    protomers.extend(_fallback_protomer(molecule, config, warning=warning))
+                    # persist=False: failure fallbacks stay in-memory so a later
+                    # --resume retries protonation after the cause is fixed
+                    # instead of checkpoint-loading the degraded input state.
+                    protomers.extend(
+                        _fallback_protomer(molecule, config, warning=warning, persist=False)
+                    )
                 else:
                     recovery.molecule(
                         item_id=molecule.input_id,
@@ -2092,8 +2144,17 @@ def _fallback_protomer(
     molecule: MoleculeInput,
     config: RunConfig,
     *,
-    warning: str = "molscrub unavailable; input protomer fallback retained",
+    warning: str = "protonation unavailable; input protomer fallback retained",
+    persist: bool = True,
 ) -> list[ProtomerRecord]:
+    """Input-state protomer used when protonation is disabled or failed.
+
+    ``persist=False`` skips writing the canonical per-molecule stage artifacts:
+    failure fallbacks must not be checkpoint-loaded by a later ``--resume`` run,
+    so that fixing the cause (e.g. raising protonation.unipka.timeout_seconds)
+    re-runs protonation instead of silently reusing degraded input states.
+    """
+
     output_dir = config.output_dir / "enumeration" / "protomers"
     output_dir.mkdir(parents=True, exist_ok=True)
     mol = Chem.Mol(molecule.rdkit_mol)
@@ -2102,7 +2163,7 @@ def _fallback_protomer(
     formula = rdMolDescriptors.CalcMolFormula(mol)
     metadata = {
         "fallback": True,
-        "reason": "molscrub unavailable; original molecule used as single protomer candidate",
+        "reason": "protonation unavailable; original molecule used as single protomer candidate",
     }
     record = ProtomerRecord(
         id=make_protomer_id(molecule.input_id, 1, canonical, isomeric, metadata),
@@ -2120,15 +2181,13 @@ def _fallback_protomer(
             output_dir / f"{molecule.input_id}_protomers.sdf",
             output_dir / f"{molecule.input_id}_protomers.csv",
         ],
-        warnings=[
-            "molscrub unavailable; original molecule used as a single protomer candidate. "
-            "This is suitable for smoke tests only."
-        ],
+        warnings=[f"{warning} Original molecule retained as single protomer candidate."],
         metadata=metadata,
         protomer_index=1,
         rdkit_mol=mol,
     )
-    _write_protomer_outputs(record)
+    if persist:
+        _write_protomer_outputs(record)
     return [record]
 
 

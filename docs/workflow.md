@@ -28,7 +28,7 @@ dsvr run examples/test_molecules.smi   --config configs/ligprep_like_default.yam
 | --- | --- | --- |
 | Input | DSVR readers | Read SMILES/SDF and report invalid records. |
 | Standardization | RDKit | Normalize molecules and keep valid ligand inputs. |
-| Protomer generation | molscrub/fallback logic | Generate plausible pH/protomer candidates at target pH. |
+| Protomer generation | Uni-Pka (default, occupancy-based) or molscrub | Generate and select protomer candidates at target pH; Uni-Pka stores predicted occupancy/dG and ensemble summary properties and writes a pH-distribution artifact. |
 | Early protomer filtering | DSVR filters | Cap protomer count before tautomer work. |
 | Tautomer candidate generation | RDKit via Auto3D path | Generate bounded tautomer candidates. |
 | Tautomer energy triage | Auto3D ANI2xt/AIMNet2 | Rank/filter by optimized conformer energies. |

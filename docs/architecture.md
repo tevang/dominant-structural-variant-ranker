@@ -44,7 +44,7 @@ flowchart TB
 
     subgraph row2[" "]
         direction RL
-        C[molscrub protomer<br/>candidates] --> D[Early filtering]
+        C[Uni-Pka protomer<br/>candidates (or molscrub)] --> D[Early filtering]
     end
 
     subgraph row3[" "]
@@ -84,7 +84,11 @@ uses them.
 
 The architecture separates candidate generation from thermodynamic correction:
 
-- molscrub provides practical pH/protomer candidates.
+- Uni-Pka (container) provides protomer microspecies with predicted
+  occupancies/free energies; molscrub is an optional alternative providing
+  structure-only candidates with heuristic scoring. Selection dispatch sits in
+  `src/dsvr/chemistry/protonation.py` on `protonation.tool`, with runners in
+  `src/dsvr/runners/unipka_runner.py` / `molscrub_runner.py`.
 - RDKit tautomer canonicalization is representation canonicalization, not
   stability ranking.
 - RDKit stereoisomer enumeration is explicit and controlled by configuration.

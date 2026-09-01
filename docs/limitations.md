@@ -8,7 +8,35 @@ The default workflow is designed for fast ligand preparation, docking, ligand-ba
 
 ## pH and Protonation
 
-Default pH handling is candidate generation, not rigorous constant-pH thermodynamics. molscrub is used to generate practical pH/protomer/protonation candidates at the requested pH or pH window.
+Default pH handling is candidate generation plus model predictions, not
+rigorous constant-pH thermodynamics. The default Uni-Pka path enumerates
+microspecies and predicts a free energy per microspecies; protomer selection
+uses the predicted Boltzmann occupancies at the working pH, and six
+per-molecule summary properties (ensemble entropy, charge populations,
+microstate count, top-two occupancy gap, isoelectric point, distance to the
+nearest macroscopic pKa transition) are stored for later uncertainty
+analysis.
+
+Uni-Pka predictions come with sharp caveats: the model was trained on
+drug-like chemistry (Uni-Mol/Dwars) and its absolute occupancies are
+estimates; the pH-distribution grid for pKa/pI/interpolation is coarse for
+publication values (default step 0.25, analysis refined to ≤0.05); pure
+acids and pure bases have a null isoelectric point by construction (net
+charge never crosses zero); and the downstream ranking in this release does
+not re-weight variants by Uni-Pka occupancies — they are recorded features,
+not corrections. molscrub (`protonation.tool: molscrub`) remains available
+and uses the original heuristic plausibility scoring with no occupancy
+predictions.
+
+Because Uni-Pka selection differs from molscrub's, default runs are not
+comparable to molscrub-era runs; provenance records which tool produced
+each run. One semantic difference to note: `keep_input_state: true` under
+molscrub unconditionally injects the input protonation state as a candidate,
+while under Uni-Pka it only prioritizes the input state **if Uni-Pka predicted
+that form at all** (it is never force-injected below the occupancy threshold,
+since a form the model did not predict has no occupancy to rank). When the
+input state was dropped for that reason, no warning is raised; the selected
+forms and the pH-distribution artifact show what was kept.
 
 DSVR does not perform rigorous pH-dependent population calculations unless a micro-pKa/proton chemical-potential correction provider is added. Without that correction, cross-protomer and cross-charge populations are approximate.
 

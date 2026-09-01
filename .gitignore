@@ -15,3 +15,5 @@ examples/runs/
 logs/
 tmp/
 doctor_report.json
+containers/*.sif
+.apptainer-env/

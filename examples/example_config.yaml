@@ -16,6 +16,26 @@ chemistry:
   keep_salts: false
   largest_fragment_only: true
 
+protonation:
+  enabled: true
+  tool: unipka
+  unipka:
+    # Docker image name or Apptainer .sif path (docs/installation.md)
+    container: unipka
+    runtime: auto
+    min_occupancy: 0.05
+    # max_forms defaults to max_protomers_per_molecule below
+    ph_range_low: 2.0
+    ph_range_high: 12.0
+    ph_step: 0.25
+    timeout_seconds: 3600
+  max_protomers_per_molecule: 4
+  keep_input_state: true
+  keep_best_per_charge: true
+  # molscrub-only (used when tool: molscrub)
+  skip_gen3d_in_molscrub: true
+  timeout_seconds_per_molecule: 60
+
 enumeration:
   max_protomers_per_molecule: 16
   max_tautomers_per_protomer: 16

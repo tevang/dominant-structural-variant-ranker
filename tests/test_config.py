@@ -263,3 +263,82 @@ def test_rejects_invalid_ligprep_caps_and_timeouts() -> None:
 def test_ligprep_requires_one_final_conformer_per_variant() -> None:
     with pytest.raises(ValidationError, match="one_conformer_per_variant"):
         RunConfig(workflow_mode="ligprep_like", final_3d={"one_conformer_per_variant": False})
+
+
+def test_protonation_tool_defaults_to_unipka() -> None:
+    config = RunConfig()
+
+    assert config.protonation.tool == "unipka"
+    assert config.protonation.unipka.container == "unipka"
+    assert config.protonation.unipka.runtime == "auto"
+    assert config.protonation.unipka.min_occupancy == 0.05
+    assert config.protonation.unipka.max_forms == config.protonation.max_protomers_per_molecule
+    assert config.protonation.unipka.ph_range_low == 2.0
+    assert config.protonation.unipka.ph_range_high == 12.0
+    assert config.protonation.unipka.ph_step == 0.25
+    assert config.protonation.unipka.timeout_seconds == 3600
+
+
+def test_molscrub_remains_selectable() -> None:
+    config = RunConfig(protonation={"tool": "molscrub"})
+
+    assert config.protonation.tool == "molscrub"
+    assert config.protonation.skip_gen3d_in_molscrub is True
+
+
+def test_rejects_unknown_protonation_tool() -> None:
+    with pytest.raises(ValidationError, match="tool"):
+        RunConfig(protonation={"tool": "dimorphite"})
+
+
+def test_rejects_max_forms_below_cap() -> None:
+    with pytest.raises(ValidationError, match="max_forms"):
+        RunConfig(
+            protonation={
+                "tool": "unipka",
+                "max_protomers_per_molecule": 4,
+                "unipka": {"max_forms": 2},
+            }
+        )
+
+
+def test_max_forms_defaults_to_cap() -> None:
+    config = RunConfig(protonation={"tool": "unipka", "max_protomers_per_molecule": 8})
+
+    assert config.protonation.unipka.max_forms == 8
+
+
+def test_cli_max_protomers_override_raises_cap_with_defaulted_max_forms() -> None:
+    config = merge_cli_overrides(RunConfig(), max_protomers=8)
+
+    assert config.protonation.max_protomers_per_molecule == 8
+    assert config.protonation.unipka.max_forms == 8
+
+
+def test_cli_max_protomers_override_keeps_explicit_max_forms() -> None:
+    base = RunConfig(protonation={"tool": "unipka", "unipka": {"max_forms": 12}})
+
+    config = merge_cli_overrides(base, max_protomers=8)
+
+    assert config.protonation.unipka.max_forms == 12
+
+    with pytest.raises(ValidationError, match="max_forms"):
+        merge_cli_overrides(
+            RunConfig(protonation={"tool": "unipka", "unipka": {"max_forms": 6}}),
+            max_protomers=8,
+        )
+
+
+def test_rejects_occupancy_out_of_range_and_bad_ph_range() -> None:
+    with pytest.raises(ValidationError, match="min_occupancy"):
+        RunConfig(protonation={"unipka": {"min_occupancy": 1.5}})
+    with pytest.raises(ValidationError, match="ph_range_low"):
+        RunConfig(protonation={"unipka": {"ph_range_low": 12.0, "ph_range_high": 2.0}})
+
+
+def test_rejects_working_ph_outside_unipka_range() -> None:
+    with pytest.raises(ValidationError, match="must be inside"):
+        RunConfig(chemistry={"ph": 14.5})
+    # molscrub runs do not use the Uni-Pka distribution range
+    config = RunConfig(chemistry={"ph": 14.5}, protonation={"tool": "molscrub"})
+    assert config.chemistry.ph == 14.5

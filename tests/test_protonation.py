@@ -43,7 +43,7 @@ def test_generate_protomer_candidates_with_mocked_molscrub(
     config = RunConfig(
         input_path=input_path,
         output_dir=tmp_path / "run",
-        protonation={"max_protomers_per_molecule": 32},
+        protonation={"tool": "molscrub", "max_protomers_per_molecule": 32},
     )
 
     records = generate_protomer_candidates(molecules[0], config)
@@ -87,7 +87,7 @@ def test_generate_protomer_candidates_caps_and_warns(
     config = RunConfig(
         input_path=input_path,
         output_dir=tmp_path / "run",
-        protonation={"max_protomers_per_molecule": 1},
+        protonation={"tool": "molscrub", "max_protomers_per_molecule": 1},
     )
 
     records = generate_protomer_candidates(molecules[0], config)
@@ -191,7 +191,7 @@ def test_many_molscrub_states_only_selected_protomers_pass_downstream(
     config = RunConfig(
         input_path=input_path,
         output_dir=tmp_path / "run",
-        protonation={"max_protomers_per_molecule": 2},
+        protonation={"tool": "molscrub", "max_protomers_per_molecule": 2},
     )
 
     records = generate_protomer_candidates(molecules[0], config)
@@ -224,9 +224,179 @@ def test_no_valid_molscrub_state_retains_original_with_warning(
         return [], "molscrub-test", "Scrub(...)"
 
     monkeypatch.setattr(protonation, "generate_molscrub_candidates", fake_molscrub_candidates)
-    config = RunConfig(input_path=input_path, output_dir=tmp_path / "run")
+    config = RunConfig(
+        input_path=input_path,
+        output_dir=tmp_path / "run",
+        protonation={"tool": "molscrub"},
+    )
 
     records = generate_protomer_candidates(molecules[0], config)
 
     assert len(records) == 1
     assert any("retained input" in warning for warning in records[0].warnings)
+
+
+def _unipka_molecule(tmp_path: Path, smiles: str):
+    input_path = tmp_path / "mols.smi"
+    input_path.write_text(f"{smiles} testmol\n", encoding="utf-8")
+    molecules, invalid = read_smiles(input_path)
+    assert invalid == []
+    return molecules[0]
+
+
+def _unipka_result(input_id: str, forms, envelope=None, failed=False, warning=None):
+    from dsvr.runners.unipka_runner import UnipkaEnvelope, UnipkaForm, UnipkaMoleculeResult
+
+    return UnipkaMoleculeResult(
+        input_id=input_id,
+        forms=[UnipkaForm(form_smiles=smi, occupancy=occ) for smi, occ in forms],
+        envelope=UnipkaEnvelope(microstates=envelope or {}),
+        failed=failed,
+        failed_warning=warning,
+        source_command="apptainer run container.sif protonate ...",
+    )
+
+
+def test_unipka_selection_keeps_dominant_form_above_threshold(tmp_path: Path) -> None:
+    from dsvr.chemistry.protonation import generate_unipka_protomer_candidates
+
+    molecule = _unipka_molecule(tmp_path, "CC(=O)O")
+    result = _unipka_result(
+        molecule.input_id,
+        [("CC(=O)[O-]", 0.97), ("CC(=O)O", 0.03)],
+        envelope={"CC(=O)[O-]": -6.79, "CC(=O)O": -5.25},
+    )
+    config = RunConfig(
+        input_path=tmp_path / "mols.smi",
+        output_dir=tmp_path / "run",
+        protonation={"tool": "unipka", "max_protomers_per_molecule": 4},
+    )
+
+    records = generate_unipka_protomer_candidates(molecule, config, result)
+
+    charges = [record.formal_charge for record in records]
+    assert charges.count(-1) == 1
+    assert len(records) == 2
+    # keep_input_state has selection precedence over raw occupancy ordering,
+    # so the neutral input form comes first; occupancy metadata matches each form
+    by_smiles = {record.canonical_smiles: record for record in records}
+    assert by_smiles["CC(=O)[O-]"].metadata["unipka_occupancy"] == 0.97
+    assert by_smiles["CC(=O)[O-]"].metadata["unipka_dg"] == -6.79
+    assert by_smiles["CC(=O)O"].metadata["unipka_occupancy"] == 0.03
+    assert by_smiles["CC(=O)O"].metadata["plausibility"]["selection_reason"] == "unipka_input_state"
+    assert by_smiles["CC(=O)[O-]"].metadata["plausibility"]["selection_reason"] == "unipka_best_per_charge"
+
+    # audit tables the report/audit consumers rely on must exist on the unipka path
+    audit_dir = tmp_path / "run" / "enumeration" / "protomers"
+    for name in ("protomers_all.csv", "protomers_selected.csv"):
+        path = audit_dir / name
+        assert path.exists() and path.read_text(encoding="utf-8").strip() != ""
+
+    # the input state is kept first despite low occupancy; the top-two gap must
+    # still be the occupancy-ordered difference, never the selection-order one
+    gap = records[0].metadata["unipka_summary"]["top_two_occupancy_gap"]
+    assert gap == pytest.approx(0.94)
+
+
+def test_unipka_cap_trims_by_occupancy(tmp_path: Path) -> None:
+    from dsvr.chemistry.protonation import generate_unipka_protomer_candidates
+
+    molecule = _unipka_molecule(tmp_path, "c1c[nH]cn1")
+    result = _unipka_result(
+        molecule.input_id,
+        [
+            ("c1c[nH]cn1", 0.60),
+            ("c1c[nH+]c[nH]1", 0.35),
+            ("c1c[nH]c[nH+]1", 0.05),
+        ],
+        envelope={},
+    )
+    config = RunConfig(
+        input_path=tmp_path / "mols.smi",
+        output_dir=tmp_path / "run",
+        protonation={"tool": "unipka", "max_protomers_per_molecule": 2, "unipka": {"max_forms": 3}},
+    )
+
+    records = generate_unipka_protomer_candidates(molecule, config, result)
+
+    assert len(records) == 2
+    assert [r.metadata["unipka_occupancy"] for r in records] == [0.60, 0.35]
+
+
+def test_unipka_failed_molecule_retains_input_state_with_summary_null(tmp_path: Path) -> None:
+    from dsvr.chemistry.protonation import generate_unipka_protomer_candidates
+
+    molecule = _unipka_molecule(tmp_path, "C1CCCCC1")
+    result = _unipka_result(
+        molecule.input_id,
+        [],
+        failed=True,
+        warning="Uni-Pka returned no protonation form; retained input state",
+    )
+    config = RunConfig(
+        input_path=tmp_path / "mols.smi",
+        output_dir=tmp_path / "run",
+        protonation={"tool": "unipka"},
+    )
+
+    records = generate_unipka_protomer_candidates(molecule, config, result)
+
+    assert len(records) == 1
+    assert any("retained input state" in warning for warning in records[0].warnings)
+    summary = records[0].metadata["unipka_summary"]
+    assert summary["microstate_count"] == 0
+    assert summary["occupancy_entropy"] is None
+    assert records[0].metadata["unipka_occupancy"] is None
+    assert records[0].source_software == "unipka"
+
+
+def test_unipka_summary_computed_from_envelope(tmp_path: Path) -> None:
+    from dsvr.chemistry.protonation import generate_unipka_protomer_candidates
+
+    molecule = _unipka_molecule(tmp_path, "c1c[nH]cn1")
+    result = _unipka_result(
+        molecule.input_id,
+        [("c1c[nH]cn1", 0.6254), ("c1c[nH+]c[nH]1", 0.3746)],
+        envelope={"c1c[nH]cn1": -5.24537, "c1c[nH+]c[nH]1": -6.7938},
+    )
+    config = RunConfig(
+        input_path=tmp_path / "mols.smi",
+        output_dir=tmp_path / "run",
+        chemistry={"ph": 7.4},
+        protonation={"tool": "unipka"},
+    )
+
+    records = generate_unipka_protomer_candidates(molecule, config, result)
+
+    summary = records[0].metadata["unipka_summary"]
+    assert summary["microstate_count"] == 2
+    assert summary["charge_population"] == {"0": pytest.approx(0.6254, abs=1e-3), "1": pytest.approx(0.3746, abs=1e-3)}
+    assert summary["top_two_occupancy_gap"] == pytest.approx(0.6254 - 0.3746, abs=1e-3)
+    # imidazole pKa ~7.18, working pH 7.4 → small nearest distance
+    assert summary["pka_nearest_transition"] == pytest.approx(7.18, abs=0.2)
+    # neutral↔+1 only: never negative → pI null
+    assert summary["isoelectric_point"] is None
+
+
+def test_unipka_provenance_records_tool_and_command(tmp_path: Path) -> None:
+    from dsvr.chemistry.protonation import generate_unipka_protomer_candidates
+
+    molecule = _unipka_molecule(tmp_path, "CC(=O)O")
+    result = _unipka_result(
+        molecule.input_id,
+        [("CC(=O)[O-]", 0.97)],
+        envelope={"CC(=O)[O-]": -6.79},
+    )
+    config = RunConfig(
+        input_path=tmp_path / "mols.smi",
+        output_dir=tmp_path / "run",
+        protonation={"tool": "unipka"},
+    )
+
+    records = generate_unipka_protomer_candidates(molecule, config, result)
+
+    assert records[0].source_software == "unipka"
+    assert "protonate" in (records[0].source_command or "")
+    assert records[0].source_python_function and "unipka" in records[0].source_python_function
+    assert records[0].metadata["tool"] == "unipka"
+    assert records[0].metadata["target_ph"] == 7.0

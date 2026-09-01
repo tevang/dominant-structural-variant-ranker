@@ -119,13 +119,75 @@ class EnumerationConfig(StrictModel):
         return value
 
 
+ProtonationTool = Literal["unipka", "molscrub"]
+UnipkaRuntime = Literal["auto", "docker", "apptainer"]
+
+
+class UnipkaConfig(StrictModel):
+    """Uni-Pka (EasyDock container implementation) execution options.
+
+    container: Docker image name or Apptainer .sif path; the bare default
+    ``unipka`` uses ``containers/unipka.sif`` in this repo when present.
+    runtime: container runtime selection; ``auto`` prefers Apptainer when a
+    .sif path is configured, otherwise prefers Docker when available.
+    script_path: host ``unipka.py`` bind-mounted over the image copy (all
+    published Zenodo SIF builds bake an outdated script); ``None`` uses the
+    vendored ``containers/unipka.py`` when present, ``""`` disables the override.
+    distribution_min_occupancy: keep in the distribution TSV every microstate
+    reaching it at any grid pH (lower = more complete ensemble for the summary
+    properties; the container default 0.01 drops low-population states).
+    ph_range covers the distribution artifact grid and MUST include the
+    working pH (validated against chemistry.ph in RunConfig).
+    """
+
+    container: str | None = "unipka"
+    runtime: UnipkaRuntime = "auto"
+    script_path: str | None = None
+    min_occupancy: float = 0.05
+    distribution_min_occupancy: float = 0.001
+    max_forms: int | None = None
+    ph_range_low: float = 2.0
+    ph_range_high: float = 12.0
+    ph_step: float = 0.25
+    timeout_seconds: int = 3600
+
+    @field_validator("min_occupancy", "distribution_min_occupancy")
+    @classmethod
+    def valid_occupancy(cls, value: float) -> float:
+        if not 0.0 <= value <= 1.0:
+            raise ValueError("unipka min_occupancy/distribution_min_occupancy must be in [0, 1]")
+        return value
+
+    @field_validator("max_forms", "timeout_seconds")
+    @classmethod
+    def positive_unipka_limit(cls, value: int | None) -> int | None:
+        if value is not None and value <= 0:
+            raise ValueError("unipka max_forms/timeout_seconds must be positive when set")
+        return value
+
+    @field_validator("ph_step")
+    @classmethod
+    def positive_ph_step(cls, value: float) -> float:
+        if value <= 0:
+            raise ValueError("unipka.ph_step must be positive")
+        return value
+
+    @model_validator(mode="after")
+    def validate_ph_range(self) -> UnipkaConfig:
+        if self.ph_range_low >= self.ph_range_high:
+            raise ValueError("unipka.ph_range_low must be < unipka.ph_range_high")
+        return self
+
+
 class ProtonationConfig(StrictModel):
     enabled: bool = True
-    tool: str = "molscrub"
+    tool: ProtonationTool = "unipka"
+    unipka: UnipkaConfig = Field(default_factory=UnipkaConfig)
     mode: str = "plausible"
     max_protomers_per_molecule: int = 4
     keep_input_state: bool = True
     keep_best_per_charge: bool = True
+    # molscrub-only keys; ignored when tool == "unipka"
     skip_gen3d_in_molscrub: bool = True
     timeout_seconds_per_molecule: int = 60
 
@@ -135,6 +197,19 @@ class ProtonationConfig(StrictModel):
         if value <= 0:
             raise ValueError("protonation limits must be positive")
         return value
+
+    @model_validator(mode="after")
+    def validate_unipka_forms(self) -> ProtonationConfig:
+        if self.tool == "unipka":
+            if self.unipka.max_forms is None:
+                object.__setattr__(self.unipka, "max_forms", self.max_protomers_per_molecule)
+            elif self.unipka.max_forms < self.max_protomers_per_molecule:
+                raise ValueError(
+                    "protonation.unipka.max_forms must be >= "
+                    "protonation.max_protomers_per_molecule so cap trimming does not "
+                    "silently discard forms"
+                )
+        return self
 
 
 class Auto3dConfig(StrictModel):
@@ -695,6 +770,17 @@ class RunConfig(StrictModel):
         return data
 
     @model_validator(mode="after")
+    def validate_unipka_ph_coverage(self) -> RunConfig:
+        if self.protonation.enabled and self.protonation.tool == "unipka":
+            up = self.protonation.unipka
+            if not up.ph_range_low <= self.chemistry.ph <= up.ph_range_high:
+                raise ValueError(
+                    f"chemistry.ph ({self.chemistry.ph}) must be inside "
+                    f"protonation.unipka pH range [{up.ph_range_low}, {up.ph_range_high}]"
+                )
+        return self
+
+    @model_validator(mode="after")
     def validate_ligprep_like_settings(self) -> RunConfig:
         if self.workflow_mode == "ligprep_like":
             if not self.final_3d.one_conformer_per_variant:
@@ -728,11 +814,17 @@ def merge_cli_overrides(config: RunConfig, **overrides: Any) -> RunConfig:
         data["chemistry"]["ph_low"] = None
         data["chemistry"]["ph_high"] = None
     _set_if_present(data["chemistry"], "solvent", overrides.get("solvent"))
-    _set_if_present(
-        data["protonation"],
-        "max_protomers_per_molecule",
-        overrides.get("max_protomers"),
-    )
+    max_protomers = overrides.get("max_protomers")
+    if max_protomers is not None:
+        # max_forms was materialized to the old cap during validation; a raised
+        # cap would then spuriously fail the >= cap check. A max_forms equal to
+        # the old cap is exactly the defaulted (cap-following) value: re-default it.
+        unipka_data = data["protonation"].get("unipka")
+        if isinstance(unipka_data, dict) and unipka_data.get("max_forms") == data[
+            "protonation"
+        ].get("max_protomers_per_molecule"):
+            unipka_data["max_forms"] = None
+    _set_if_present(data["protonation"], "max_protomers_per_molecule", max_protomers)
     _set_if_present(
         data["enumeration"],
         "max_protomers_per_molecule",
