@@ -101,9 +101,10 @@ PYTHONPATH=src python -m pytest
 ## Dependency Strategy
 
 - Do not vendor Third-party repositories. Sole exception: `containers/unipka.py`
-  is a pinned single-file copy of the current EasyDock Uni-Pka script
-  (BSD-3-Clause, see `containers/README.md`) that DSVR bind-mounts into the
-  container because all published pre-built images bake an outdated version.
+  is a pinned single-file copy of the current EasyDock Uni-Pka script plus a small
+  DSVR bug fix for shared microstates across a batch (BSD-3-Clause, see
+  `containers/README.md`) that DSVR bind-mounts into the container because all
+  published pre-built images bake an outdated version.
 - Install Python packages via uv.
 - Install external binaries via official binaries or user-managed modules.
 - Use `dsvr doctor` to verify the environment before running optional physics-heavy workflows.

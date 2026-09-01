@@ -167,7 +167,8 @@ docker build -t unipka .                # or Docker
 
 Every published Zenodo image bakes an outdated `unipka.py` without the
 occupancy flags; DSVR bind-mounts the current EasyDock script (vendored at
-`containers/unipka.py`) over it automatically. Override the path with
+`containers/unipka.py`, with one DSVR bug-fix patch — see `containers/README.md`)
+over it automatically. Override the path with
 `protonation.unipka.script_path` (empty string disables the override).
 
 Without root access, Apptainer can be installed from conda-forge

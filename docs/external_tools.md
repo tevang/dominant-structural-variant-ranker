@@ -78,9 +78,14 @@ Note: every published Zenodo `unipka.sif` build (through 2026-04-19) bakes an
 older `unipka.py` that lacks the occupancy flags DSVR needs (`-n`,
 `--occupancy`, `--distribution-file`). DSVR therefore bind-mounts the current
 EasyDock script — vendored at `containers/unipka.py` (BSD-3-Clause, see
-`containers/README.md`) — over the image copy. Set
+`containers/README.md`) — over the image copy. The vendored copy carries one
+DSVR patch on top of upstream (`unipka-shared-microstate-fix.patch`): without
+it, molecules sharing microstates within one batch (e.g. a conjugate acid/base
+pair) are silently dropped from the output. Set
 `protonation.unipka.script_path` to another checkout of the EasyDock script, or
-to `""` to disable the override (only correct for freshly built images).
+to `""` to disable the override (only correct for freshly built images; note
+that an unpatched script still has the shared-microstate bug until upstream
+fixes it).
 
 `dsvr doctor` (with a global `-c/--config`) checks the runtime and image of the
 configured container reference; without a config it probes the default

@@ -59,3 +59,15 @@ All notable changes to DSVR are documented here. Format loosely follows
   (`distribution_min_occupancy`, default 0.001) instead of the container's
   0.01 cutoff, so ensemble summary properties are computed over the full
   predicted microspecies set.
+- Uni-Pka batch truncation (upstream Uni-Pka 0.3.2 bug, fixed in the vendored
+  `containers/unipka.py` by the DSVR shared-microstate patch documented in
+  `containers/README.md`): molecules sharing microstates by exact SMILES
+  collision within one batch — e.g. a conjugate acid/base pair such as
+  aniline + anilinium — had one member silently dropped from the container
+  output (exit 0, fewer output lines than inputs), making DSVR fall back to
+  the unprotonated input state without any warning. The patch credits shared
+  microstates to all parent molecules, deduplicates GPU predictions per unique
+  microstate, and warns when any molecule ends a run without a complete
+  prediction set. Regression tests:
+  `tests/test_unipka_shared_microstate_regression.py` (they fail against the
+  unpatched upstream script).
