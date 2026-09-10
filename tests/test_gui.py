@@ -311,20 +311,159 @@ def test_artifact_path_resolution_refuses_run_dir_escape(tmp_path: Path) -> None
 pytest.importorskip("streamlit", reason="streamlit is not installed")
 
 
+_ENTRY_SCRIPT = (
+    Path(__file__).resolve().parent.parent / "src" / "dsvr" / "gui" / "ui" / "streamlit_entry.py"
+)
+
+# Renders _render_depictions on a ranked.csv whose path the test exports, so the
+# helper can be exercised without going through the sidebar navigation.
+_DEPICT_SCRIPT = """
+import os
+import pandas as pd
+from dsvr.gui.ui.views import _render_depictions
+
+_render_depictions(pd.read_csv(os.environ["DSVR_TEST_RANKED_CSV"]))
+"""
+
+
+def _open_view(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, view: str):
+    """Launch the GUI on a fixture run dir and switch to the named sidebar view."""
+    from streamlit.testing.v1 import AppTest
+
+    monkeypatch.setenv("DSVR_VIEW_RUNDIR", str(make_run_dir(tmp_path, ranked_molecules=11)))
+    at = AppTest.from_file(str(_ENTRY_SCRIPT))
+    at.run()
+    assert not at.exception, [str(e) for e in at.exception]
+    at.sidebar.radio[0].set_value(view).run()
+    assert not at.exception, [str(e) for e in at.exception]
+    return at
+
+
+def _html_bodies(at) -> list[str]:
+    """Bodies of the ``st.html`` blocks emitted in the app body (not the sidebar)."""
+    return [str(element.proto.body) for element in at.main.get("html")]
+
+
 def test_all_views_render_without_exception(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     from streamlit.testing.v1 import AppTest
 
     run_dir = make_run_dir(tmp_path, ranked_molecules=11, invalid_inputs=12, inputs_empty=True)
-    entry = (
-        Path(__file__).parent.parent / "src" / "dsvr" / "gui" / "ui" / "streamlit_entry.py"
-    )
     monkeypatch.setenv("DSVR_VIEW_RUNDIR", str(run_dir))
-    at = AppTest.from_file(str(entry))
+    at = AppTest.from_file(str(_ENTRY_SCRIPT))
     at.run()
     assert not at.exception, [str(e) for e in at.exception]
     options = list(at.sidebar.radio[0].options)
     assert "Overview" in options
     at.sidebar.radio[0].set_value("Overview").run()
     assert not at.exception, [str(e) for e in at.exception]
+
+
+def test_molecule_depictions_render_as_html(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Depictions must reach the browser as HTML blocks, not sanitized markdown."""
+    at = _open_view(tmp_path, monkeypatch, "Molecules")
+    show = next(selectbox for selectbox in at.selectbox if selectbox.label == "Show")
+    show.set_value("Depictions").run()
+    assert not at.exception, [str(e) for e in at.exception]
+
+    expected = min(30, 11)  # one block per ranked row, capped at 30
+    assert len([body for body in _html_bodies(at) if "<svg" in body]) == expected
+    # no depiction SVG may travel through markdown: Streamlit strips inline <svg> there
+    assert not [markdown for markdown in at.markdown if "<svg" in markdown.value]
+
+
+def test_depictions_placeholder_for_unparseable_smiles(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from streamlit.testing.v1 import AppTest
+
+    ranked = tmp_path / "ranked.csv"
+    _write_csv(
+        ranked,
+        ["variant_id", "smiles"],
+        [
+            ["mol_000001_p01", "CCO"],
+            ["mol_000002_p01", "not_a_smiles"],
+            ["mol_000003_p01", "CCN"],
+        ],
+    )
+    monkeypatch.setenv("DSVR_TEST_RANKED_CSV", str(ranked))
+    at = AppTest.from_string(_DEPICT_SCRIPT).run()
+    assert not at.exception, [str(e) for e in at.exception]
+
+    bodies = _html_bodies(at)
+    assert len(bodies) == 2  # the parseable rows still depict
+    assert all("<svg" in body for body in bodies)
+
+    captions = [caption.value for caption in at.caption]
+    assert captions.count("_(unparseable SMILES)_") == 1
+    assert [value for value in captions if value.startswith("mol_")] == [
+        "mol_000001_p01",
+        "mol_000002_p01",
+        "mol_000003_p01",
+    ]
+
+
+def test_depictions_without_smiles_column_shows_info(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from streamlit.testing.v1 import AppTest
+
+    ranked = tmp_path / "ranked.csv"
+    _write_csv(ranked, ["variant_id"], [["mol_000001_p01"]])
+    monkeypatch.setenv("DSVR_TEST_RANKED_CSV", str(ranked))
+    at = AppTest.from_string(_DEPICT_SCRIPT).run()
+    assert not at.exception, [str(e) for e in at.exception]
+
+    assert _html_bodies(at) == []
+    assert [info.value for info in at.info] == ["No SMILES column available for depictions."]
+
+
+def test_depictions_are_capped_at_30_in_a_3_column_grid(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Rows past the 30-row cap must not render; the grid stays 3 columns."""
+    from streamlit.testing.v1 import AppTest
+
+    ranked = tmp_path / "ranked.csv"
+    _write_csv(
+        ranked,
+        ["variant_id", "smiles"],
+        [[f"mol_{i:06d}_p01", "CCO"] for i in range(1, 36)],
+    )
+    monkeypatch.setenv("DSVR_TEST_RANKED_CSV", str(ranked))
+    at = AppTest.from_string(_DEPICT_SCRIPT).run()
+    assert not at.exception, [str(e) for e in at.exception]
+
+    assert len([body for body in _html_bodies(at) if "<svg" in body]) == 30
+    columns = at.main.columns
+    assert len(columns) == 3
+    assert all(abs(column.proto.weight - 1 / 3) < 0.01 for column in columns)
+
+
+def test_gui_extra_declares_streamlit_floor(tmp_path: Path) -> None:
+    """The gui extra must keep streamlit>=1.33: st.html is the depiction renderer."""
+    import tomllib
+
+    pyproject = Path(__file__).resolve().parent.parent / "pyproject.toml"
+    data = tomllib.loads(pyproject.read_text(encoding="utf-8"))
+    gui_deps = data["project"]["optional-dependencies"]["gui"]
+    specifiers = [
+        requirement for requirement in gui_deps if requirement.lower().startswith("streamlit")
+    ]
+    assert len(specifiers) == 1
+    from packaging.requirements import Requirement
+    from packaging.version import Version
+
+    lower_bounds = [
+        Version(specifier.version)
+        for specifier in Requirement(specifiers[0]).specifier
+        if specifier.operator in (">=", ">")
+    ]
+    assert lower_bounds, f"{specifiers[0]} declares no lower bound"
+    assert all(
+        bound >= Version("1.33") for bound in lower_bounds
+    ), f"{specifiers[0]} falls below the st.html floor (1.33)"

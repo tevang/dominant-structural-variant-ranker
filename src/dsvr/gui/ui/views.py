@@ -169,18 +169,26 @@ def render_molecules(run_dir: Path) -> None:
     subset = rank_frame if selected == "-- all --" else rank_frame[rank_frame[name_col] == selected]
     view = st.selectbox("Show", ["Table", "Depictions"])
     if view == "Depictions":
-        col = "smiles" if "smiles" in subset.columns else None
-        if col:
-            cols = st.columns(3)
-            for i, (_, row) in enumerate(subset.head(30).iterrows()):
-                svg = smiles_to_svg(str(row[col]))
-                with cols[i % 3]:
-                    st.markdown(svg if svg else "_(unparseable SMILES)_", unsafe_allow_html=True)
-                    st.caption(str(row.get("variant_id", "")))
-        else:
-            st.info("No SMILES column available for depictions.")
+        _render_depictions(subset)
     else:
         st.dataframe(subset.head(500), use_container_width=True)
+
+
+def _render_depictions(subset: pd.DataFrame) -> None:
+    """Draw up to 30 ranked variants as SVG depictions in a 3-column grid."""
+    col = "smiles" if "smiles" in subset.columns else None
+    if not col:
+        st.info("No SMILES column available for depictions.")
+        return
+    cols = st.columns(3)
+    for i, (_, row) in enumerate(subset.head(30).iterrows()):
+        svg = smiles_to_svg(str(row[col]))
+        with cols[i % 3]:
+            if svg:
+                st.html(svg)
+            else:
+                st.caption("_(unparseable SMILES)_")
+            st.caption(str(row.get("variant_id", "")))
 
 
 def render_enumerations(run_dir: Path) -> None:
