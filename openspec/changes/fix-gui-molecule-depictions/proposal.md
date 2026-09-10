@@ -26,24 +26,25 @@ Root cause (investigated and confirmed before this proposal):
 
 ## What Changes
 
-- Render molecule depictions with `st.html(svg)` instead of
-  `st.markdown(..., unsafe_allow_html=True)`. `st.html` is present since Streamlit
-  1.33 (already the declared floor for the `gui` extra), sanitizes with DOMPurify
-  (which permits the `<svg>` tag set RDKit emits), injects content without iframing,
-  and keeps the SVG zoomable/selectable.
+- Render molecule depictions with `st.image(svg)` instead of
+  `st.markdown(..., unsafe_allow_html=True)`. `st.image` turns SVG strings into
+  base64 `data:image/svg+xml` `<img>` sources, so SVG never passes through a
+  client-side sanitizer. (The first attempt, `st.html(svg)`, was disproven by running
+  Streamlit's own shipped DOMPurify bundle in a real browser: its html-only profile
+  drops `<svg>` entirely — see design.md.)
 - Extract a small `_render_depictions(subset)` helper so the depiction branch is
   readable and unit-testable; preserve all existing behavior around it: 3-column grid,
   30-row cap, `variant_id` caption per structure, and the
   "_(unparseable SMILES)_" placeholder for rows whose SMILES fail to parse.
-- Add regression coverage that fails if depictions regress to markdown-based
-  rendering: an AppTest-driven test that opens the Molecules view, switches Show to
-  "Depictions", and asserts one rendered HTML block containing `<svg` per depicted
-  ranked row (up to the 30-row cap); plus helper-level tests for the valid/invalid
-  SMILES branches.
-- Guard the floor: assert at module import or test time that `streamlit >= 1.33`
-  (importable `st.html`), documented as the requirement in the spec. pyproject.toml
-  already declares `streamlit>=1.33` for the `gui` extra, so no dependency change is
-  needed.
+- Add regression coverage that fails if depictions regress to inline-SVG rendering:
+  an AppTest-driven test that opens the Molecules view, switches Show to
+  "Depictions", and asserts one image element with a `data:image/svg+xml` source per
+  depicted ranked row (up to the 30-row cap) and zero inline `<svg` in markdown/html
+  elements; plus helper-level tests for the valid/invalid SMILES branches.
+- Guard the floor: assert in tests that the `gui` extra keeps `streamlit >= 1.33`
+  (the Streamlit floor for the GUI feature set; `st.image` SVG support predates it),
+  documented as the requirement in the spec. pyproject.toml already declares
+  `streamlit>=1.33` for the `gui` extra, so no dependency change is needed.
 
 ## Capabilities
 

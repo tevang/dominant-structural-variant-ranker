@@ -339,9 +339,13 @@ def _open_view(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, view: str):
     return at
 
 
-def _html_bodies(at) -> list[str]:
-    """Bodies of the ``st.html`` blocks emitted in the app body (not the sidebar)."""
-    return [str(element.proto.body) for element in at.main.get("html")]
+def _depiction_image_urls(at) -> list[str]:
+    """``data:`` URIs of the SVG images emitted in the app body (not the sidebar)."""
+    urls: list[str] = []
+    for element in at.main.get("image"):
+        for image in element.proto.imgs:
+            urls.append(image.url)
+    return urls
 
 
 def test_all_views_render_without_exception(
@@ -360,19 +364,30 @@ def test_all_views_render_without_exception(
     assert not at.exception, [str(e) for e in at.exception]
 
 
-def test_molecule_depictions_render_as_html(
+_SVG_DATA_URI = "data:image/svg+xml;base64,"
+
+
+def test_molecule_depictions_render_as_svg_images(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Depictions must reach the browser as HTML blocks, not sanitized markdown."""
+    """Depictions must reach the browser as SVG <img> elements.
+
+    Inline SVG through st.markdown or st.html is stripped by Streamlit's
+    client-side DOMPurify (the html profile drops <svg>), which is why the
+    renderer embeds SVGs as base64 data-URI images instead.
+    """
     at = _open_view(tmp_path, monkeypatch, "Molecules")
     show = next(selectbox for selectbox in at.selectbox if selectbox.label == "Show")
     show.set_value("Depictions").run()
     assert not at.exception, [str(e) for e in at.exception]
 
-    expected = min(30, 11)  # one block per ranked row, capped at 30
-    assert len([body for body in _html_bodies(at) if "<svg" in body]) == expected
-    # no depiction SVG may travel through markdown: Streamlit strips inline <svg> there
+    expected = min(30, 11)  # one image per ranked row, capped at 30
+    urls = _depiction_image_urls(at)
+    assert len([url for url in urls if url.startswith(_SVG_DATA_URI)]) == expected
+    # no depiction SVG may travel through markdown or html: Streamlit strips
+    # inline <svg> in both
     assert not [markdown for markdown in at.markdown if "<svg" in markdown.value]
+    assert not [body for body in (str(e.proto.body) for e in at.main.get("html")) if "<svg" in body]
 
 
 def test_depictions_placeholder_for_unparseable_smiles(
@@ -394,9 +409,9 @@ def test_depictions_placeholder_for_unparseable_smiles(
     at = AppTest.from_string(_DEPICT_SCRIPT).run()
     assert not at.exception, [str(e) for e in at.exception]
 
-    bodies = _html_bodies(at)
-    assert len(bodies) == 2  # the parseable rows still depict
-    assert all("<svg" in body for body in bodies)
+    urls = _depiction_image_urls(at)
+    assert len(urls) == 2  # the parseable rows still depict
+    assert all(url.startswith(_SVG_DATA_URI) for url in urls)
 
     captions = [caption.value for caption in at.caption]
     assert captions.count("_(unparseable SMILES)_") == 1
@@ -418,7 +433,7 @@ def test_depictions_without_smiles_column_shows_info(
     at = AppTest.from_string(_DEPICT_SCRIPT).run()
     assert not at.exception, [str(e) for e in at.exception]
 
-    assert _html_bodies(at) == []
+    assert _depiction_image_urls(at) == []
     assert [info.value for info in at.info] == ["No SMILES column available for depictions."]
 
 
@@ -438,14 +453,14 @@ def test_depictions_are_capped_at_30_in_a_3_column_grid(
     at = AppTest.from_string(_DEPICT_SCRIPT).run()
     assert not at.exception, [str(e) for e in at.exception]
 
-    assert len([body for body in _html_bodies(at) if "<svg" in body]) == 30
+    assert len([url for url in _depiction_image_urls(at) if url.startswith(_SVG_DATA_URI)]) == 30
     columns = at.main.columns
     assert len(columns) == 3
     assert all(abs(column.proto.weight - 1 / 3) < 0.01 for column in columns)
 
 
 def test_gui_extra_declares_streamlit_floor(tmp_path: Path) -> None:
-    """The gui extra must keep streamlit>=1.33: st.html is the depiction renderer."""
+    """The gui extra must keep streamlit>=1.33 for the depiction renderer."""
     import tomllib
 
     pyproject = Path(__file__).resolve().parent.parent / "pyproject.toml"

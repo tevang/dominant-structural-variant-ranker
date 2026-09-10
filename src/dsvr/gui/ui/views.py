@@ -185,7 +185,9 @@ def _render_depictions(subset: pd.DataFrame) -> None:
         svg = smiles_to_svg(str(row[col]))
         with cols[i % 3]:
             if svg:
-                st.html(svg)
+                # st.image turns SVG strings into a data: URI <img>; inline SVG
+                # through st.markdown/st.html is stripped by Streamlit's DOMPurify.
+                st.image(svg)
             else:
                 st.caption("_(unparseable SMILES)_")
             st.caption(str(row.get("variant_id", "")))

@@ -7,27 +7,29 @@ the rendering API.
 
 ## ADDED Requirements
 
-### Requirement: Depictions render via a sanitization-safe API
+### Requirement: Depictions render via a sanitizer-proof API
 
 The Molecules view SHALL render each 2D depiction by passing the RDKit SVG string to
-`st.html`. Depiction SVG content MUST NOT be emitted through `st.markdown` (with or
-without `unsafe_allow_html`), because supported Streamlit versions sanitize markdown
-output and strip inline `<svg>` markup.
+`st.image`, which embeds SVG content as a base64 `data:image/svg+xml` image and is
+therefore never passed through the client-side HTML sanitizer. Depiction SVG content
+MUST NOT be emitted through `st.markdown` or `st.html`, because Streamlit sanitizes
+both (markdown via its own pipeline, `st.html` via a DOMPurify configuration whose
+html-only profile drops `<svg>` and its subtree), so inline SVG renders as nothing.
 
 #### Scenario: Depictions are visible in a real browser
 
 - **WHEN** a user opens the Molecules view for a run whose `ranked.csv` contains a
   `smiles` column and selects Show = "Depictions"
-- **THEN** every depicted row emits its SVG through an `st.html` element and no
-  depiction SVG is emitted through `st.markdown`
+- **THEN** every depicted row emits an image element whose source is an SVG data URI,
+  and no depiction SVG is emitted through `st.markdown` or `st.html`
 
-#### Scenario: Regression to markdown rendering is caught by tests
+#### Scenario: Regression to inline-SVG rendering is caught by tests
 
 - **WHEN** the automated GUI tests open the Molecules view, switch Show to
   "Depictions", and inspect the emitted elements
-- **THEN** the test observes one HTML element whose body contains `<svg` per depicted
-  ranked row (up to the 30-row cap), and the test fails if depictions are emitted as
-  markdown elements instead
+- **THEN** the test observes one image element with a `data:image/svg+xml` source per
+  depicted ranked row (up to the 30-row cap), and the test fails if depictions are
+  emitted as inline SVG through markdown or html elements instead
 
 ### Requirement: Depiction layout and fallbacks are preserved
 

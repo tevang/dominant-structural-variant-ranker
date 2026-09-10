@@ -9,20 +9,24 @@ Streamlit sanitizes markdown output regardless of the unsafe flag, stripping `<s
 in the browser. `AppTest` cannot observe this (no browser, no sanitizer), which is why
 `tests/test_gui.py` stayed green while the feature was broken.
 
-## Decision: `st.html(svg)` as the rendering primitive
+## Decision: `st.image(svg)` (base64 SVG data URI) as the rendering primitive
+
+Original plan (superseded — see verification note below): `st.html(svg)`.
 
 Options considered:
 
-1. **`st.html(svg)`** (chosen). Available since Streamlit 1.33 — exactly the declared
-   floor of the `gui` extra (`streamlit>=1.33` in pyproject.toml), so no dependency
-   change is required. Content is DOMPurify-sanitized client-side (the `<svg>`,
-   `<line>`, `<ellipse>`, `<path>`, `<rect>`, `<text>` elements RDKit's
-   `MolDraw2DSVG` emits are all on the default allow list), injected inline (not
-   iframed), and remains zoomable/selectable as vector content.
-2. Base64 `<img src="data:image/svg+xml;base64,...">` inside `st.html` or `st.image`.
-   Works but rasterizes-by-reference: text in the SVG is no longer selectable, and the
-   wrapper adds size/encoding plumbing for no benefit here. Kept as the documented
-   fallback only if `st.html` proves to misbehave on some future Streamlit.
+1. **`st.image(svg)`** (chosen; documented fallback of the original plan). Streamlit
+   converts SVG strings to a `data:image/svg+xml;base64,...` URL client-side-safe path
+   (`image_utils.py` detects the `<?xml`/`<svg` prolog and base64-encodes), so the SVG
+   reaches the browser as an `<img>` source and never passes through any HTML
+   sanitizer. SVG support in `st.image` long predates the 1.33 floor. Vector rendering
+   and browser zoom are preserved (`<img>` of an SVG scales without rasterizing).
+2. `st.html(svg)`. **Empirically broken**: Streamlit 1.62's Html component sanitizes
+   with DOMPurify `USE_PROFILES:{html:true}, FORCE_BODY:true`, and DOMPurify's
+   html-only profile drops `<svg>` and its whole subtree. Running Streamlit's own
+   shipped purify bundle in headless Chromium on a real RDKit SVG returned an empty
+   string (1988 → 2 bytes). AppTest does not run the sanitizer, so unit tests alone
+   cannot distinguish the two — the manual browser check caught this.
 3. Pin Streamlit to the last version that tolerated unsanitized markdown SVG.
    Rejected: pinning backwards to preserve a deprecated behavior blocks security
    fixes and is the wrong direction.
@@ -41,21 +45,18 @@ Options considered:
 
 ## Risks and mitigations
 
-- **DOMPurify strips something RDKit emits.** Mitigation: spec requires the emitted
-  HTML blocks to contain `<svg` in tests, and the manual browser check (tasks 3.2)
-  covers the real render end-to-end. RDKit's output is plain static SVG with no script,
-  so allow-listing holds.
-- **XML prolog (`<?xml ... encoding='iso-8859-1'?>`) inside inline HTML.** The prolog
-  precedes the `<svg>` element in the fragment; browsers/DOMPurify tolerate and drop
-  it in fragment parsing. Verified acceptable for the manual check; if it ever
-  surfaces as an issue, stripping the prolog in `_render_depictions` is a one-line
-  follow-up (not needed now).
-- **AppTest regressing silently again.** The new test asserts the *type* of the
-  emitted element (HTML block) and the presence of `<svg` in its body, so a future
-  reversion to `st.markdown` fails the suite even though AppTest does not sanitize.
+- **Sanitizer behavior is invisible to AppTest.** Lesson from the st.html attempt:
+  only a real browser runs DOMPurify. Mitigation: the rendering path uses `st.image`
+  (no sanitizer in the path at all), and the end-to-end check (tasks 3.2) drives a
+  real browser and counts SVG `<img>` elements in the DOM — not just AppTest blocks.
+- **AppTest regressing silently again.** The tests assert image elements with a
+  `data:image/svg+xml` source, and that no inline `<svg` leaks into markdown or html
+  elements, so a reversion to any inline-SVG primitive fails the suite.
+- **XML prolog (`<?xml ... encoding='iso-8859-1'?>`).** `image_utils._is_svg` accepts
+  prolog-prefixed SVGs, so `st.image` handles RDKit output unchanged.
 
 ## Version floor
 
-`st.html` exists since Streamlit 1.33. The `gui` extra already declares
-`streamlit>=1.33`; the spec records this floor as a requirement so a future floor
+The `gui` extra already declares `streamlit>=1.33`; SVG-string support in `st.image`
+predates that floor. The spec records the floor as a requirement so a future floor
 lowering (or a remove-and-readd of the extra) is caught during spec review.
