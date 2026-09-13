@@ -17,4 +17,3 @@ tmp/
 doctor_report.json
 containers/*.sif
 .apptainer-env/
-openspec/
